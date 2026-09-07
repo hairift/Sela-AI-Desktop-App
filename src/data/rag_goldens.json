@@ -1,0 +1,122 @@
+[
+  {
+    "id": "golden_01",
+    "query": "kalau mau daftar siapin apa aja",
+    "expected_intents": ["syarat", "pendaftaran"],
+    "expected_ids": ["pmb_syarat", "faq_awam_syarat_daftar"]
+  },
+  {
+    "id": "golden_02",
+    "query": "uang masuknya berapa",
+    "expected_intents": ["biaya"],
+    "expected_ids": ["biaya_kuliah", "faq_awam_biaya_bayar"]
+  },
+  {
+    "id": "golden_03",
+    "query": "bayarnya bisa dana gak",
+    "expected_intents": ["biaya"],
+    "expected_ids": ["biaya_kuliah", "faq_awam_biaya_bayar"]
+  },
+  {
+    "id": "golden_04",
+    "query": "kelas orang kerja ada ga",
+    "expected_intents": ["kelas"],
+    "expected_ids": ["jadwal_kuliah_umum", "faq_awam_kelas_pekerja"]
+  },
+  {
+    "id": "golden_05",
+    "query": "anak komputer cocoknya jurusan apa",
+    "expected_intents": ["jurusan"],
+    "expected_ids": ["faq_awam_jurusan_rekomendasi", "prodi_teknik_informatika_detail"]
+  },
+  {
+    "id": "golden_06",
+    "query": "nomor admin pmb mana",
+    "expected_intents": ["kontak"],
+    "expected_ids": ["pmb_alur_kontak", "faq_awam_kontak_admin"]
+  },
+  {
+    "id": "golden_07",
+    "query": "kampusnya dimana sih",
+    "expected_intents": ["lokasi"],
+    "expected_ids": ["lokasi_kampus", "faq_awam_lokasi_kampus"]
+  },
+  {
+    "id": "golden_08",
+    "query": "abis daftar terus ngapain",
+    "expected_intents": ["pendaftaran"],
+    "expected_ids": ["daftar_ulang_camaba", "faq_awam_setelah_daftar"]
+  },
+  {
+    "id": "golden_09",
+    "query": "daftar online syaratnya apa terus bayarnya lewat apa",
+    "expected_intents": ["pendaftaran", "syarat", "biaya"],
+    "expected_ids": ["pendaftaran_pmb", "pmb_syarat", "biaya_kuliah"]
+  },
+  {
+    "id": "golden_10",
+    "query": "kalau yang kerja bisa kuliah malam gak",
+    "expected_intents": ["kelas"],
+    "expected_ids": ["jadwal_kuliah_umum", "faq_awam_kelas_pekerja"]
+  },
+  {
+    "id": "golden_11",
+    "query": "orang tua mau nanya kampus ini akreditasi nya gimana",
+    "expected_intents": ["kontak"],
+    "expected_ids": ["faq_orang_tua_mahasiswa", "akreditasi"]
+  },
+  {
+    "id": "golden_12",
+    "query": "persaratan daftar kuliah apa",
+    "expected_intents": ["syarat", "pendaftaran"],
+    "expected_ids": ["pmb_syarat", "faq_awam_syarat_daftar"]
+  },
+  {
+    "id": "golden_13",
+    "query": "ucic ada jurusan apa aja",
+    "expected_intents": ["jurusan"],
+    "expected_ids": ["jurusan_ucic", "jurusan_fti", "jurusan_feb", "jurusan_fps"]
+  },
+  {
+    "id": "golden_14",
+    "query": "kalau suka desain cocok masuk prodi apa",
+    "expected_intents": ["jurusan"],
+    "expected_ids": ["faq_awam_jurusan_rekomendasi", "prodi_dkv_detail", "prodi_dkv"]
+  },
+  {
+    "id": "golden_15",
+    "query": "fasilitas kampus ucic ada lab apa aja",
+    "expected_intents": ["fasilitas"],
+    "expected_ids": ["fasilitas_kampus_lengkap"]
+  },
+  {
+    "id": "golden_16",
+    "query": "beasiswa di ucic ada apa aja",
+    "expected_intents": ["beasiswa"],
+    "expected_ids": ["beasiswa"]
+  },
+  {
+    "id": "golden_17",
+    "query": "kapan pendaftaran mahasiswa baru dibuka",
+    "expected_intents": ["pendaftaran"],
+    "expected_ids": ["pmb_jadwal", "pendaftaran_pmb"]
+  },
+  {
+    "id": "golden_18",
+    "query": "kalau telat masuk kelas lebih dari 15 menit gimana",
+    "expected_intents": ["akademik"],
+    "expected_ids": ["baak_kehadiran_perkuliahan"]
+  },
+  {
+    "id": "golden_19",
+    "query": "cara isi krs mahasiswa lama gimana",
+    "expected_intents": ["akademik"],
+    "expected_ids": ["baak_krs_heregistrasi"]
+  },
+  {
+    "id": "golden_20",
+    "query": "syarat sidang skripsi apa aja",
+    "expected_intents": ["akademik"],
+    "expected_ids": ["baak_syarat_sidang_skripsi", "baak_skripsi_tugas_akhir"]
+  }
+]

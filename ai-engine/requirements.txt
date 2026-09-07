@@ -1,0 +1,49 @@
+# SELA AI Desktop — Dependensi Python Backend AI Offline
+# Pasang dengan:  pip install -r requirements.txt
+# Python yang didukung: 3.10 / 3.11 / 3.12 (Windows 64-bit)
+#
+# Catatan: error IDE "Cannot find module fastapi / numpy / torch / ..."
+# (Pyrefly/Pylance missing-import) 100% hilang setelah file ini dipasang
+# DAN interpreter VS Code menunjuk ke Python yang sama dengan `pip`
+# (lihat .vscode/settings.json -> python.defaultInterpreterPath).
+
+# ── Web server ──────────────────────────────────────────────
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.5
+python-multipart==0.0.32
+websockets==17.1
+httpx==0.28.1
+
+# ── Audio / numerik ─────────────────────────────────────────
+soundfile==0.14.0
+numpy==2.5.3
+scipy==1.18.1
+librosa==1.0.0
+
+# ── Deep learning (CPU + CUDA) ──────────────────────────────
+torch==2.14.0
+torchaudio==2.11.0
+transformers==5.16.1
+huggingface-hub>=0.23
+onnxruntime==1.29.0
+
+# ── ASR offline (Whisper) ───────────────────────────────────
+faster-whisper==1.2.1
+# openai-whisper  # opsional, fallback bila faster-whisper gagal
+
+# ── TTS offline ─────────────────────────────────────────────
+# Jalur utama: Piper ONNX (ringan, natural, female ID/EN, CPU <200ms)
+piper-tts==1.8.0
+# Jalur kualitas: Higgs TTS v2 3B via `transformers` (tanpa paket tambahan).
+#   Model: bosonai/higgs-audio-v2-generation-3B-base  (diunduh otomatis
+#   ke ai-engine/models/higgs/ saat pertama dipakai, lalu 100% offline).
+# Cadangan terakhir: pyttsx3 SAPI5 (Windows, tanpa unduhan)
+pyttsx3==2.99
+
+# ── LLM offline ─────────────────────────────────────────────
+# Jalur utama: model chat kecil via `transformers`
+#   (default: Qwen2.5-0.5B-Instruct, ~1 GB, CPU/GPU, 100% offline).
+#   Diunduh otomatis ke ai-engine/models/llm/ saat pertama dipakai.
+# Jalur alternatif (opsional, tercepat di RTX 3050): llama-cpp-python + GGUF
+#llama-cpp-python  # opsional — aktifkan bila memakai file .gguf + GPU offload

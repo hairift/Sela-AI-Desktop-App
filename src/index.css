@@ -1,0 +1,147 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    @apply font-sans antialiased text-gray-800 dark:text-gray-100;
+    background: #f8faff;
+  }
+}
+
+@layer components {
+  .glass-card {
+    @apply bg-white/70 backdrop-blur-xl border border-white/60 rounded-2xl shadow-lg;
+  }
+
+  .glass-light {
+    @apply bg-white/50 backdrop-blur-md border border-white/40 rounded-xl;
+  }
+
+  .btn-primary {
+    @apply bg-gradient-to-r from-blue-500 to-blue-600 text-white font-semibold rounded-full px-6 py-3 
+           shadow-md hover:shadow-lg hover:from-blue-600 hover:to-blue-700 
+           active:scale-95 transition-all duration-200;
+  }
+
+  .input-field {
+    @apply w-full bg-white/80 border border-gray-200/60 rounded-full px-5 py-3 
+           text-gray-700 placeholder-gray-400 outline-none 
+           focus:ring-2 focus:ring-blue-300/50 focus:border-blue-300 
+           transition-all duration-200 shadow-sm;
+  }
+
+  .toggle-switch {
+    @apply relative inline-flex items-center cursor-pointer;
+  }
+
+  .sidebar-item {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-xl text-gray-600 text-sm 
+           hover:bg-blue-50/80 hover:text-blue-600 transition-all duration-150 cursor-pointer;
+  }
+
+  .sidebar-item-active {
+    @apply flex items-center gap-3 px-3 py-2.5 rounded-xl text-sm 
+           bg-blue-50 text-blue-600 font-medium cursor-pointer;
+  }
+}
+
+/* Waveform animation */
+.wave-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 48px;
+}
+
+.wave-bar {
+  width: 4px;
+  border-radius: 9999px;
+  transform-origin: bottom center;
+}
+
+@keyframes waveBar {
+  0%, 100% { transform: scaleY(0.3); }
+  50%       { transform: scaleY(1); }
+}
+
+.animate-wave-1 { animation: waveBar 1s ease-in-out infinite 0s; }
+.animate-wave-2 { animation: waveBar 1s ease-in-out infinite 0.15s; }
+.animate-wave-3 { animation: waveBar 1s ease-in-out infinite 0.3s; }
+.animate-wave-4 { animation: waveBar 1s ease-in-out infinite 0.45s; }
+.animate-wave-5 { animation: waveBar 1s ease-in-out infinite 0.6s; }
+
+.animate-fade-in { animation: fadeIn 0.4s ease-out forwards; }
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 9999px;
+}
+*:hover::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+}
+
+/* Hide scrollbar while keeping scroll functionality */
+.hide-scrollbar {
+  -ms-overflow-style: none;  /* IE and Edge */
+  scrollbar-width: none;     /* Firefox */
+}
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;  /* Chrome, Safari */
+}
+
+/* Remove default button/input styles */
+button { cursor: pointer; }
+select { cursor: pointer; appearance: none; }
+
+/* Smooth page transitions */
+.page-enter {
+  animation: fadeIn 0.3s ease-out forwards;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes float1 {
+  0% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(30px, 50px) scale(1.1); }
+  66% { transform: translate(-20px, 30px) scale(0.9); }
+  100% { transform: translate(0, 0) scale(1); }
+}
+@keyframes float2 {
+  0% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-40px, -20px) scale(1.05); }
+  100% { transform: translate(0, 0) scale(1); }
+}
+@keyframes float3 {
+  0% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(20px, -40px) scale(1.15); }
+  100% { transform: translate(0, 0) scale(1); }
+}
+
+.animate-float-1 { animation: float1 18s ease-in-out infinite; }
+.animate-float-2 { animation: float2 22s ease-in-out infinite; }
+.animate-float-3 { animation: float3 26s ease-in-out infinite; }
