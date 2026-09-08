@@ -155,9 +155,8 @@ export default function LiveCaption({
 
         {links.length > 0 && (
           <div className="flex flex-wrap justify-center gap-2">
-            {links.map((url, index) => (
-              <TimedQrCard key={`${url}-${index}`} url={url} />
-            ))}
+            {/* Cegah QR ganda: hanya tampilkan 1 kartu QR utama per pesan */}
+            <TimedQrCard key={links[0]} url={links[0]} />
           </div>
         )}
       </div>

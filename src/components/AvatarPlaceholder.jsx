@@ -3,6 +3,7 @@ import { Canvas, useFrame } from '@react-three/fiber'
 import { ContactShadows, Html, PerspectiveCamera, useGLTF, useAnimations, Environment } from '@react-three/drei'
 import * as THREE from 'three'
 import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js'
+import { lipsyncManager, VISEMES } from '../lib/lipsync'
 
 /**
  * Komponen Pembatas Galat (ErrorBoundary) untuk melindungi antarmuka jika terjadi
@@ -224,9 +225,69 @@ function SelaModel({ state }) {
       }
     }
 
-    const visemeCycle = ['visemeAa', 'visemeIh', 'visemeU', 'visemeE', 'visemeO', 'visemeSil']
-    const visemeIndex = Math.floor((t * 7.5) % visemeCycle.length)
-    const activeViseme = state === 'speaking' ? visemeCycle[visemeIndex] : 'visemeSil'
+    // ── 100% Wawa Lipsync: Analisis frekuensi audio real-time Web Audio API ──
+    let currentViseme = VISEMES.sil
+    let currentVolume = 0
+
+    if (state === 'speaking') {
+      try {
+        lipsyncManager.processAudio()
+        currentViseme = lipsyncManager.viseme || VISEMES.sil
+        currentVolume = lipsyncManager.features?.volume || 0
+      } catch (_) {}
+    }
+
+    // Skala bukaan mulut berdasarkan volume audio nyata
+    const volumeMultiplier = state === 'speaking' ? Math.min(1.25, Math.max(0.2, currentVolume * 2.6)) : 0
+
+    let targetAa = 0
+    let targetIh = 0
+    let targetU = 0
+    let targetE = 0
+    let targetO = 0
+    let targetSil = state === 'speaking' ? 0.05 : 0.85
+
+    if (state === 'speaking') {
+      switch (currentViseme) {
+        case VISEMES.aa:
+          targetAa = 1.0 * volumeMultiplier
+          targetE = 0.25 * volumeMultiplier
+          break
+        case VISEMES.E:
+          targetE = 1.0 * volumeMultiplier
+          targetAa = 0.3 * volumeMultiplier
+          break
+        case VISEMES.I:
+          targetIh = 1.0 * volumeMultiplier
+          targetE = 0.3 * volumeMultiplier
+          break
+        case VISEMES.O:
+          targetO = 1.0 * volumeMultiplier
+          targetU = 0.25 * volumeMultiplier
+          break
+        case VISEMES.U:
+          targetU = 1.0 * volumeMultiplier
+          targetO = 0.3 * volumeMultiplier
+          break
+        // Fricatives, dental, plosives (gigi merapat & sedikit membuka)
+        case VISEMES.CH:
+        case VISEMES.SS:
+        case VISEMES.FF:
+        case VISEMES.TH:
+        case VISEMES.DD:
+        case VISEMES.kk:
+        case VISEMES.nn:
+        case VISEMES.RR:
+          targetIh = 0.45 * volumeMultiplier
+          targetE = 0.2 * volumeMultiplier
+          break
+        case VISEMES.PP:
+        case VISEMES.sil:
+        default:
+          targetSil = 0.8
+          break
+      }
+    }
 
     const eyeWideBase =
       state === 'listening' ? 0.24 :
@@ -265,16 +326,27 @@ function SelaModel({ state }) {
     resetUntrackedMorphs(bindings, trackedKeys)
 
     trackedKeys.forEach((key) => {
-      const target =
-        key === activeViseme ? 0.95 :
-          key === 'visemeSil' ? (state === 'speaking' ? 0.08 : 0.82) :
-            key === 'eyeBlinkLeft' || key === 'eyeBlinkRight' ? blinkWeight :
-              key === 'eyeWideLeft' || key === 'eyeWideRight' ? Math.max(0, eyeWideBase - blinkWeight * 0.8) :
-                key === 'browInnerUp' || key === 'browOuterUpLeft' || key === 'browOuterUpRight' ? browLift :
-                  key === 'browDownLeft' || key === 'browDownRight' ? browDown :
-                    0
+      let target = 0
+      let smoothing = 0.28 // Halus dan sinkron dengan frekuensi audio
 
-      applyMorph(bindings, key, target)
+      if (key === 'visemeSil') target = targetSil
+      else if (key === 'visemeAa') target = targetAa
+      else if (key === 'visemeIh') target = targetIh
+      else if (key === 'visemeU') target = targetU
+      else if (key === 'visemeE') target = targetE
+      else if (key === 'visemeO') target = targetO
+      else if (key === 'eyeBlinkLeft' || key === 'eyeBlinkRight') {
+        target = blinkWeight
+        smoothing = 0.4
+      } else if (key === 'eyeWideLeft' || key === 'eyeWideRight') {
+        target = Math.max(0, eyeWideBase - blinkWeight * 0.8)
+      } else if (key === 'browInnerUp' || key === 'browOuterUpLeft' || key === 'browOuterUpRight') {
+        target = browLift
+      } else if (key === 'browDownLeft' || key === 'browDownRight') {
+        target = browDown
+      }
+
+      applyMorph(bindings, key, target, smoothing)
     })
   })
 
@@ -289,27 +361,69 @@ function SelaAvatar3D({ state, theme }) {
   const isDark = theme === 'dark'
 
   return (
-    <Canvas dpr={[1, 2]} gl={{ antialias: true, alpha: true }}>
+    <Canvas
+      dpr={[1, 2]}
+      gl={{
+        antialias: true,
+        alpha: true,
+        powerPreference: "high-performance",
+        toneMapping: THREE.ACESFilmicToneMapping,
+        toneMappingExposure: isDark ? 1.05 : 1.25,
+      }}
+    >
       <PerspectiveCamera makeDefault position={[0, 0.8, 5.5]} fov={32} />
 
-      <ambientLight intensity={isDark ? 0.85 : 1.2} color={isDark ? "#f0f9ff" : "#ffffff"} />
-      <hemisphereLight intensity={isDark ? 0.5 : 0.8} skyColor={isDark ? "#e0f2fe" : "#ffffff"} groundColor="#0f172a" />
+      {/* Pencahayaan Studio Tiga Titik Berstandar AAA + Rim Light Sinematik */}
+      <ambientLight intensity={isDark ? 0.45 : 0.65} color="#ffffff" />
+      <hemisphereLight intensity={isDark ? 0.55 : 0.8} skyColor="#e0f2fe" groundColor="#0f172a" />
 
-      {/* Lampu utama dan samping disesuaikan posisinya */}
-      <directionalLight position={[3.0, 1.0, 4.0]} intensity={isDark ? 1.0 : 1.5} color={isDark ? "#f0f9ff" : "#ffffff"} />
-      <directionalLight position={[-3.0, 1.0, 3.0]} intensity={isDark ? 0.65 : 1.0} color="#7dd3fc" />
+      {/* Key Light: Cahaya utama hangat dari sudut atas kanan */}
+      <directionalLight
+        position={[3.5, 3.5, 4.5]}
+        intensity={isDark ? 1.6 : 2.2}
+        color="#fffbeb"
+      />
 
-      {/* Cahaya rata dari depan yang tegak lurus (Z-axis) agar rambut tidak memberi bayangan ke wajah */}
-      <directionalLight position={[0, 0, 10.0]} intensity={isDark ? 1.0 : 1.5} color={isDark ? "#f0f9ff" : "#ffffff"} />
+      {/* Fill Light: Cahaya pengisi lembut dari kiri agar bayangan wajah transparan & halus */}
+      <directionalLight
+        position={[-3.5, 2.0, 3.0]}
+        intensity={isDark ? 0.85 : 1.15}
+        color="#e0f2fe"
+      />
 
-      {/* Point light (seperti ring light) diletakkan persis di depan wajah (y=1.0) */}
-      <pointLight position={[0, 2.5, 3.0]} intensity={isDark ? 1.3 : 2.0} distance={15} color={isDark ? "#e0f2fe" : "#ffffff"} />
+      {/* Rim / Hair Backlight: Memberi outline biru lembut di tepi rambut dan bahu */}
+      <directionalLight
+        position={[0, 4.0, -3.5]}
+        intensity={isDark ? 2.8 : 3.4}
+        color="#38bdf8"
+      />
+      <directionalLight
+        position={[-3.0, 3.0, -2.5]}
+        intensity={isDark ? 1.4 : 1.9}
+        color="#818cf8"
+      />
+
+      {/* Beauty Front Light: Cahaya sorot lembut di mata & wajah agar segar (tidak butek) */}
+      <pointLight
+        position={[0, 1.2, 3.2]}
+        intensity={isDark ? 0.85 : 1.2}
+        distance={10}
+        color="#ffffff"
+      />
 
       <Suspense fallback={<AvatarFallback />}>
-        {/* Environment map memberikan pantulan natural (Global Illumination) */}
-        <Environment preset="city" environmentIntensity={isDark ? 0.45 : 0.7} />
+        {/* Environment map untuk pantulan global natural */}
+        <Environment preset="city" environmentIntensity={isDark ? 0.55 : 0.8} />
         <SelaModel state={state} />
-        <ContactShadows position={[0, SHADOW_Y, 0]} opacity={isDark ? 0.25 : 0.16} scale={5.2} blur={2.4} far={4.4} color={isDark ? "#000000" : "#1e293b"} />
+        <ContactShadows
+          position={[0, SHADOW_Y, 0]}
+          opacity={isDark ? 0.35 : 0.22}
+          scale={5.5}
+          blur={2.0}
+          far={4.5}
+          color={isDark ? "#020617" : "#0f172a"}
+        />
+
       </Suspense>
     </Canvas>
   )

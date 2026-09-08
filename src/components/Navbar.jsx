@@ -1,3 +1,5 @@
+import { useState, useEffect } from 'react'
+
 const IconSun = () => (
   <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
     <circle cx="12" cy="12" r="5" />
@@ -11,13 +13,91 @@ const IconMoon = () => (
   </svg>
 )
 
+// Badge status engine TTS — polling /api/status-tts setiap 15 detik
+function TtsStatusBadge() {
+  const [status, setStatus] = useState(null) // null = loading awal, {} = data
+
+  useEffect(() => {
+    const cekStatus = async () => {
+      try {
+        const r = await fetch('/api/status-tts', { signal: AbortSignal.timeout(4000) })
+        if (r.ok) setStatus(await r.json())
+      } catch (_) {}
+    }
+    cekStatus()
+    const interval = setInterval(cekStatus, 15000) // polling tiap 15 detik
+    return () => clearInterval(interval)
+  }, [])
+
+  if (!status) return null // Belum ada data
+
+  if (status.omnivoice_cepat) {
+    return (
+      <div
+        id="tts-status-badge"
+        title="OmniVoice Voice Cloning aktif (Akselerasi CUDA)"
+        className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 border border-emerald-300 dark:border-emerald-600"
+      >
+        <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+        <span className="text-[9px] font-bold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide hidden sm:inline">
+          Voice Clone
+        </span>
+      </div>
+    )
+  }
+
+  if (status.piper_siap) {
+    return (
+      <div
+        id="tts-status-badge"
+        title="Suara Neural Piper Siap (Respon instan <150ms)"
+        className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 border border-emerald-300 dark:border-emerald-600"
+      >
+        <span className="w-2 h-2 rounded-full bg-emerald-500" />
+        <span className="text-[9px] font-bold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide hidden sm:inline">
+          Suara Siap
+        </span>
+      </div>
+    )
+  }
+
+  if (status.omnivoice_gagal) {
+    return (
+      <div
+        id="tts-status-badge"
+        title="OmniVoice gagal diinisialisasi"
+        className="flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-100 dark:bg-amber-900/40 border border-amber-300 dark:border-amber-600"
+      >
+        <span className="w-2 h-2 rounded-full bg-amber-500" />
+        <span className="text-[9px] font-bold text-amber-700 dark:text-amber-300 uppercase tracking-wide hidden sm:inline">
+          Piper
+        </span>
+      </div>
+    )
+  }
+
+  // OmniVoice sedang loading
+  return (
+    <div
+      id="tts-status-badge"
+      title="OmniVoice sedang diunduh (~2.5GB) — menggunakan Piper sementara"
+      className="flex items-center gap-1 px-2 py-1 rounded-lg bg-blue-100 dark:bg-blue-900/40 border border-blue-300 dark:border-blue-600"
+    >
+      <span className="w-2 h-2 rounded-full bg-blue-500 animate-ping" />
+      <span className="text-[9px] font-bold text-blue-700 dark:text-blue-300 uppercase tracking-wide hidden sm:inline">
+        Unduh AI...
+      </span>
+    </div>
+  )
+}
+
 export default function Navbar({ onMenuClick, lang, setLang, theme, setTheme }) {
   const toggleLang = () => {
-    if (setLang) setLang(lang === 'id' ? 'en' : 'id');
+    if (setLang) setLang(lang === 'id' ? 'en' : 'id')
   }
 
   const toggleTheme = () => {
-    if (setTheme) setTheme(theme === 'light' ? 'dark' : 'light');
+    if (setTheme) setTheme(theme === 'light' ? 'dark' : 'light')
   }
 
   return (
@@ -38,6 +118,9 @@ export default function Navbar({ onMenuClick, lang, setLang, theme, setTheme }) 
       <h1 className="text-xl font-bold tracking-widest text-gray-800 dark:text-gray-100 select-none">SELA</h1>
 
       <div className="flex items-center gap-2">
+        {/* Badge status TTS engine */}
+        <TtsStatusBadge />
+
         {/* Theme Toggle Shortcut */}
         <button
           onClick={toggleTheme}

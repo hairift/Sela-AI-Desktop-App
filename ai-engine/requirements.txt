@@ -33,12 +33,14 @@ faster-whisper==1.2.1
 # openai-whisper  # opsional, fallback bila faster-whisper gagal
 
 # ── TTS offline ─────────────────────────────────────────────
-# Jalur utama: Piper ONNX (ringan, natural, female ID/EN, CPU <200ms)
+# Jalur voice cloning utama: OmniVoice (k2-fsa) zero-shot voice cloning
+omnivoice==0.2.1
+webdataset>=1.0.0
+tensorboardX>=2.6
+braceexpand>=0.1.7
+# Jalur kecepatan tinggi: Piper ONNX (ringan, natural, female ID/EN, CPU <200ms)
 piper-tts==1.8.0
-# Jalur kualitas: Higgs TTS v2 3B via `transformers` (tanpa paket tambahan).
-#   Model: bosonai/higgs-audio-v2-generation-3B-base  (diunduh otomatis
-#   ke ai-engine/models/higgs/ saat pertama dipakai, lalu 100% offline).
-# Cadangan terakhir: pyttsx3 SAPI5 (Windows, tanpa unduhan)
+# Cadangan: pyttsx3 SAPI5 (Windows, tanpa unduhan)
 pyttsx3==2.99
 
 # ── LLM offline ─────────────────────────────────────────────

@@ -106,23 +106,28 @@ class PemrosesLlmOffline:
         yield from self._hasilkan_ekstraksi_fallback(prompt_instruksi)
 
     def _hasilkan_ekstraksi_fallback(self, prompt_lengkap: str) -> Generator[str, None, None]:
-        """
-        Menghasilkan jawaban berbasis ekstraksi dokumen langsung secara streaming
-        sehingga pengguna tetap mendapatkan jawaban akurat seketika.
-        """
-        # Ekstrak bagian dokumen dari prompt
-        pola_dokumen = re.search(r"DOKUMEN RESMI KAMPUS UCIC:\n(.*?)\n<\|im_end\|>", prompt_lengkap, re.DOTALL)
-        if not pola_dokumen:
+        # 1. Periksa apakah sudah ada respon terarah dari intent classifier
+        tag_asisten = "<|im_start|>assistant\n"
+        if tag_asisten in prompt_lengkap:
+            bagian_asisten = prompt_lengkap.split(tag_asisten)[-1].split("<|im_end|>")[0].strip()
+            if bagian_asisten:
+                for kata in bagian_asisten.split(" "):
+                    yield kata + " "
+                return
+
+        # 2. Ekstrak bagian dokumen dari prompt
+        tag_dokumen = "DOKUMEN RESMI KAMPUS UCIC:\n"
+        if tag_dokumen not in prompt_lengkap:
             teks_default = (
                 "Halo! Terima kasih telah menghubungi SELA Customer Service UCIC. "
                 "Informasi yang Anda tanyakan belum tercatat secara spesifik pada basis data kami. "
-                "Silakan kunjungi situs resmi Universitas CIC di https://cic.ac.id atau hubungi nomor layanan kampus kami ya!"
+                "Silakan kunjungi situs resmi Universitas CIC di https://pmb.cic.ac.id atau hubungi WhatsApp PMB di 0812 1670 0519 ya!"
             )
             for kata in teks_default.split(" "):
                 yield kata + " "
             return
 
-        konten_dokumen = pola_dokumen.group(1).strip()
+        konten_dokumen = prompt_lengkap.split(tag_dokumen)[-1].split("<|im_end|>")[0].strip()
         # Ambil ringkasan kalimat utama dokumen
         baris_dokumen = [b.strip() for b in konten_dokumen.split("\n") if b.strip() and not b.startswith("---")]
 
@@ -130,7 +135,25 @@ class PemrosesLlmOffline:
         for kata in kalimat_pembuka.split(" "):
             yield kata + " "
 
-        for baris in baris_dokumen[:8]:
+        # Format baris dokumen dengan rapi, hindari pengulangan URL
+        url_ditemukan = set()
+        baris_terpilih = []
+        for baris in baris_dokumen:
+            if len(baris_terpilih) >= 7:
+                break
+            # Lewati baris kosong atau duplikat
+            if not baris or baris in baris_terpilih:
+                continue
+            # Batasi URL berulang agar tidak menimbulkan QR ganda
+            urls = re.findall(r"https?://\S+", baris)
+            if urls:
+                if any(u in url_ditemukan for u in urls):
+                    continue
+                for u in urls:
+                    url_ditemukan.add(u)
+            baris_terpilih.append(baris)
+
+        for baris in baris_terpilih:
             yield baris + "\n"
 
         kalimat_penutup = "\nAda lagi informasi seputar kampus UCIC yang ingin Anda tanyakan?"
@@ -146,26 +169,31 @@ class PemrosesLlmOffline:
         """
         buffer_kalimat = ""
         tanda_akhir_kalimat = {".", "?", "!", "\n"}
+        apakah_kalimat_pertama = True
 
         for token in self.hasilkan_jawaban_streaming(prompt_instruksi):
             buffer_kalimat += token
 
-            # Periksa apakah ada batas kalimat
-            apakah_ada_tanda = any(tanda in buffer_kalimat for tanda in tanda_akhir_kalimat)
-            if apakah_ada_tanda and len(buffer_kalimat.strip()) > 15:
-                # Cari pemisah kalimat terdekat
-                indeks_pemisah = max(
-                    buffer_kalimat.rfind("."),
-                    buffer_kalimat.rfind("?"),
-                    buffer_kalimat.rfind("!"),
-                    buffer_kalimat.rfind("\n"),
-                )
+            # Untuk kalimat pertama, izinkan tanda koma jika sudah mencapai panjang minimum
+            tanda_aktif = set(tanda_akhir_kalimat)
+            if apakah_kalimat_pertama and len(buffer_kalimat.strip()) > 20:
+                tanda_aktif.add(",")
+
+            apakah_ada_tanda = any(tanda in buffer_kalimat for tanda in tanda_aktif)
+            if apakah_ada_tanda and len(buffer_kalimat.strip()) > 10:
+                # Cari pemisah kalimat pertama yang muncul
+                indeks_pemisah = -1
+                for tanda in tanda_aktif:
+                    pos = buffer_kalimat.find(tanda)
+                    if pos != -1 and (indeks_pemisah == -1 or pos < indeks_pemisah):
+                        indeks_pemisah = pos
 
                 if indeks_pemisah != -1:
                     kalimat_siap = buffer_kalimat[: indeks_pemisah + 1].strip()
                     buffer_kalimat = buffer_kalimat[indeks_pemisah + 1 :]
 
                     if kalimat_siap:
+                        apakah_kalimat_pertama = False
                         yield {"tipe": "kalimat", "teks": kalimat_siap}
 
         # Keluarkan sisa buffer jika ada

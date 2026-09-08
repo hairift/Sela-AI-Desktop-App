@@ -9,6 +9,7 @@ import {
   getChatCompletion,
   speakText,
   stopSpeaking,
+  streamChatAndVoice,
   getTimeBasedGreeting,
   archiveConversationSession,
   prepareTranscriptForRag,
@@ -17,7 +18,7 @@ import {
 
 // ── SVG Icons ────────────────────────────────────────────────────
 const IconMic = ({ size = "md" }) => {
-  const cls = size === "lg" ? "w-12 h-12" : "w-5 h-5";
+  const cls = size === "lg" ? "w-12 h-12" : size === "sm" ? "w-4 h-4" : "w-5 h-5";
   return (
     <svg
       className={`${cls} text-white`}
@@ -94,6 +95,18 @@ const IconChevronDown = () => (
     <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
   </svg>
 );
+
+const IconChevronRight = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+  </svg>
+);
+
+const IconChat = () => (
+  <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+    <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+  </svg>
+);
 // ─────────────────────────────────────────────────────────────────
 
 import { t } from "../lib/translations";
@@ -105,16 +118,36 @@ const quickReplies = {
       label: "📝 Cara Daftar?",
       text: "Bagaimana cara mendaftar sebagai mahasiswa baru di UCIC?",
     },
-    // { label: '🎓 Info Beasiswa', text: 'Apa saja program beasiswa yang tersedia di UCIC?' }, // DISABLED - Awaiting complete scholarship data
-    // { label: '📞 Kontak BAA', text: 'Bagaimana cara menghubungi Biro Administrasi Akademik?' }, // DISABLED - Awaiting complete contact data
+    {
+      label: "💰 Biaya Kuliah",
+      text: "Berapa rincian biaya kuliah di UCIC?",
+    },
+    {
+      label: "🎓 Program Studi",
+      text: "Apa saja program studi dan jurusan yang ada di UCIC?",
+    },
+    {
+      label: "📍 Kontak & Lokasi",
+      text: "Di mana alamat kampus UCIC dan kontak yang bisa dihubungi?",
+    },
   ],
   en: [
     {
       label: "📝 How to Register?",
       text: "How do I register as a new student at UCIC?",
     },
-    // { label: '🎓 Scholarship Info', text: 'What scholarship programs are available at UCIC?' }, // DISABLED - Awaiting complete scholarship data
-    // { label: '📞 Contact BAA', text: 'How can I contact the Academic Administration Bureau?' }, // DISABLED - Awaiting complete contact data
+    {
+      label: "💰 Tuition Fees",
+      text: "What are the tuition fees at UCIC?",
+    },
+    {
+      label: "🎓 Study Programs",
+      text: "What study programs are offered at UCIC?",
+    },
+    {
+      label: "📍 Contact & Location",
+      text: "Where is UCIC campus located and how to contact?",
+    },
   ],
 };
 
@@ -130,18 +163,14 @@ const MIN_TRANSCRIPT_CHARS = 2; // izinkan kata pendek (mis. "krs", "pmb", "ya")
 const QUICK_COMMIT_SILENCE_MS = 500; // commit cepat setelah speech valid
 const QUICK_COMMIT_MIN_SPEECH_MS = 300;
 const MIN_RMS_FOR_VALID_SPEECH = 0.8; // Diturunkan: mikrofon laptop/built-in sering RMS rendah
-// ── Full-duplex barge-in (potong ucapan SELA dengan suara) ──
-const BARGE_IN_AKTIF = true; // interupsi suara otomatis saat SELA bicara
+// ── ASR Push-to-Talk (Hanya merekam saat tombol ditekan) ──
+const BARGE_IN_AKTIF = false; // Dinonaktifkan: mic tidak live-stream terus-menerus
 const BARGE_IN_GRACE_MS = 1200; // abaikan gema speaker di awal TTS
 const BARGE_IN_AMBANG_MULTIPLIER = 3.0; // ambang tinggi anti-gema (x threshold normal)
 const BARGE_IN_AMBANG_MIN = 12; // lantai ambang barge-in (skala RMS byte-domain)
 const BARGE_IN_TAHAN_MS = 400; // suara harus bertahan selama ini → bukan gema sesaat
 const IDLE_SESSION_MS = 90 * 1000; // 90 detik tanpa interaksi -> reset sesi
 const FACE_LOST_END_MS = 12 * 1000; // 12 detik wajah hilang saat sesi aktif -> reset
-// Deteksi mikrofon tidak aktif: jika RMS max < ambang batas setelah N siklus rekaman
-const MAX_RMS_AKTIF = 1.2;       // RMS di bawah ini dianggap tidak ada sinyal suara nyata
-const MAX_SIKLUS_TANPA_MIC = 2;  // Setelah 2 siklus tanpa sinyal → tandai sebagai tidak ada mic
-
 // Farewell detection
 const FAREWELL_KEYWORDS = [
   "terima kasih",
@@ -168,7 +197,6 @@ export default function VoiceUI({
   setLang,
   theme = "light",
 }) {
-  const [mode, setMode] = useState("speak");
   const [value, setValue] = useState("");
   const [focused, setFocused] = useState(false);
   const [avatarState, setAvatarState] = useState("idle");
@@ -182,6 +210,9 @@ export default function VoiceUI({
   const [langSelected, setLangSelected] = useState(true); // Default terpilih bahasa aktif
   const [awaitingLangSelect, setAwaitingLangSelect] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
+  const [latestSpokenText, setLatestSpokenText] = useState("");
+  const [showTextInput, setShowTextInput] = useState(false);
+  const [showChatPanel, setShowChatPanel] = useState(true);
 
   const messagesEndRef = useRef(null);
   const chatScrollRef = useRef(null);
@@ -200,8 +231,7 @@ export default function VoiceUI({
   const speechStartRef = useRef(null);
   const firstSpeechDetectedAtRef = useRef(null);
   const baselineStartedAtRef = useRef(null);
-  const modeRef = useRef(mode);
-  const dynamicThresholdRef = useRef(10); // fallback fallback jika baseline gagal
+  const dynamicThresholdRef = useRef(10); // fallback jika baseline gagal
   const suppressRecorderOnStopRef = useRef(false);
   const lastInteractionTimeRef = useRef(Date.now());
   const sessionEndingRef = useRef(false);
@@ -220,7 +250,7 @@ export default function VoiceUI({
 
   // Face detection refs
   const audioUnlockedRef = useRef(false); // true setelah tap pertama, tidak pernah reset
-  const activatedRef = useRef(false); // sync dengan activated state
+  const activatedRef = useRef(true); // sync dengan activated state (selalu siap di desktop)
   const videoRef = useRef(null);
   const videoStreamRef = useRef(null);
   const faceDetectorRef = useRef(null);
@@ -232,9 +262,6 @@ export default function VoiceUI({
   const MIN_FACE_SIZE_RATIO = 0.2; // minimum 20% dari video width (~1m distance untuk kiosk)
 
   // Sinkronkan refs dengan state
-  useEffect(() => {
-    modeRef.current = mode;
-  }, [mode]);
   useEffect(() => {
     avatarStateRef.current = avatarState;
   }, [avatarState]);
@@ -257,6 +284,31 @@ export default function VoiceUI({
         "[SELA] Kiosk mode aktif — audio auto-unlocked, menunggu wajah...",
       );
     }
+  }, []);
+
+  // Deteksi perangkat mikrofon fisik nyata pada perangkat
+  useEffect(() => {
+    async function deteksiPerangkatAudio() {
+      try {
+        if (navigator?.mediaDevices?.enumerateDevices) {
+          const daftar = await navigator.mediaDevices.enumerateDevices();
+          const adaMikrofon = daftar.some((d) => d.kind === "audioinput");
+          if (!adaMikrofon) {
+            console.warn("[SELA] Tidak ditemukan perangkat audio input (mikrofon fisik).");
+            setMicTidakAktif(true);
+          } else {
+            setMicTidakAktif(false);
+          }
+        }
+      } catch (err) {
+        console.warn("[SELA] Gagal mendeteksi daftar perangkat audio:", err);
+      }
+    }
+    deteksiPerangkatAudio();
+    navigator?.mediaDevices?.addEventListener?.("devicechange", deteksiPerangkatAudio);
+    return () => {
+      navigator?.mediaDevices?.removeEventListener?.("devicechange", deteksiPerangkatAudio);
+    };
   }, []);
 
   // Re-attach camera stream ke video element setiap kali overlay muncul
@@ -285,13 +337,13 @@ export default function VoiceUI({
   };
 
   const speakWithAvatar = (text, speechLang = lang, onDone = null) => {
-    // Interupsi suara (barge-in): hentikan SELA, langsung dengarkan pengguna
+    setLatestSpokenText(text);
+    // Interupsi suara: hentikan ucapan SELA
     const handleBargeInSuara = () => {
       stopSpeaking();
       hentikanMonitorBargeIn();
       setAvatarState("idle");
       isProcessingRef.current = false;
-      setTimeout(() => startListeningRef.current?.(), 200);
     };
     speakText(
       text,
@@ -437,10 +489,10 @@ export default function VoiceUI({
     }
 
     isProcessingRef.current = false;
-    activatedRef.current = false;
-    setActivated(false);
+    activatedRef.current = true;
+    setActivated(true);
     setAvatarState("idle");
-    setLangSelected(false);
+    setLangSelected(true);
     setAwaitingLangSelect(false);
     setFaceDetected(false);
     properFaceTimeRef.current = null;
@@ -533,7 +585,6 @@ export default function VoiceUI({
       stopSpeaking();
       setAvatarState("idle");
       isProcessingRef.current = false;
-      setTimeout(() => startListeningRef.current?.(), 200);
       return;
     }
     if (isListeningRef.current) {
@@ -611,7 +662,6 @@ export default function VoiceUI({
   startListeningRef.current = async () => {
     // Cek via ref — tidak pernah stale
     if (isListeningRef.current || isProcessingRef.current) return;
-    if (modeRef.current !== "speak") return;
 
     try {
       // ── Aggressive audio constraints untuk noisy environments ──
@@ -628,6 +678,7 @@ export default function VoiceUI({
       });
       streamRef.current = stream;
       setMicDenied(false);
+      setMicTidakAktif(false);
       isListeningRef.current = true;
 
       // AudioContext + Analyser untuk VAD
@@ -672,26 +723,10 @@ export default function VoiceUI({
             blobSize: audioBlob.size,
           });
 
-          // Deteksi mikrofon tidak aktif: cek apakah seluruh siklus tidak ada sinyal real
-          const rmsMaxSiklus = rmsMaxSiklusIniRef.current;
-          rmsMaxSiklusIniRef.current = 0; // reset untuk siklus berikutnya
-
-          if (rmsMaxSiklus < MAX_RMS_AKTIF) {
-            // RMS max siklus ini masih sangat rendah → kemungkinan besar tidak ada mic
-            siklusRmsTinggiRef.current += 1;
-            if (siklusRmsTinggiRef.current >= MAX_SIKLUS_TANPA_MIC) {
-              console.warn("[SELA] Terdeteksi: tidak ada mikrofon hardware aktif. Beralih ke mode teks.");
-              setMicTidakAktif(true);
-              // Jangan hentikan sesi — biarkan pengguna tetap chat via Type Mode
-            }
-          } else {
-            // Ada sinyal — mic aktif, reset penghitung
-            siklusRmsTinggiRef.current = 0;
-            setMicTidakAktif(false);
-          }
-
+          // Siklus hening/noise biasa — kembali ke idle (tidak auto-restart)
+          rmsMaxSiklusIniRef.current = 0;
           setAvatarState("idle");
-          setTimeout(() => startListeningRef.current?.(), 300);
+          stopListening();
           return;
         }
 
@@ -720,7 +755,6 @@ export default function VoiceUI({
             blobSize: audioBlob.size,
           });
           setAvatarState("idle");
-          setTimeout(() => startListeningRef.current?.(), 300);
           return;
         }
 
@@ -878,10 +912,68 @@ export default function VoiceUI({
         vadFrameRef.current = requestAnimationFrame(checkSilence);
       };
     } catch (err) {
-      console.error("Mic error:", err);
-      setMicDenied(true);
+      console.error("[SELA] Mic error:", err);
+      if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
+        setMicTidakAktif(true);
+        setMicDenied(false);
+      } else if (err.name === "NotAllowedError" || err.name === "PermissionDeniedError") {
+        setMicDenied(true);
+        setMicTidakAktif(false);
+      } else {
+        setMicDenied(true);
+      }
       setAvatarState("idle");
       isListeningRef.current = false;
+    }
+  };
+
+  // ── Penanganan Interaksi Asisten (RAG Anti-Halusinasi Cepat & Responsif) ──
+  const handleAssistantInteraction = async (userText, isVoice = false) => {
+    setIsWaitingAI(true);
+    isProcessingRef.current = true;
+    setAvatarState("thinking");
+    const requestId = ++aiRequestSeqRef.current;
+
+    const history = (currentChat?.messages || []).map((m) => ({
+      role: m.role,
+      content: m.text,
+    }));
+    history.push({ role: "user", content: userText });
+
+    try {
+      // 1. Eksekusi RAG Anti-Halusinasi & Pencocokan Fakta Kampus UCIC
+      const response = await getChatCompletion(history, lang);
+      if (requestId !== aiRequestSeqRef.current) return;
+      setIsWaitingAI(false);
+
+      if (response.text?.includes("[IGNORE_NOISE]")) {
+        console.log("[SELA] AI mendeteksi noise/obrolan acak, mengabaikan input.");
+        isProcessingRef.current = false;
+        setAvatarState("idle");
+        return;
+      }
+
+      // 2. Tampilkan pesan asisten di layar secara instan (bubble, suggestion buttons, media)
+      if (onReceive) onReceive(response);
+      markSessionInteraction();
+
+      // 3. Sintesis suara cepat (< 80ms) + Wawa Lipsync
+      const spokenText = response.spokenText || response.text;
+      setLatestSpokenText(spokenText);
+      speakWithAvatar(
+        spokenText,
+        response.detectedLang || lang,
+        () => {
+          isProcessingRef.current = false;
+        },
+      );
+    } catch (err) {
+      console.error("[SELA Interaction] Kendala pemrosesan jawaban:", err);
+      if (requestId !== aiRequestSeqRef.current) return;
+      setIsWaitingAI(false);
+      if (onReceive) onReceive(t[lang].error_network);
+      setAvatarState("idle");
+      isProcessingRef.current = false;
     }
   };
 
@@ -896,10 +988,9 @@ export default function VoiceUI({
 
       // Check if server filtered out background audio
       if (!rawText || rawText.trim().length === 0) {
-        console.log("[SELA] Server filtered out background audio → retrying");
+        console.log("[SELA] Server filtered out background audio");
         isProcessingRef.current = false;
         setAvatarState("idle");
-        setTimeout(() => startListeningRef.current?.(), 300);
         return;
       }
 
@@ -923,7 +1014,6 @@ export default function VoiceUI({
         console.log("[SELA] Diabaikan (filler mikrofon):", text);
         isProcessingRef.current = false;
         setAvatarState("idle");
-        setTimeout(() => startListeningRef.current?.(), 300);
         return;
       }
 
@@ -934,92 +1024,30 @@ export default function VoiceUI({
       }
 
       onSend(text);
-      setIsWaitingAI(true);
-      const requestId = ++aiRequestSeqRef.current;
-
-      const history = (currentChat?.messages || []).map((m) => ({
-        role: m.role,
-        content: m.text,
-      }));
-      history.push({ role: "user", content: text });
-      const response = await getChatCompletion(history, lang);
-      if (requestId !== aiRequestSeqRef.current) return;
-      setIsWaitingAI(false);
-      console.log("[SELA Voice] Query final ke RAG:", {
-        original: rawText,
-        final: text,
-        transcriptMarker: preparedTranscript.marker,
-      });
-
-      // 2. Filter LLM-Side: SELA mendeteksi obrolan orang lewat
-      if (response.text?.includes("[IGNORE_NOISE]")) {
-        console.log(
-          "[SELA] AI mendeteksi noise/obrolan acak, mengabaikan input.",
-        );
-        isProcessingRef.current = false;
-        setAvatarState("idle");
-        setTimeout(() => startListeningRef.current?.(), 300);
-        return;
-      }
-
-      if (onReceive) onReceive(response);
-      markSessionInteraction();
-
-      // Fallback: kalau TTS onEnd tidak pernah terpanggil (bug Chrome),
-      // paksa restart listen setelah estimasi durasi + buffer
-      const spokenText = response.spokenText || response.text;
-      const estDuration = Math.max(3000, spokenText.length * 80);
-      const ttsFallback = setTimeout(() => {
-        if (isProcessingRef.current) {
-          console.warn("[SELA] TTS onEnd timeout — force restart listen");
-          stopSpeaking();
-          setAvatarState("idle");
-          isProcessingRef.current = false;
-          setTimeout(() => startListeningRef.current?.(), 800);
-        }
-      }, estDuration + 2000);
-
-      speakText(
-        spokenText,
-        () => setAvatarState("speaking"),
-        () => {
-          clearTimeout(ttsFallback);
-          setAvatarState("idle");
-          isProcessingRef.current = false;
-          // Delay 800ms — beri waktu speaker selesai bergema sebelum mic aktif lagi
-          setTimeout(() => startListeningRef.current?.(), 800);
-        },
-        response.detectedLang || lang,
-      );
+      await handleAssistantInteraction(text, true);
     } catch (error) {
       console.error(error);
       setIsWaitingAI(false);
       if (onReceive) onReceive(t[lang].error_stt);
       setAvatarState("idle");
       isProcessingRef.current = false;
-      setTimeout(() => startListeningRef.current?.(), 1500);
     }
   };
 
-  // ── Auto-start saat mode speak DAN sudah diaktivasi ──────────
+  // ── Bersihkan audio saat unmount (tidak auto-listen) ──────────
   useEffect(() => {
-    if (mode !== "speak" || !activated) {
-      stopListening();
-      stopSpeaking();
-      hentikanMonitorBargeIn();
-      setAvatarState("idle");
-      isProcessingRef.current = false;
-      return;
-    }
-    const timer = setTimeout(() => startListeningRef.current?.(), 200);
+    stopListening();
+    stopSpeaking();
+    hentikanMonitorBargeIn();
+    setAvatarState("idle");
+    isProcessingRef.current = false;
     return () => {
-      clearTimeout(timer);
       stopListening();
       stopSpeaking();
       hentikanMonitorBargeIn();
       isProcessingRef.current = false;
     };
-  }, [mode, activated]);
+  }, [activated]);
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -1072,9 +1100,9 @@ export default function VoiceUI({
         endReason: "farewell",
       });
       isProcessingRef.current = false;
-      activatedRef.current = false;
+      activatedRef.current = true;
       setAvatarState("idle");
-      setActivated(false);
+      setActivated(true);
       if (onReset) onReset();
     }, 6000);
 
@@ -1090,10 +1118,10 @@ export default function VoiceUI({
           endReason: "farewell",
         });
         isProcessingRef.current = false;
-        activatedRef.current = false;
+        activatedRef.current = true;
         setAvatarState("idle");
-        setActivated(false);
-        setLangSelected(false);
+        setActivated(true);
+        setLangSelected(true);
         setAwaitingLangSelect(false);
         if (onReset) onReset();
       },
@@ -1149,31 +1177,7 @@ export default function VoiceUI({
       return;
     }
 
-    setAvatarState("thinking");
-    setIsWaitingAI(true);
-    const requestId = ++aiRequestSeqRef.current;
-    try {
-      const history = (currentChat?.messages || []).map((m) => ({
-        role: m.role,
-        content: m.text,
-      }));
-      history.push({ role: "user", content: userText });
-      const response = await getChatCompletion(history, lang);
-      if (requestId !== aiRequestSeqRef.current) return;
-      setIsWaitingAI(false);
-      if (onReceive) onReceive(response);
-      markSessionInteraction();
-      speakWithAvatar(
-        response.spokenText || response.text,
-        response.detectedLang || lang,
-        () => setAvatarState("idle"),
-      );
-    } catch {
-      if (requestId !== aiRequestSeqRef.current) return;
-      setIsWaitingAI(false);
-      if (onReceive) onReceive(t[lang].error_network);
-      setAvatarState("idle");
-    }
+    await handleAssistantInteraction(userText, false);
   };
 
   // ── Pilih bahasa saat greeting ────────────────────────────────
@@ -1188,51 +1192,17 @@ export default function VoiceUI({
 
     // Use time-based greeting instead of static message
     const timeBasedGreeting = getTimeBasedGreeting(chosen);
-    const confirm = timeBasedGreeting;
-
-    if (mode === "type") {
-      onSend(langLabel);
-      if (onReceive) onReceive(confirm);
-    }
+    onSend(langLabel);
+    if (onReceive) onReceive(timeBasedGreeting);
+    setLatestSpokenText(timeBasedGreeting);
     speakWithAvatar(
-      confirm,
+      timeBasedGreeting,
       chosen,
       () => {
-        startListeningRef.current?.();
+        setAvatarState("idle");
       },
     );
   };
-
-  // ── Mode Toggle ───────────────────────────────────────────────
-  const ModeToggle = () => (
-    <div className="flex justify-center">
-      <div className="inline-flex items-center bg-white/70 dark:bg-slate-900/70 backdrop-blur-sm border border-gray-100/80 dark:border-white/10 rounded-2xl shadow-sm overflow-hidden transition-colors">
-        <button
-          id="mode-type-btn"
-          onClick={() => setMode("type")}
-          className={`flex flex-col items-center gap-1 px-8 py-2.5 transition-all duration-200
-            ${mode === "type" ? "text-blue-600 dark:text-blue-400" : "text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"}`}
-        >
-          <IconKeyboard />
-          <span className="text-[10px] font-bold uppercase tracking-widest">
-            {t[lang].type_mode}
-          </span>
-        </button>
-        <div className="w-px h-8 bg-gray-200 dark:bg-white/10" />
-        <button
-          id="mode-speak-btn"
-          onClick={() => setMode("speak")}
-          className={`flex flex-col items-center gap-1 px-8 py-2.5 transition-all duration-200
-            ${mode === "speak" ? "text-blue-600 dark:text-blue-400" : "text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"}`}
-        >
-          <IconMicToggle />
-          <span className="text-[10px] font-bold uppercase tracking-widest">
-            {t[lang].speak_mode}
-          </span>
-        </button>
-      </div>
-    </div>
-  );
 
   const statusLabel = () => {
     if (micDenied)
@@ -1253,56 +1223,127 @@ export default function VoiceUI({
 
   const messages = currentChat?.messages ?? [];
 
-  // ── SPEAK MODE ────────────────────────────────────────────────
-  if (mode === "speak") {
-    const latestMsg = messages[messages.length - 1];
+  return (
+    <main className="flex-1 relative flex flex-col overflow-hidden">
+      {/* 3D Avatar full screen background */}
+      <div className="absolute inset-0 pointer-events-none z-0">
+        <div className="pointer-events-auto w-full h-full">
+          <AvatarPlaceholder state={avatarState} theme={theme} />
+        </div>
+      </div>
 
-    // Overlay sebelum aktivasi — kamera preview + face detection status
-    if (!activated) {
-      return (
-        <main className="flex-1 relative flex flex-col items-center justify-center overflow-hidden">
-          {/* Avatar 3D Background - FULL SCREEN */}
-          <div className="absolute inset-0 pointer-events-none z-0">
-            <div className="pointer-events-auto w-full h-full">
-              <AvatarPlaceholder state="idle" theme={theme} />
-            </div>
+      {/* Hidden Camera video element */}
+      <div className="absolute opacity-0 pointer-events-none overflow-hidden w-1 h-1">
+        <video ref={videoRef} muted playsInline autoPlay />
+      </div>
+
+      {/* Tombol Terapung Buka Chat Panel (Muncul saat bilah chat disembunyikan) */}
+      {!showChatPanel && (
+        <button
+          type="button"
+          onClick={() => setShowChatPanel(true)}
+          className="absolute top-4 right-4 z-30 flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-white/85 dark:bg-slate-900/85 backdrop-blur-xl border border-white/60 dark:border-slate-700/60 shadow-xl hover:shadow-2xl hover:scale-105 active:scale-95 text-xs font-semibold text-gray-800 dark:text-gray-100 transition-all cursor-pointer group"
+          title="Buka bilah chat"
+        >
+          <span className="p-1.5 rounded-lg bg-blue-500/15 text-blue-600 dark:text-blue-400 group-hover:bg-blue-500 group-hover:text-white transition-all">
+            <IconChat />
+          </span>
+          <span>{lang === "id" ? "Buka Chat" : "Open Chat"}</span>
+          {messages.length > 0 && (
+            <span className="px-1.5 py-0.5 text-[10px] font-bold rounded-full bg-blue-600 text-white">
+              {messages.length}
+            </span>
+          )}
+        </button>
+      )}
+
+      {/* Bilah Chat Kanan Interaktif (Bisa Disembunyikan / Dimunculkan) */}
+      <div
+        className={`absolute top-3 right-4 bottom-3 w-[calc(100%-32px)] sm:w-[380px] lg:w-[420px] max-w-[420px] flex flex-col justify-between p-4 rounded-3xl bg-white/85 dark:bg-slate-900/90 backdrop-blur-2xl border border-white/60 dark:border-slate-700/60 shadow-2xl z-30 transition-all duration-300 ease-out overflow-hidden ${
+          showChatPanel
+            ? "translate-x-0 opacity-100 pointer-events-auto"
+            : "translate-x-[115%] opacity-0 pointer-events-none"
+        }`}
+      >
+        {/* Header Panel Kanan */}
+        <div className="flex items-center justify-between pb-2.5 border-b border-gray-200/60 dark:border-slate-700/60">
+          <div className="flex items-center gap-2">
+            <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+            <span className="text-xs font-bold tracking-wider text-gray-800 dark:text-gray-200 uppercase">
+              SELA Asisten UCIC
+            </span>
           </div>
-
-          {/* Hidden Camera for Face Detection */}
-          <div className="absolute opacity-0 pointer-events-none overflow-hidden w-1 h-1">
-            <video ref={videoRef} muted playsInline autoPlay />
-          </div>
-
-          <div className="absolute bottom-8 z-20">
-            <ModeToggle />
-          </div>
-        </main>
-      );
-    }
-
-    return (
-      <main className="flex-1 relative flex flex-col overflow-hidden">
-        {/* Avatar full screen */}
-        <div className="absolute inset-0 pointer-events-none z-0">
-          <div className="pointer-events-auto w-full h-full">
-            <AvatarPlaceholder state={avatarState} theme={theme} />
+          <div className="flex items-center gap-1.5">
+            {messages.length > 0 && (
+              <button
+                type="button"
+                onClick={onNewChat}
+                className="text-[11px] px-2.5 py-1 rounded-full text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/60 hover:bg-blue-100 dark:hover:bg-blue-900/60 font-semibold transition-all cursor-pointer"
+                title="Mulai sesi percakapan baru"
+              >
+                {lang === "id" ? "+ Sesi Baru" : "+ New Chat"}
+              </button>
+            )}
+            {/* Tombol Sembunyikan Bilah Chat */}
+            <button
+              type="button"
+              onClick={() => setShowChatPanel(false)}
+              className="p-1.5 rounded-xl hover:bg-gray-100 dark:hover:bg-slate-800 text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 transition-all cursor-pointer"
+              title="Sembunyikan bilah chat"
+            >
+              <IconChevronRight />
+            </button>
           </div>
         </div>
 
-        {/* Chat bubbles — landscape/wide mode only */}
-        <div className="absolute top-0 right-0 bottom-28 w-[340px] hidden md:flex [@media(orientation:portrait)]:hidden flex-col justify-end pr-8 pb-6 pt-4 pointer-events-auto z-10 transition-colors overflow-hidden">
+        {/* Area Konten Chat / Tampilan Awal (Empty State) */}
+        <div className="flex-1 overflow-hidden relative flex flex-col justify-end my-2">
           {messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center h-full text-center gap-2 pb-4 opacity-50">
-              <IconSparkle />
-              <p className="text-xs text-gray-400 dark:text-gray-500 mt-2 italic tracking-widest">
-                SELA AI
-              </p>
+            <div className="flex flex-col items-center justify-center my-auto text-center gap-4 py-4 px-2 animate-fade-in">
+              <div className="p-3.5 rounded-2xl bg-blue-50 dark:bg-slate-800/90 text-blue-500 shadow-inner">
+                <IconSparkle />
+              </div>
+              <div>
+                <h3 className="text-3xl font-light text-gray-800 dark:text-gray-100 tracking-tight italic font-serif">
+                  SELA
+                </h3>
+                <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 font-medium">
+                  {lang === "id"
+                    ? "Ketik pesan, pilih topik, atau gunakan audio"
+                    : "Type a message, pick a topic, or use voice"}
+                </p>
+              </div>
+
+              {/* Tombol Cepat Pertanyaan Populer */}
+              <div className="w-full mt-2">
+                <p className="text-[10px] text-gray-400 dark:text-gray-500 mb-2.5 font-bold uppercase tracking-widest">
+                  {lang === "id" ? "PERTANYAAN POPULER" : "POPULAR QUESTIONS"}
+                </p>
+                <div className="flex flex-col gap-2 w-full">
+                  {quickReplies[lang]?.map((qr, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        handleSubmit(qr.text);
+                      }}
+                      className="w-full py-2.5 px-3.5 rounded-xl bg-white hover:bg-slate-50 dark:bg-slate-800/90 dark:hover:bg-slate-750 text-slate-700 dark:text-slate-100 hover:text-blue-700 dark:hover:text-blue-300 border border-slate-200/90 dark:border-slate-700/80 hover:border-blue-300 dark:hover:border-blue-500/40 text-xs font-medium shadow-sm hover:shadow active:scale-[0.98] transition-all text-left flex items-center justify-between gap-2 cursor-pointer group"
+                    >
+                      <span className="truncate">{qr.label}</span>
+                      <svg className="w-3.5 h-3.5 text-gray-400 group-hover:text-blue-600 dark:group-hover:text-blue-400 shrink-0 transition-transform group-hover:translate-x-0.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                      </svg>
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           ) : (
             <div
               ref={chatScrollRef}
               onScroll={handleChatScroll}
-              className="flex flex-col gap-1 overflow-y-auto hide-scrollbar"
+              className="flex-1 overflow-y-auto pr-1 flex flex-col gap-1 hide-scrollbar"
             >
               {messages.map((msg) => (
                 <div key={msg.id}>
@@ -1311,7 +1352,17 @@ export default function VoiceUI({
                     text={msg.text}
                     lang={lang}
                     isNew={msg.role === "assistant" && msg.id === latestSelaId}
+                    isSpeaking={avatarState === "speaking" && msg.id === latestSelaId}
                   />
+                  {msg.role === "assistant" &&
+                    msg.suggestions &&
+                    msg.suggestions.length > 0 && (
+                      <SuggestionButtons
+                        suggestions={msg.suggestions}
+                        onClick={(suggestion) => handleSubmit(suggestion)}
+                        isVisible
+                      />
+                    )}
                   {msg.role === "assistant" &&
                     msg.media &&
                     msg.media.length > 0 && <MediaCarousel media={msg.media} />}
@@ -1323,332 +1374,226 @@ export default function VoiceUI({
               <div ref={messagesEndRef} />
             </div>
           )}
-        </div>
-        {/* Tombol scroll ke bawah — voice mode, di atas panel chat */}
-        {!isAtBottom && messages.length > 0 && (
-          <button
-            onClick={scrollToBottom}
-            className="absolute bottom-40 right-[155px] z-30 w-8 h-8 rounded-full hidden md:flex [@media(orientation:portrait)]:hidden
-              bg-white/90 dark:bg-slate-800/90 border border-gray-200/70 dark:border-white/10
-              shadow-lg items-center justify-center text-gray-500 dark:text-gray-300
-              hover:bg-white dark:hover:bg-slate-700 active:scale-95 transition-all duration-150 animate-fade-in"
-          >
-            <IconChevronDown />
-          </button>
-        )}
 
-        <div className="flex-1 pointer-events-none" />
-
-        {/* Bottom content for speak mode */}
-        <div className="flex flex-col items-center gap-3 pb-8 pt-2 px-4 relative z-20 pointer-events-auto">
-          <div className="w-full max-w-sm md:hidden [@media(orientation:portrait)]:block">
-            {/* Portrait mode: Show LiveCaption when SELA is speaking */}
-            {avatarState === "speaking" && latestMsg?.role === "assistant" && (
-              <LiveCaption
-                text={latestMsg.text}
-                isLoading={false}
-                avatarState={avatarState}
-              />
-            )}
-            {/* Show loading when waiting for AI response */}
-            {isWaitingAI && avatarState !== "speaking" && (
-              <ChatBubble role="assistant" text="" lang={lang} isLoading />
-            )}
-            {/* Show latest message when not speaking and not waiting */}
-            {avatarState !== "speaking" && !isWaitingAI && latestMsg && (
-              <div className="animate-fade-in">
-                <ChatBubble
-                  role={latestMsg.role}
-                  text={latestMsg.text}
-                  lang={lang}
-                  qrVisibleMs={20000}
-                  isNew={
-                    latestMsg.role === "assistant" &&
-                    latestMsg.id === latestSelaId
-                  }
-                />
-                {latestMsg.role === "assistant" &&
-                  latestMsg.media &&
-                  latestMsg.media.length > 0 && (
-                    <MediaCarousel media={latestMsg.media} />
-                  )}
-              </div>
-            )}
-          </div>
-
-          {/* Tombol Interaktif Mikrofon / Suara Speak Mode */}
-          <div className="flex flex-col items-center gap-2 my-2">
+          {/* Tombol Scroll ke Bawah */}
+          {!isAtBottom && messages.length > 0 && (
             <button
-              id="voice-action-btn"
               type="button"
-              onClick={handleToggleVoice}
-              className={`relative w-20 h-20 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 transform active:scale-95 ${
-                avatarState === "listening"
-                  ? "bg-red-500 shadow-red-500/50 animate-pulse ring-8 ring-red-400/30 text-white"
-                  : avatarState === "speaking"
-                  ? "bg-amber-500 shadow-amber-500/50 animate-pulse ring-8 ring-amber-400/30 text-white"
-                  : avatarState === "thinking"
-                  ? "bg-indigo-600 shadow-indigo-500/50 ring-4 ring-indigo-300/30 text-white"
-                  : "bg-gradient-to-tr from-blue-600 to-cyan-500 shadow-blue-500/40 hover:from-blue-700 hover:to-cyan-600 hover:scale-105 ring-4 ring-blue-300/30 text-white"
-              }`}
-              title={
-                avatarState === "listening"
-                  ? "Sedang merekam suara... Klik untuk mengirim sekarang"
-                  : avatarState === "speaking"
-                  ? "SELA sedang bicara... Klik untuk memotong (interupsi)"
-                  : "Klik untuk mulai berbicara"
-              }
-            >
-              {avatarState === "speaking" ? (
-                <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
-                </svg>
-              ) : avatarState === "thinking" ? (
-                <svg className="w-8 h-8 text-white animate-spin" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-              ) : (
-                <IconMic size="lg" />
-              )}
-            </button>
-            <p className="text-xs font-semibold tracking-wide text-gray-700 dark:text-gray-200">
-              {avatarState === "listening"
-                ? (lang === "id" ? "🎙️ Mendengarkan... (Bicara atau Klik untuk Kirim)" : "🎙️ Listening... (Speak or Click to Send)")
-                : avatarState === "speaking"
-                ? (lang === "id" ? "🔊 SELA Sedang Bicara (Klik untuk Potong)" : "🔊 SELA is Speaking (Click to Interrupt)")
-                : avatarState === "thinking"
-                ? (lang === "id" ? "⏳ Sedang Memproses Ucapan..." : "⏳ Processing Speech...")
-                : (lang === "id" ? "🎙️ Klik untuk Berbicara" : "🎙️ Click to Speak")}
-            </p>
-          </div>
-
-          <p className="text-xs text-gray-400 dark:text-gray-500 font-bold uppercase tracking-tighter text-center">
-            {statusLabel()}
-          </p>
-
-          {micDenied && (
-            <button
-              onClick={() => {
-                setMicDenied(false);
-                startListeningRef.current?.();
-              }}
-              className="text-xs text-blue-500 underline"
-            >
-              {lang === "id" ? "Coba lagi" : "Retry"}
-            </button>
-          )}
-
-          {/* Banner notifikasi: tidak ada mikrofon hardware terdeteksi */}
-          {micTidakAktif && !micDenied && (
-            <div className="flex flex-col items-center gap-2 px-4 py-3 bg-amber-500/20 border border-amber-400/40 rounded-2xl backdrop-blur-sm max-w-xs text-center animate-fade-in">
-              <span className="text-lg">🎤</span>
-              <p className="text-xs font-semibold text-amber-700 dark:text-amber-300">
-                {lang === "id"
-                  ? "Mikrofon tidak terdeteksi di komputer ini."
-                  : "No microphone detected on this computer."}
-              </p>
-              <p className="text-xs text-amber-600/80 dark:text-amber-400/80">
-                {lang === "id"
-                  ? "Gunakan Mode Ketik untuk chat teks, atau sambungkan mikrofon."
-                  : "Use Type Mode for text chat, or connect a microphone."}
-              </p>
-              <button
-                onClick={() => setMode("type")}
-                className="mt-1 px-4 py-1.5 rounded-full text-xs font-bold bg-amber-500 hover:bg-amber-600 text-white active:scale-95 transition-all"
-              >
-                {lang === "id" ? "⌨️ Beralih ke Mode Ketik" : "⌨️ Switch to Type Mode"}
-              </button>
-            </div>
-          )}
-
-          {/* Tombol pilihan bahasa — muncul setelah greeting bilingual selesai */}
-          {activated && awaitingLangSelect && !langSelected && avatarState === "idle" && (
-            <div className="flex gap-3 animate-fade-in">
-              <button
-                onClick={() => handleLangSelect("id")}
-                className="px-5 py-2 rounded-2xl text-sm font-semibold bg-blue-500 hover:bg-blue-600 active:scale-95 text-white shadow-md transition-all duration-150"
-              >
-                🇮🇩 Indonesia
-              </button>
-              <button
-                onClick={() => handleLangSelect("en")}
-                className="px-5 py-2 rounded-2xl text-sm font-semibold bg-white hover:bg-gray-50 active:scale-95 text-gray-700 border border-gray-200 shadow-md dark:bg-slate-700 dark:text-gray-100 dark:border-slate-600 transition-all duration-150"
-              >
-                🇬🇧 English
-              </button>
-            </div>
-          )}
-
-          <ModeToggle />
-        </div>
-      </main>
-    );
-  }
-
-  // ── TYPE MODE ─────────────────────────────────────────────────
-  return (
-    <main className="flex-1 relative flex flex-col overflow-hidden px-4 pt-4 pb-8 transition-colors">
-      <div className="flex-1 flex flex-col max-w-2xl w-full mx-auto overflow-hidden">
-        {messages.length === 0 ? (
-          <div className="flex-1 flex flex-col items-center justify-center text-center gap-6 pb-8">
-            <IconSparkle />
-            <div>
-              <h2 className="text-4xl font-light text-gray-600 dark:text-gray-200 tracking-tighter italic">
-                SELA
-              </h2>
-              <p className="text-sm text-gray-400 dark:text-gray-500 mt-2 font-medium">
-                {t[lang].type_message}
-              </p>
-            </div>
-
-            {/* Quick reply buttons */}
-            <div className="w-full px-2">
-              <p className="text-xs text-gray-400 dark:text-gray-500 mb-3 font-semibold uppercase tracking-widest">
-                {lang === "id" ? "Pertanyaan Populer" : "Popular Questions"}
-              </p>
-              <div className="flex flex-wrap gap-2 justify-center">
-                {quickReplies[lang]?.map((qr, idx) => (
-                  <button
-                    key={idx}
-                    onClick={() => handleSubmit(qr.text)}
-                    className="px-4 py-2.5 rounded-full bg-gradient-to-r from-blue-500 to-blue-600
-                               hover:from-blue-600 hover:to-blue-700
-                               dark:from-blue-600 dark:to-blue-700
-                               dark:hover:from-blue-700 dark:hover:to-blue-800
-                               text-white text-xs font-semibold
-                               active:scale-95 shadow-md
-                               transition-all duration-150"
-                  >
-                    {qr.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        ) : (
-          <div
-            ref={chatScrollRef}
-            onScroll={handleChatScroll}
-            className="flex-1 overflow-y-auto py-4 flex flex-col gap-1 hide-scrollbar"
-          >
-            {messages.map((msg, idx) => (
-              <div key={msg.id}>
-                <ChatBubble
-                  role={msg.role}
-                  text={msg.text}
-                  lang={lang}
-                  isNew={msg.role === "assistant" && msg.id === latestSelaId}
-                />
-                {msg.role === "assistant" &&
-                  msg.suggestions &&
-                  msg.suggestions.length > 0 && (
-                    <SuggestionButtons
-                      suggestions={msg.suggestions}
-                      onClick={(suggestion) => handleSubmit(suggestion)}
-                      isVisible
-                    />
-                  )}
-                {msg.role === "assistant" &&
-                  msg.media &&
-                  msg.media.length > 0 && <MediaCarousel media={msg.media} />}
-              </div>
-            ))}
-            {isWaitingAI && (
-              <ChatBubble role="assistant" text="" lang={lang} isLoading />
-            )}
-            <div ref={messagesEndRef} />
-          </div>
-        )}
-      </div>
-
-      <div className="w-full max-w-xl mx-auto mt-4">
-        {/* Tombol scroll ke bawah — di atas input bar */}
-        {!isAtBottom && messages.length > 0 && (
-          <div className="flex justify-center mb-3 animate-fade-in">
-            <button
               onClick={scrollToBottom}
-              className="w-9 h-9 rounded-full bg-white/90 dark:bg-slate-800/90 border border-gray-200/70 dark:border-white/10
-                shadow-lg flex items-center justify-center text-gray-500 dark:text-gray-300
-                hover:bg-white dark:hover:bg-slate-700 active:scale-95 transition-all duration-150"
+              className="absolute bottom-2 left-1/2 -translate-x-1/2 z-30 w-8 h-8 rounded-full
+                bg-white/95 dark:bg-slate-800/95 border border-gray-200 dark:border-slate-700
+                shadow-lg flex items-center justify-center text-gray-600 dark:text-gray-300
+                hover:bg-white dark:hover:bg-slate-700 active:scale-95 transition-all animate-fade-in cursor-pointer"
+              title="Gulir ke bawah"
             >
               <IconChevronDown />
             </button>
+          )}
+        </div>
+
+        {/* Quick chips bila pesan sudah ada */}
+        {messages.length > 0 && (
+          <div className="flex items-center gap-1.5 overflow-x-auto hide-scrollbar py-1 mb-1 z-10">
+            {quickReplies[lang]?.map((qr, idx) => (
+              <button
+                key={idx}
+                type="button"
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  handleSubmit(qr.text);
+                }}
+                className="whitespace-nowrap text-[11px] font-medium px-3 py-1 rounded-lg bg-blue-50 dark:bg-slate-800 text-blue-600 dark:text-blue-300 border border-blue-200/60 dark:border-slate-700 hover:bg-blue-100 dark:hover:bg-slate-700 transition-all flex-shrink-0 active:scale-95 cursor-pointer"
+              >
+                {qr.label}
+              </button>
+            ))}
           </div>
         )}
-        {/* Tombol pilihan bahasa — muncul setelah greeting bilingual di type mode */}
-        {awaitingLangSelect && !langSelected && (
-          <div className="flex gap-3 justify-center mb-4 animate-fade-in">
-            <button
-              onClick={() => handleLangSelect("id")}
-              className="px-5 py-2 rounded-2xl text-sm font-semibold bg-blue-500 hover:bg-blue-600 active:scale-95 text-white shadow-md transition-all duration-150"
-            >
-              🇮🇩 Indonesia
-            </button>
-            <button
-              onClick={() => handleLangSelect("en")}
-              className="px-5 py-2 rounded-2xl text-sm font-semibold bg-white hover:bg-gray-50 active:scale-95 text-gray-700 border border-gray-200 shadow-md dark:bg-slate-700 dark:text-gray-100 dark:border-slate-600 transition-all duration-150"
-            >
-              🇬🇧 English
-            </button>
-          </div>
-        )}
-        <form onSubmit={handleSubmit} className="relative mb-3">
+
+        {/* Bilah Form Input Ketik & Tombol Rekam Suara Langsung di Panel Kanan */}
+        <form onSubmit={handleSubmit} className="relative w-full pt-1">
           <input
-            id="main-input"
+            id="side-main-input"
             type="text"
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onFocus={() => setFocused(true)}
             onBlur={() => setFocused(false)}
             placeholder={
-              isRecordingTypeInput
-                ? (lang === "id" ? "🎙️ Sedang mendengarkan ucapan Anda... Silakan bicara!" : "🎙️ Listening... Speak now!")
-                : t[lang].type_message
+              avatarState === "listening"
+                ? (lang === "id" ? "🎙️ Sedang mendengarkan... Silakan bicara!" : "🎙️ Listening... Speak now!")
+                : (lang === "id" ? "Ketik pesan untuk Sela..." : "Type a message...")
             }
-            className={`w-full bg-white/85 dark:bg-slate-900/90 backdrop-blur-sm border rounded-full pl-5 pr-14 py-4
-                        text-gray-700 dark:text-gray-100 text-sm placeholder-gray-400 outline-none shadow-md
-                        transition-all duration-300
+            className={`w-full bg-white/95 dark:bg-slate-800/95 backdrop-blur-md border rounded-2xl pl-3.5 pr-11 py-2.5
+                        text-gray-800 dark:text-gray-100 text-xs placeholder-gray-400 outline-none shadow-sm
+                        transition-all duration-200
                         ${
-                          isRecordingTypeInput
-                            ? "border-red-400 ring-4 ring-red-400/40 shadow-red-200 animate-pulse"
+                          avatarState === "listening"
+                            ? "border-red-400 ring-4 ring-red-400/30 animate-pulse shadow-red-200"
                             : focused
-                            ? "border-blue-300 dark:border-blue-500 ring-4 ring-blue-100/60 dark:ring-blue-900/40 shadow-blue-100/60"
-                            : "border-gray-200/70 dark:border-white/10"
+                            ? "border-blue-500 ring-2 ring-blue-200 dark:ring-blue-900"
+                            : "border-gray-200 dark:border-slate-700"
                         }`}
           />
           <button
-            id="send-btn"
+            id="side-send-btn"
             type={value.trim() ? "submit" : "button"}
-            onClick={value.trim() ? undefined : handleToggleTypeMic}
-            aria-label={value.trim() ? "Send" : "Microphone"}
-            className={`absolute right-2 top-1/2 -translate-y-1/2
-                       w-10 h-10 rounded-full flex items-center justify-center
-                       shadow-lg active:scale-95 transition-all duration-150 ${
-                         isRecordingTypeInput
-                           ? "bg-red-500 animate-pulse text-white shadow-red-500/40 ring-4 ring-red-300"
-                           : "bg-gradient-to-br from-blue-500 to-blue-600 shadow-blue-400/40 hover:from-blue-600 hover:to-blue-700"
-                       }`}
+            onClick={value.trim() ? undefined : handleToggleVoice}
+            className={`absolute right-1.5 top-1/2 -translate-y-1/2 w-8 h-8 rounded-xl flex items-center justify-center shadow-md transition-all active:scale-95 cursor-pointer ${
+              value.trim()
+                ? "bg-blue-600 hover:bg-blue-700 text-white shadow-blue-500/30"
+                : avatarState === "listening"
+                ? "bg-red-500 hover:bg-red-600 text-white animate-pulse ring-2 ring-red-400 shadow-red-500/30"
+                : "bg-blue-600 hover:bg-blue-700 text-white shadow-blue-500/20"
+            }`}
             title={
               value.trim()
                 ? "Kirim pesan teks"
-                : isRecordingTypeInput
-                ? "Klik untuk berhenti dan kirim suara"
-                : "Klik untuk berbicara lewat mikrofon"
+                : avatarState === "listening"
+                ? "Sedang mendengarkan... Klik untuk selesai dan kirim"
+                : "Bicara lewat mikrofon"
             }
           >
             {value.trim() ? (
               <IconSend />
-            ) : isRecordingTypeInput ? (
-              <svg className="w-5 h-5 text-white" fill="currentColor" viewBox="0 0 24 24">
+            ) : avatarState === "listening" ? (
+              <svg className="w-3.5 h-3.5 text-white" fill="currentColor" viewBox="0 0 24 24">
                 <rect x="6" y="6" width="12" height="12" rx="1" />
               </svg>
             ) : (
-              <IconMic />
+              <IconMic size="sm" />
             )}
           </button>
         </form>
-        <ModeToggle />
+      </div>
+
+      {/* Live Caption Terapung di Tengah (Tampil saat bilah chat disembunyikan) */}
+      {!showChatPanel && (
+        <div className="absolute bottom-44 left-1/2 -translate-x-1/2 w-full max-w-2xl z-20 pointer-events-none px-4 flex flex-col items-center">
+          <LiveCaption
+            text={latestSpokenText}
+            isLoading={isWaitingAI}
+            avatarState={avatarState}
+          />
+        </div>
+      )}
+
+      {/* Tombol Cepat Topik Populer Terapung (Tampil saat bilah chat disembunyikan) */}
+      {!showChatPanel && (
+        <div className="absolute bottom-28 left-1/2 -translate-x-1/2 z-20 flex items-center justify-center gap-2 max-w-2xl flex-wrap px-4 pointer-events-auto">
+          {quickReplies[lang]?.map((qr, idx) => (
+            <button
+              key={idx}
+              type="button"
+              onClick={(e) => {
+                e.preventDefault();
+                handleSubmit(qr.text);
+              }}
+              className="px-3.5 py-1.5 rounded-full bg-white/80 dark:bg-slate-900/80 hover:bg-blue-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 hover:text-blue-600 dark:hover:text-blue-400 border border-slate-200/80 dark:border-slate-700/80 shadow-md backdrop-blur-md text-xs font-semibold active:scale-95 transition-all cursor-pointer flex items-center gap-1.5"
+            >
+              <span>{qr.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Bottom Voice Action Button & Status (TERPUSAT PERSIS DI TENGAH DEPAN 3D AVATAR) */}
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-20 flex flex-col items-center gap-2 pointer-events-auto max-w-xs">
+        {/* Tombol Suara Utama */}
+        <button
+          id="voice-action-btn"
+          type="button"
+          onClick={handleToggleVoice}
+          className={`relative w-20 h-20 rounded-full flex items-center justify-center shadow-2xl transition-all duration-300 transform active:scale-95 cursor-pointer ${
+            avatarState === "listening"
+              ? "bg-red-500 shadow-red-500/50 animate-pulse ring-8 ring-red-400/30 text-white"
+              : avatarState === "speaking"
+              ? "bg-amber-500 shadow-amber-500/50 animate-pulse ring-8 ring-amber-400/30 text-white"
+              : avatarState === "thinking"
+              ? "bg-indigo-600 shadow-indigo-500/50 ring-4 ring-indigo-300/30 text-white"
+              : "bg-blue-600 shadow-xl shadow-blue-600/30 hover:bg-blue-700 hover:scale-105 ring-4 ring-blue-200/60 dark:ring-blue-900/40 text-white"
+          }`}
+          title={
+            avatarState === "listening"
+              ? "Sedang merekam suara... Klik untuk mengirim sekarang"
+              : avatarState === "speaking"
+              ? "SELA sedang bicara... Klik untuk memotong (interupsi)"
+              : "Klik untuk mulai berbicara"
+          }
+        >
+          {avatarState === "speaking" ? (
+            <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor" />
+            </svg>
+          ) : avatarState === "thinking" ? (
+            <svg className="w-8 h-8 text-white animate-spin" fill="none" viewBox="0 0 24 24">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+          ) : (
+            <IconMic size="lg" />
+          )}
+        </button>
+
+        <p className="text-xs font-semibold tracking-wide text-gray-700 dark:text-gray-200">
+          {avatarState === "listening"
+            ? (lang === "id" ? "🎙️ Mendengarkan... (Bicara atau Klik untuk Kirim)" : "🎙️ Listening... (Speak or Click to Send)")
+            : avatarState === "speaking"
+            ? (lang === "id" ? "🔊 SELA Sedang Bicara (Klik untuk Potong)" : "🔊 SELA is Speaking (Click to Interrupt)")
+            : avatarState === "thinking"
+            ? (lang === "id" ? "⏳ Sedang Memproses Ucapan..." : "⏳ Processing Speech...")
+            : (lang === "id" ? "🎙️ Klik untuk Berbicara" : "🎙️ Click to Speak")}
+        </p>
+
+        <p className="text-xs text-gray-400 dark:text-gray-500 font-bold uppercase tracking-tighter text-center">
+          {statusLabel()}
+        </p>
+
+        {micDenied && (
+          <button
+            type="button"
+            onClick={() => {
+              setMicDenied(false);
+              startListeningRef.current?.();
+            }}
+            className="text-xs text-blue-500 underline cursor-pointer"
+          >
+            {lang === "id" ? "Coba lagi izin mikrofon" : "Retry mic permission"}
+          </button>
+        )}
+
+        {/* Banner info mikrofon tidak terdeteksi */}
+        {micTidakAktif && !micDenied && (
+          <div className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/10 border border-amber-400/30 rounded-xl text-center animate-fade-in">
+            <span className="text-sm">🎤</span>
+            <p className="text-[11px] font-medium text-amber-700 dark:text-amber-300">
+              {lang === "id"
+                ? "Mikrofon tidak terdeteksi. Silakan ketik pesan di bilah kanan."
+                : "No mic detected. Please type in the right chat panel."}
+            </p>
+          </div>
+        )}
+
+        {/* Tombol pilihan bahasa jika greeting meminta bahasa */}
+        {awaitingLangSelect && !langSelected && avatarState === "idle" && (
+          <div className="flex gap-2 animate-fade-in mt-1">
+            <button
+              type="button"
+              onClick={() => handleLangSelect("id")}
+              className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-blue-500 hover:bg-blue-600 active:scale-95 text-white shadow transition-all cursor-pointer"
+            >
+              🇮🇩 Indonesia
+            </button>
+            <button
+              type="button"
+              onClick={() => handleLangSelect("en")}
+              className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-white hover:bg-gray-50 active:scale-95 text-gray-700 border border-gray-200 shadow dark:bg-slate-700 dark:text-gray-100 dark:border-slate-600 transition-all cursor-pointer"
+            >
+              🇬🇧 English
+            </button>
+          </div>
+        )}
       </div>
     </main>
   );

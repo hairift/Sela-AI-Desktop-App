@@ -40,7 +40,7 @@ function splitTextByLinks(text = '') {
     }
 
     if (url) {
-      parts.push({ type: 'qr', value: url })
+      parts.push({ type: 'link', value: url })
     }
 
     if (trailing) {
@@ -193,18 +193,22 @@ function splitMarkdownBlocks(text = '') {
   return blocks
 }
 
-function renderInlineMarkdown(text = '', keyPrefix = 'inline', qrVisibleMs = null) {
+function renderInlineMarkdown(text = '', keyPrefix = 'inline') {
   const normalized = normalizeSelaAliases(text)
   const parts = splitTextByLinks(normalized)
 
   return parts.flatMap((part, partIndex) => {
-    if (part.type === 'qr') {
+    if (part.type === 'link') {
       return (
-        <QrLinkCard
-          key={`${keyPrefix}-qr-${partIndex}`}
-          url={part.value}
-          visibleMs={qrVisibleMs}
-        />
+        <a
+          key={`${keyPrefix}-link-${partIndex}`}
+          href={part.value}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-blue-600 dark:text-blue-400 hover:underline font-medium break-all"
+        >
+          {part.value}
+        </a>
       )
     }
 
@@ -294,51 +298,65 @@ function ChatContent({ text, qrVisibleMs = null }) {
   const { answerText, suggestions } = splitFollowUpSuggestions(text)
   const blocks = splitMarkdownBlocks(answerText)
 
-  if (blocks.length === 0) {
-    return (
-      <ChatSuggestionLayout suggestions={suggestions}>
-        <span className="whitespace-pre-wrap break-words">
-          {renderInlineMarkdown(answerText, 'fallback', qrVisibleMs)}
-        </span>
-      </ChatSuggestionLayout>
-    )
+  // Ekstrak tautan pertama yang valid untuk kartu QR tunggal (mencegah QR ganda)
+  const matches = answerText.match(URL_PATTERN)
+  let primaryQrUrl = null
+  if (matches && matches.length > 0) {
+    let raw = matches[0]
+    while (TRAILING_PUNCTUATION.test(raw)) {
+      raw = raw.slice(0, -1)
+    }
+    primaryQrUrl = raw
   }
 
   return (
     <ChatSuggestionLayout suggestions={suggestions}>
       <div className="space-y-2 break-words">
-        {blocks.map((block, blockIndex) => {
-          if (block.type === 'heading') {
-            const headingClass =
-              block.level === 1
-                ? 'text-base font-semibold text-gray-900 dark:text-white'
-                : 'text-sm font-semibold text-gray-800 dark:text-gray-100'
+        {blocks.length === 0 ? (
+          <span className="whitespace-pre-wrap break-words">
+            {renderInlineMarkdown(answerText, 'fallback')}
+          </span>
+        ) : (
+          blocks.map((block, blockIndex) => {
+            if (block.type === 'heading') {
+              const headingClass =
+                block.level === 1
+                  ? 'text-base font-semibold text-gray-900 dark:text-white'
+                  : 'text-sm font-semibold text-gray-800 dark:text-gray-100'
+
+              return (
+                <p key={`heading-${blockIndex}`} className={headingClass}>
+                  {renderInlineMarkdown(block.content, `heading-${blockIndex}`)}
+                </p>
+              )
+            }
+
+            if (block.type === 'ordered-list') {
+              return (
+                <ol key={`ol-${blockIndex}`} className="list-decimal space-y-1.5 pl-5 leading-relaxed">
+                  {block.items.map((item, itemIndex) => (
+                    <li key={`ol-${blockIndex}-${itemIndex}`} className="whitespace-pre-wrap pl-0.5">
+                      {renderInlineMarkdown(item, `ol-${blockIndex}-${itemIndex}`)}
+                    </li>
+                  ))}
+                </ol>
+              )
+            }
 
             return (
-              <p key={`heading-${blockIndex}`} className={headingClass}>
-                {renderInlineMarkdown(block.content, `heading-${blockIndex}`, qrVisibleMs)}
+              <p key={`p-${blockIndex}`} className="whitespace-pre-wrap break-words">
+                {renderInlineMarkdown(block.content, `p-${blockIndex}`)}
               </p>
             )
-          }
+          })
+        )}
 
-          if (block.type === 'ordered-list') {
-            return (
-              <ol key={`ol-${blockIndex}`} className="list-decimal space-y-1.5 pl-5 leading-relaxed">
-                {block.items.map((item, itemIndex) => (
-                  <li key={`ol-${blockIndex}-${itemIndex}`} className="whitespace-pre-wrap pl-0.5">
-                    {renderInlineMarkdown(item, `ol-${blockIndex}-${itemIndex}`, qrVisibleMs)}
-                  </li>
-                ))}
-              </ol>
-            )
-          }
-
-          return (
-            <p key={`p-${blockIndex}`} className="whitespace-pre-wrap break-words">
-              {renderInlineMarkdown(block.content, `p-${blockIndex}`, qrVisibleMs)}
-            </p>
-          )
-        })}
+        {/* Kartu QR tunggal yang rapi untuk pesan ini */}
+        {primaryQrUrl && (
+          <div className="pt-2 flex justify-start">
+            <QrLinkCard url={primaryQrUrl} visibleMs={qrVisibleMs} />
+          </div>
+        )}
       </div>
     </ChatSuggestionLayout>
   )
@@ -361,10 +379,19 @@ function ChatSuggestionLayout({ children, suggestions = [] }) {
   )
 }
 
-export default function ChatBubble({ role, text, lang = 'id', isLoading = false, isNew = false, qrVisibleMs = null }) {
+export default function ChatBubble({
+  role,
+  text,
+  lang = 'id',
+  isLoading = false,
+  isNew = false,
+  isSpeaking = false,
+  qrVisibleMs = null,
+}) {
   const isUser = role === 'user'
   const [displayed, setDisplayed] = useState(isNew ? '' : text)
   const intervalRef = useRef(null)
+  const wasSpeakingRef = useRef(isSpeaking)
 
   useEffect(() => {
     if (!isNew || !text) {
@@ -374,14 +401,35 @@ export default function ChatBubble({ role, text, lang = 'id', isLoading = false,
 
     setDisplayed('')
     let i = 0
+    // Kecepatan mengetik adaptif (~60-70 karakter/detik) agar responsif dan tidak menunda user membaca
+    const speed = text.length > 300 ? 12 : 16
     intervalRef.current = setInterval(() => {
       i++
       setDisplayed(text.slice(0, i))
-      if (i >= text.length) clearInterval(intervalRef.current)
-    }, 18) // ~55 karakter/detik — natural typing speed
+      if (i >= text.length) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+    }, speed)
 
-    return () => clearInterval(intervalRef.current)
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current)
+    }
   }, [text, isNew])
+
+  // Sinkronisasi Voice & Chat:
+  // Begitu suara AI selesai (isSpeaking: true -> false), langsung tampilkan teks utuh seketika
+  // sehingga teks tidak lagi tertinggal mengetik sendiri setelah audio selesai.
+  useEffect(() => {
+    if (wasSpeakingRef.current && !isSpeaking) {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current)
+        intervalRef.current = null
+      }
+      setDisplayed(text)
+    }
+    wasSpeakingRef.current = isSpeaking
+  }, [isSpeaking, text])
 
   return (
     <div className={`animate-fade-in flex flex-col ${isUser ? 'items-end' : 'items-start'} mb-3`}>

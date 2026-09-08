@@ -107,7 +107,7 @@ Daftar lengkap setiap program studi saya tampilkan di layar agar lebih mudah dib
   assert.doesNotMatch(spoken, /Teknik Informatika, S1 Sistem Informasi/i);
 });
 
-test("buildSpokenText keeps short detailed answers full for TTS", () => {
+test("buildSpokenText shortens detailed list answers with on-screen notice", () => {
   const plan = buildResponsePlan("kalau saya suka komputer masuk jurusan apa ya", {
     intent: "jurusan",
   });
@@ -118,10 +118,12 @@ Sistem Informasi: jurusan ini fokus pada pengelolaan sistem informasi dan aplika
 
   const spoken = buildSpokenText(shortAnswer, plan, "id", []);
 
-  assert.equal(spoken, shortAnswer);
+  assert.match(spoken, /layar/i);
+  assert.match(spoken, /Jika Anda suka komputer/i);
+  assert.doesNotMatch(spoken, /pengelolaan sistem informasi dan aplikasi/i);
 });
 
-test("buildSpokenText summarizes answers starting from three paragraphs", () => {
+test("buildSpokenText summarizes multi-paragraph answers into concise voice speech", () => {
   const plan = buildResponsePlan("kalau saya suka komputer masuk jurusan apa ya", {
     intent: "jurusan",
   });
@@ -134,6 +136,6 @@ Sistem Informasi lebih cocok jika Anda suka kombinasi komputer, data, dan proses
   const spoken = buildSpokenText(detailedAnswer, plan, "id", []);
 
   assert.notEqual(spoken, detailedAnswer);
-  assert.match(spoken, /Intinya/i);
+  assert.match(spoken, /layar/i);
   assert.match(spoken, /Teknik Informatika atau Sistem Informasi/i);
 });

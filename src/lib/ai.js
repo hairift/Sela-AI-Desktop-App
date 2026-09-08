@@ -7,6 +7,8 @@ import {
   buildSpokenText,
   prioritizeResponseMatches,
 } from "./responsePlan";
+import { connectAudioToLipsync, unlockAudioContext } from "./lipsync";
+import { audioQueueManager } from "./streamingAudioQueue";
 
 // ── RAG Setup ────────────────────────────────────────────────────────────────
 
@@ -2937,6 +2939,7 @@ let pemutarAudioAktif = null;
  * Menghentikan seluruh pemutaran suara yang sedang berjalan (Audio Cloned & Web Speech)
  */
 export function stopSpeaking() {
+  audioQueueManager.stop();
   if (pemutarAudioAktif) {
     try {
       pemutarAudioAktif.pause();
@@ -2952,62 +2955,117 @@ export function stopSpeaking() {
 }
 
 /**
- * Fungsi cadangan menggunakan Web Speech API bawaan browser jika server offline
+ * SELA Streaming Pipeline:
+ * Mengirim kueri ke WebSocket /ws/dupleks, menerima potongan teks dan audio,
+ * serta memutarnya secara berantai via audioQueueManager tanpa blocking.
  */
-function jalankanFallbackWebSpeech(teks, onStart, onEnd, lang = "id") {
-  if (!("speechSynthesis" in window)) {
-    if (onEnd) onEnd();
-    return;
+export function streamChatAndVoice({
+  query,
+  history = [],
+  lang = "id",
+  onTextChunk,
+  onAudioChunk,
+  onSentencePlay,
+  onStart,
+  onEnd,
+  onDone,
+  onError,
+}) {
+  const isSecure = typeof window !== "undefined" && window.location.protocol === "https:";
+  const defaultHost = "127.0.0.1:8008";
+  const host =
+    typeof window !== "undefined" &&
+    window.location.host &&
+    !window.location.protocol.startsWith("file")
+      ? window.location.host
+      : defaultHost;
+  const protocol = isSecure ? "wss:" : "ws:";
+  const wsUrl = `${protocol}//${host}/ws/dupleks`;
+  let socket = null;
+  let hasOpened = false;
+
+  audioQueueManager.startSession({
+    onStart,
+    onEnd,
+    onSentence: (sentence) => {
+      if (onSentencePlay) onSentencePlay(sentence);
+    },
+  });
+
+  try {
+    socket = new WebSocket(wsUrl);
+  } catch (err) {
+    if (onError) onError(err);
+    return null;
   }
 
-  window.speechSynthesis.cancel();
-
-  const doSpeak = () => {
-    const utterance = new SpeechSynthesisUtterance(teks);
-    let settled = false;
-    utterance.lang = lang === "en" ? "en-US" : "id-ID";
-    utterance.rate = 0.95;
-    utterance.pitch = 1.0;
-
-    const finalize = () => {
-      if (settled) return;
-      settled = true;
-      if (onEnd) onEnd();
-    };
-
-    utterance.onstart = () => {
-      if (onStart) onStart();
-    };
-    utterance.onend = () => {
-      finalize();
-    };
-    utterance.onerror = (e) => {
-      if (e?.error !== "interrupted") {
-        console.warn("[SELA SpeechSynthesis]", e?.error);
-      }
-      finalize();
-    };
-
-    const voices = window.speechSynthesis.getVoices();
-    if (voices.length > 0) {
-      const targetedLang = lang === "en" ? "en" : "id";
-      const available = voices.filter((v) => v.lang.includes(targetedLang));
-      if (available.length > 0) {
-        utterance.voice =
-          available.find((v) => v.name.toLowerCase().includes("female")) ||
-          available[0];
-      }
+  const connectionTimeout = setTimeout(() => {
+    if (!hasOpened) {
+      console.warn("[SELA Streaming] WebSocket connection timeout, closing...");
+      try {
+        socket.close();
+      } catch (_) {}
+      if (onError) onError(new Error("WebSocket connection timeout"));
     }
+  }, 4000);
 
-    window.speechSynthesis.speak(utterance);
+  socket.onopen = () => {
+    hasOpened = true;
+    clearTimeout(connectionTimeout);
+    socket.send(
+      JSON.stringify({
+        tipe: "tanya",
+        kueri: query,
+        riwayat: history,
+        bahasa: lang,
+      })
+    );
   };
 
-  if (window.speechSynthesis.getVoices().length > 0) {
-    setTimeout(doSpeak, 60);
-  } else {
-    window.speechSynthesis.onvoiceschanged = () => setTimeout(doSpeak, 60);
-  }
+  socket.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.tipe === "potongan_teks" && data.kalimat) {
+        if (onTextChunk) onTextChunk(data.kalimat);
+      } else if (data.tipe === "potongan_audio" && data.audio_base64) {
+        audioQueueManager.enqueue({
+          audio_base64: data.audio_base64,
+          format: data.format || "audio/wav",
+          sentence: data.kalimat,
+        });
+        if (onAudioChunk) onAudioChunk(data);
+      } else if (data.tipe === "selesai") {
+        audioQueueManager.markStreamFinished();
+        if (onDone) onDone(data);
+        try {
+          socket.close();
+        } catch (_) {}
+      }
+    } catch (parseErr) {
+      console.warn("[SELA Streaming] Gagal membaca paket WebSocket:", parseErr);
+    }
+  };
+
+  socket.onerror = (err) => {
+    console.warn("[SELA Streaming] WebSocket error:", err);
+    clearTimeout(connectionTimeout);
+    if (onError) onError(err);
+  };
+
+  return {
+    cancel: () => {
+      clearTimeout(connectionTimeout);
+      audioQueueManager.stop();
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        try {
+          socket.send(JSON.stringify({ tipe: "interupsi" }));
+          socket.close();
+        } catch (_) {}
+      }
+    },
+  };
 }
+
 
 /**
  * Memainkan suara respon SELA menggunakan audio hasil Voice Cloning offline dari backend
@@ -3019,53 +3077,81 @@ function jalankanFallbackWebSpeech(teks, onStart, onEnd, lang = "id") {
 export async function speakText(text, onStart, onEnd, lang = "id") {
   // Hentikan suara sebelumnya seketika (barge-in)
   stopSpeaking();
+  unlockAudioContext();
 
   if (!text || !text.trim()) {
     if (onEnd) onEnd();
     return;
   }
 
-  // 1. Prioritaskan sintesis audio kloning dari server AI lokal
+  // 1. Prioritaskan sintesis audio OmniVoice Voice Design dari server AI lokal
   try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35000);
+
     const respons = await fetch("/api/sintesis", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ teks_kalimat: text, bahasa: lang }),
+      signal: controller.signal,
     });
+    clearTimeout(timeoutId);
 
     if (respons.ok) {
       const dataSintesis = await respons.json();
       if (dataSintesis.audio_base64) {
-        console.log(`[SELA TTS] Memainkan suara hasil sintesis kloning (${dataSintesis.engine || 'voice-cloned'})`);
-        const tipeFormat = dataSintesis.format || "audio/mpeg";
-        const audio = new Audio(`data:${tipeFormat};base64,${dataSintesis.audio_base64}`);
+        console.log(`[SELA TTS] Memainkan suara OmniVoice Voice Design (${dataSintesis.engine || 'omnivoice'})`);
+        
+        // Konversi base64 ke Blob URL untuk performa audio dan lipsync optimal
+        const binaryString = atob(dataSintesis.audio_base64);
+        const bytes = new Uint8Array(binaryString.length);
+        for (let i = 0; i < binaryString.length; i++) {
+          bytes[i] = binaryString.charCodeAt(i);
+        }
+        const blob = new Blob([bytes], { type: dataSintesis.format || "audio/wav" });
+        const audioUrl = URL.createObjectURL(blob);
+        const audio = new Audio(audioUrl);
+        audio.volume = 1.0;
         pemutarAudioAktif = audio;
+
+        // Hubungkan ke Wawa Lipsync untuk analisis frekuensi audio real-time
+        connectAudioToLipsync(audio);
 
         audio.onplay = () => {
           if (onStart) onStart();
         };
 
         audio.onended = () => {
+          URL.revokeObjectURL(audioUrl);
           pemutarAudioAktif = null;
           if (onEnd) onEnd();
         };
 
         audio.onerror = (galatAudio) => {
-          console.warn("[SELA TTS] Kendala pemutaran audio kloning, beralih ke cadangan Web Speech:", galatAudio);
+          console.warn("[SELA TTS] Kendala pemutaran audio OmniVoice:", galatAudio);
+          URL.revokeObjectURL(audioUrl);
           pemutarAudioAktif = null;
-          jalankanFallbackWebSpeech(text, onStart, onEnd, lang);
+          if (onEnd) onEnd();
         };
 
-        await audio.play();
-        return;
+        try {
+          await audio.play();
+          return;
+        } catch (playErr) {
+          console.warn("[SELA TTS] audio.play() gagal diputar (kebijakan browser):", playErr);
+          URL.revokeObjectURL(audioUrl);
+          pemutarAudioAktif = null;
+          if (onEnd) onEnd();
+          return;
+        }
       }
     }
   } catch (galatKoneksi) {
-    console.warn("[SELA TTS] Endpoint sintesis backend tidak merespons:", galatKoneksi?.message);
+    console.warn("[SELA TTS] Endpoint sintesis backend error:", galatKoneksi?.message);
   }
 
-  // 2. Gunakan cadangan Web Speech jika backend belum siap
-  jalankanFallbackWebSpeech(text, onStart, onEnd, lang);
+  // Jika gagal, akhiri speaking tanpa memutar robot default browser
+  if (onEnd) onEnd();
 }
 
 // ── Time-based Greeting ──────────────────────────────────────────────────────

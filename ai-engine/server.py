@@ -75,7 +75,7 @@ async def cek_kesehatan_server():
         "model_whisper_tersedia": pengenal_suara.apakah_siap,
         "model_whisper_aktif": getattr(pengenal_suara, "nama_model_aktif", ""),
         "tts_siap": sintesis_suara.apakah_siap,
-        "tts_engine": "piper-female-natural + higgs-tts2-feminine (voice cloning dihapus)",
+        "tts_engine": "OmniVoice (k2-fsa) Voice Cloning + Piper Offline Female",
         "sampel_suara_kloning": len(sintesis_suara.daftar_sampel_audio),
     }
 
@@ -94,7 +94,7 @@ async def proses_obrolan_rest(data_mentah: dict):
 
     # 1. Bangun prompt berpagar fakta ketat dari RAG
     prompt_instruksi = mesin_rag.buat_prompt_instruksi_ketat(kueri, riwayat)
-    _, dokumen_rujukan, ditemukan = mesin_rag.bangun_konteks_grounding(kueri)
+    _, dokumen_rujukan, ditemukan = mesin_rag.bangun_konteks_grounding(kueri, riwayat)
 
     # 2. Hasilkan jawaban melalui LLM
     kumpulan_token = []
@@ -113,21 +113,30 @@ async def proses_obrolan_rest(data_mentah: dict):
     }
 
 
+from starlette.concurrency import run_in_threadpool
+
+
 @aplikasi_server.post("/api/transcribe")
 async def transkripsi_audio_rest(
     file: UploadFile = File(...),
     lang: Optional[str] = Form(None),
     bahasa: Optional[str] = Form("id"),
 ):
-    """Endpoint transkripsi suara menjadi teks via Whisper offline."""
+    """Endpoint transkripsi suara menjadi teks via Whisper offline non-blocking (faster-whisper)."""
     bahasa_efektif = lang or bahasa or "id"
     konten_bytes = await file.read()
-    hasil = pengenal_suara.transkripsikan_audio_bytes(konten_bytes, bahasa=bahasa_efektif)
+    hasil = await run_in_threadpool(
+        pengenal_suara.transkripsikan_audio_bytes,
+        konten_bytes,
+        bahasa=bahasa_efektif
+    )
     teks_hasil = hasil.get("teks", "")
     return {
         "text": teks_hasil,
         "teks": teks_hasil,
         "sukses": hasil.get("sukses", True),
+        "durasi": hasil.get("durasi", 0),
+        "bahasa": hasil.get("bahasa", bahasa_efektif),
     }
 
 
@@ -141,6 +150,16 @@ async def transkripsi_audio_rest_alias(
     return await transkripsi_audio_rest(file=file, lang=lang, bahasa=bahasa)
 
 
+@aplikasi_server.get("/api/status-asr")
+async def status_mesin_asr():
+    """Endpoint status kesiapan mesin Whisper ASR."""
+    return {
+        "apakah_siap": pengenal_suara.apakah_siap,
+        "nama_model": pengenal_suara.nama_model_aktif,
+        "perangkat": pengenal_suara.perangkat_aktif,
+    }
+
+
 @aplikasi_server.post("/api/sintesis")
 async def sintesis_audio_rest(data_permintaan: PermintaanSintesis):
     """Endpoint sintesis suara Text-to-Speech offline natural (perempuan ID/EN/Jawa)."""
@@ -148,6 +167,18 @@ async def sintesis_audio_rest(data_permintaan: PermintaanSintesis):
         data_permintaan.teks_kalimat, bahasa=data_permintaan.bahasa or "id"
     )
     return hasil
+
+
+@aplikasi_server.get("/api/status-tts")
+async def status_mesin_tts():
+    """
+    Endpoint monitoring status mesin TTS:
+    - piper_siap: Piper ONNX sudah terload (fallback cepat)
+    - omnivoice_siap: OmniVoice Voice Cloning sudah siap (kualitas tinggi)
+    - omnivoice_gagal: Inisialisasi OmniVoice gagal (lihat log server)
+    - engine_aktif: Engine yang saat ini digunakan ('omnivoice' atau 'piper')
+    """
+    return sintesis_suara.status_engine()
 
 
 @aplikasi_server.websocket("/ws/asr-stream")
@@ -268,7 +299,7 @@ async def websocket_full_dupleks(koneksi_ws: WebSocket):
 
                     # Bangun prompt berbasis RAG
                     prompt_instruksi = mesin_rag.buat_prompt_instruksi_ketat(teks_tanya, riwayat_chat)
-                    _, dokumen_rujukan, ditemukan = mesin_rag.bangun_konteks_grounding(teks_tanya)
+                    _, dokumen_rujukan, ditemukan = mesin_rag.bangun_konteks_grounding(teks_tanya, riwayat_chat)
 
                     # Kirim notifikasi mulai generasi
                     await koneksi_ws.send_json({
@@ -298,14 +329,15 @@ async def websocket_full_dupleks(koneksi_ws: WebSocket):
 
                         # Sintesis audio kalimat ini untuk langsung diputar (zero-latency streaming)
                         hasil_audio = await sintesis_suara.sintesis_teks_ke_audio_base64_async(kalimat, bahasa=lang)
-                        await koneksi_ws.send_json({
-                            "tipe": "potongan_audio",
-                            "kalimat": kalimat,
-                            "audio_base64": hasil_audio.get("audio_base64"),
-                            "format": hasil_audio.get("format", "audio/mpeg"),
-                            "engine": hasil_audio.get("engine"),
-                            "bahasa": hasil_audio.get("bahasa", "id-ID"),
-                        })
+                        if hasil_audio and hasil_audio.get("audio_base64"):
+                            await koneksi_ws.send_json({
+                                "tipe": "potongan_audio",
+                                "kalimat": kalimat,
+                                "audio_base64": hasil_audio.get("audio_base64"),
+                                "format": hasil_audio.get("format", "audio/wav"),
+                                "engine": hasil_audio.get("engine"),
+                                "bahasa": hasil_audio.get("bahasa", "id-ID"),
+                            })
 
                         # Beri jeda sangat singkat agar event loop dapat menangani interupsi
                         await asyncio.sleep(0.01)
@@ -314,6 +346,9 @@ async def websocket_full_dupleks(koneksi_ws: WebSocket):
                         await koneksi_ws.send_json({
                             "tipe": "selesai",
                             "teks_penuh": " ".join(teks_terkumpul),
+                            "dokumen_rujukan": [
+                                {"judul": d["judul"], "kategori": d["kategori"]} for d in dokumen_rujukan
+                            ],
                         })
 
                 # Jalankan tugas asinkron streaming

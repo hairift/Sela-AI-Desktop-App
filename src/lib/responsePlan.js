@@ -371,37 +371,45 @@ export function buildSpokenText(
   const plan = responsePlan || buildResponsePlan();
   const cleanedText = String(displayText || "").trim();
   if (!cleanedText) return "";
-  if (plan.ttsMode === "full") return cleanedText;
 
-  const paragraphCount = countReadableParagraphs(cleanedText);
-  const shouldSummarize =
-    plan.ttsMode === "summary_only" ||
-    paragraphCount >= 3;
-
-  if (!shouldSummarize) return cleanedText;
-
-  if (plan.displayMode === "list_detail" && plan.intent === "jurusan") {
+  // Untuk jawaban jurusan spesifik dengan daftar fakultas/prodi
+  if (plan.intent === "jurusan" && (plan.displayMode === "list_detail" || cleanedText.length > 120)) {
     const { facultyCount, programCount } = extractJurusanCounts(matches);
     if (facultyCount > 0 || programCount > 0) {
       if (lang === "en") {
-        return `UCIC has ${facultyCount || "several"} faculties and ${programCount || "multiple"} study programs. I am showing the full list on screen.`;
+        return `UCIC has ${facultyCount || "3"} faculties and ${programCount || "several"} study programs. I have displayed the full list on screen for you.`;
       }
-      return `UCIC punya ${facultyCount || "beberapa"} fakultas dan ${programCount || "beberapa"} program studi. Daftar lengkapnya saya tampilkan di layar.`;
+      return `UCIC memiliki ${facultyCount || "3"} fakultas dan ${programCount || "10"} program studi. Daftar lengkapnya sudah Sela tampilkan di layar ya.`;
     }
   }
 
-  const summaryLead = buildGenericSummary(
-    plan.intent,
-    plan.displayMode,
-    lang,
-  );
+  // Jika teks sangat pendek (<= 120 karakter) dan tidak memiliki list/bullet, bisa diucapkan langsung
+  const hasListMarkers = /(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/m.test(cleanedText);
+  const paragraphCount = countReadableParagraphs(cleanedText);
 
-  const core = extractLeadSentence(cleanedText, 140);
-  if (!core) return summaryLead;
-
-  if (lang === "en") {
-    return `${summaryLead} In short, ${core}`;
+  if (cleanedText.length <= 120 && !hasListMarkers && paragraphCount <= 1) {
+    return cleanedText;
   }
 
-  return `${summaryLead} Intinya, ${core}`;
+  // Untuk teks panjang, daftar, atau langkah: buat intisari manusiawi yang ramah dan ringkas
+  const leadSentence = extractLeadSentence(cleanedText, 130);
+
+  if (lang === "en") {
+    if (plan.displayMode === "step_detail") {
+      return `${leadSentence} Full step-by-step guidance is displayed on the screen for you.`;
+    }
+    if (plan.displayMode === "list_detail") {
+      return `${leadSentence} The complete list is displayed on the screen for you.`;
+    }
+    return `${leadSentence} Full details are displayed on the screen for you.`;
+  }
+
+  // Bahasa Indonesia
+  if (plan.displayMode === "step_detail") {
+    return `${leadSentence} Langkah-langkah lengkapnya sudah Sela tampilkan di layar ya.`;
+  }
+  if (plan.displayMode === "list_detail") {
+    return `${leadSentence} Daftar lengkapnya sudah Sela tampilkan di layar ya.`;
+  }
+  return `${leadSentence} Rincian lengkapnya sudah Sela tampilkan di layar ya.`;
 }

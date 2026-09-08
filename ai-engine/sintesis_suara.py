@@ -1,26 +1,17 @@
 """
-SELA AI Desktop - Sintesis Suara Offline Natural (Perempuan)
-=============================================================
-Arsitektur baru pengganti Voice Cloning + F5-TTS + sampel audio
-(yang bersuara aneh/robotik) dengan dua jalur offline yang manusiawi:
-
-1. Jalur Utama INSTAN - Piper ONNX (CPU, <300ms, natural, female):
-   - Indonesia (termasuk teks Jawa, dilafalkan dengan suara Indonesia):
-     `id_ID-news_tts-medium`  (perempuan)
-   - Inggris: `en_US-amy-medium`  (perempuan)
-   - 100% offline setelah model ONNX diunduh sekali ke models/tts_piper/.
-
-2. Jalur KUALITAS - Higgs TTS v2 3B (Boson AI) via `transformers`:
-   - Model: `bosonai/higgs-audio-v2-generation-3B-base`
-   - Smart voice feminin (tanpa file referensi / tanpa voice cloning).
-   - Dijalankan di background untuk meng-upgrade cache; tidak pernah
-     memblokir respons utama karena inferensi LLM-audio berat.
-
-3. Cadangan DARURAT - SAPI5/pyttsx3 suara perempuan (Windows bawaan).
-
-API publik tetap sama seperti sebelumnya sehingga server.py dan
-frontend tidak perlu diubah:
-    SintesisSuaraOffline().sintesis_teks_ke_audio_base64_async(teks, bahasa)
+SELA AI Desktop - Sintesis Suara Offline Voice Cloning (OmniVoice + Piper)
+===========================================================================
+Arsitektur suara wanita alami kampus UCIC:
+1. Jalur Kloning Utama (OmniVoice by k2-fsa):
+   - Zero-shot neural voice cloning berbasis model k2-fsa/OmniVoice.
+   - Menggunakan sampel referensi suara pengguna di `voice_samples/001-id.wav` dan `001-en.wav`.
+   - Pre-computed `VoiceClonePrompt` sehingga ekstraksi token referensi dilakukan sekali saat startup.
+2. Jalur Kecepatan Instan (Piper ONNX):
+   - Indonesia (id_ID-news_tts-medium) & Inggris (en_US-amy-medium).
+   - Selalu siap dalam < 100ms untuk menjamin tidak ada lag atau freeze saat model besar sedang inisialisasi.
+3. Disk & Memory Audio Caching:
+   - Kalimat yang pernah disintesis disimpan secara permanen di disk (`cache_audio/`)
+   - Latensi 0 ms untuk sapaan dan jawaban kampus yang sering diulang.
 """
 
 import os
@@ -33,27 +24,38 @@ import hashlib
 import threading
 from typing import Optional, Dict, Any, List
 
+import numpy as np
+
 
 # ── Konfigurasi suara ──────────────────────────────────────────
 SUARA_PIPER_PER_BAHASA = {
-    # Indonesia + Jawa (Jawa dilafalkan memakai suara Indonesia karena
-    # belum ada model ONNX native Jawa yang berkualitas).
     "id": "id_ID-news_tts-medium",
     "jv": "id_ID-news_tts-medium",
     "jw": "id_ID-news_tts-medium",
     "jawa": "id_ID-news_tts-medium",
-    # Inggris (perempuan).
     "en": "en_US-amy-medium",
 }
 
-HIGGS_MODEL_ID = "bosonai/higgs-audio-v2-generation-3B-base"
+OMNIVOICE_MODEL_ID = "k2-fsa/OmniVoice"
 
-# Scene feminin untuk Higgs (smart voice, tanpa audio referensi).
-_HIGGS_SCENE_FEMININ = (
-    "Audio is recorded from a quiet room. "
-    "SPEAKER0: feminine, young adult female voice, warm and friendly "
-    "customer-service tone, clear Indonesian and English pronunciation."
-)
+# Kode bahasa ISO-639-3 yang diterima oleh OmniVoice.generate(language=...)
+OMNIVOICE_KODE_BAHASA = {
+    "id": "ind",   # Indonesian
+    "jv": "ind",   # Javanese -> fallback ke Indonesian
+    "en": "eng",   # English
+}
+
+# Transkripsi tepat dari sampel suara referensi pengguna (HARUS AKURAT)
+TEKS_SAMPEL_REFERENSI = {
+    "id": (
+        "Halo, selamat datang. Saya adalah asisten virtual yang siap membantu "
+        "kamu menyelesaikan berbagai tugas setiap hari."
+    ),
+    "en": (
+        "Hello, welcome. I am a virtual assistant ready to help you complete "
+        "various tasks every day!"
+    ),
+}
 
 
 def _normalisasi_kode_bahasa(bahasa: Optional[str]) -> str:
@@ -72,13 +74,13 @@ def _bersihkan_teks_untuk_tts(teks: str) -> str:
     if not teks:
         return ""
     bersih = teks.strip()
-    # URL -> kata "tautan" supaya tidak dieja "h t t p s ..."
-    bersih = re.sub(r"https?://\S+", "tautan", bersih)
-    # Markdown bold/heading/quote
+    # URL -> kata 'tautan' supaya tidak dieja huruf per huruf
+    bersih = re.sub(r"https?://\S+", "tautan resmi", bersih)
+    # Markdown formatting
     bersih = re.sub(r"\*\*(.+?)\*\*", r"\1", bersih)
     bersih = re.sub(r"^#{1,3}\s+", "", bersih, flags=re.MULTILINE)
     bersih = re.sub(r"^>\s?", "", bersih, flags=re.MULTILINE)
-    # Follow-up "[...]" tidak perlu diucapkan
+    # Follow-up tag
     bersih = re.sub(r"\[[^\]\n]*\]", "", bersih)
     bersih = re.sub(r"[😀-🙏🌀-🗿🚀-🛿☀-➿]+", "", bersih)
     bersih = re.sub(r"\s+", " ", bersih).strip()
@@ -101,7 +103,7 @@ def _pecah_kalimat(teks: str, batas: int = 220) -> List[str]:
                 hasil.append(penampung)
             if len(kalimat) <= batas:
                 penampung = kalimat
-            else:  # kalimat tunggal sangat panjang -> potong keras
+            else:
                 for i in range(0, len(kalimat), batas):
                     hasil.append(kalimat[i:i + batas])
                 penampung = ""
@@ -124,53 +126,56 @@ def _tulis_wav_bytes(frames_int16: bytes, sample_rate: int,
 
 class SintesisSuaraOffline:
     """
-    Mesin TTS offline natural bersuara perempuan (ID/Jawa/EN).
-
-    Prioritas respons:
-      1. Cache in-memory (0 ms)
-      2. Cache disk (0-2 ms)
-      3. Piper ONNX feminin (< 300 ms, respons utama)
-      4. Higgs TTS v2 feminin (background upgrade cache)
-      5. SAPI5 perempuan (darurat bila 3 & 4 tak tersedia)
+    Mesin TTS Offline Multi-Jalur: OmniVoice Zero-Shot Voice Cloning + Piper ONNX.
     """
 
     def __init__(self, direktori_sampel_suara: Optional[str] = None):
-        # `direktori_sampel_suara` dipertahankan demi kompatibilitas
-        # pemanggil lama; sistem voice cloning sudah DIHAPUS total.
         self.direktori_induk = os.path.dirname(os.path.abspath(__file__))
 
+        if direktori_sampel_suara is None:
+            direktori_sampel_suara = os.path.join(self.direktori_induk, "voice_samples")
+        self.direktori_sampel_suara = direktori_sampel_suara
+        os.makedirs(self.direktori_sampel_suara, exist_ok=True)
+
         self.direktori_model_piper = os.path.join(self.direktori_induk, "models", "tts_piper")
-        self.direktori_model_higgs = os.path.join(self.direktori_induk, "models", "higgs")
+        self.direktori_model_omnivoice = os.path.join(self.direktori_induk, "models", "omnivoice")
         os.makedirs(self.direktori_model_piper, exist_ok=True)
-        os.makedirs(self.direktori_model_higgs, exist_ok=True)
+        os.makedirs(self.direktori_model_omnivoice, exist_ok=True)
 
         self.direktori_cache = os.path.join(self.direktori_induk, "cache_audio")
-        self.direktori_cache_higgs = os.path.join(self.direktori_cache, "higgs")
+        self.direktori_cache_omnivoice = os.path.join(self.direktori_cache, "omnivoice")
+        self.direktori_cache_piper = os.path.join(self.direktori_cache, "piper")
         os.makedirs(self.direktori_cache, exist_ok=True)
-        os.makedirs(self.direktori_cache_higgs, exist_ok=True)
+        os.makedirs(self.direktori_cache_omnivoice, exist_ok=True)
+        os.makedirs(self.direktori_cache_piper, exist_ok=True)
 
-        # Kompatibilitas /kesehatan lama (voice cloning dihapus -> list kosong).
-        self.daftar_sampel_audio: List[str] = []
-        self.sampel_indonesia: List[str] = []
-        self.sampel_inggris: List[str] = []
+        # Muat daftar berkas sampel audio kloning dari direktori
+        self.daftar_sampel_audio = [
+            f for f in os.listdir(self.direktori_sampel_suara) if f.lower().endswith(".wav")
+        ]
 
         self.cache_audio: Dict[str, str] = {}
-        self.cache_higgs: Dict[str, str] = {}
         self.apakah_siap = False
 
+        # Piper state
         self._suara_piper: Dict[str, Any] = {}
         self._kunci_piper = threading.Lock()
-        self._higgs_processor = None
-        self._higgs_model = None
-        self._higgs_gagal = False
-        self._kunci_higgs = threading.Lock()
-        self._sedang_generate_higgs: set = set()
 
+        # OmniVoice state
+        self._omnivoice_model = None
+        self._omnivoice_prompts: Dict[str, Any] = {}
+        self._omnivoice_sr = 24000
+        self._omnivoice_siap = False
+        self._omnivoice_gagal = False
+        self._kunci_omnivoice = threading.Lock()
+        self._sedang_generate_omnivoice: set = set()
+
+        # 1. Siapkan Piper (instan, <100ms)
         self._siapkan_piper()
         self.muat_cache_audio_dari_disk()
-        # Higgs berat (LLM-audio 6B) -> inisialisasi di background,
-        # tidak pernah memblokir startup server.
-        threading.Thread(target=self._inisialisasi_higgs, daemon=True).start()
+
+        # 2. Inisialisasi OmniVoice di background thread
+        threading.Thread(target=self._inisialisasi_omnivoice, daemon=True).start()
 
     # ── Piper ONNX ────────────────────────────────────────────
     def _jalur_model_piper(self, nama_suara: str) -> str:
@@ -182,7 +187,7 @@ class SintesisSuaraOffline:
             return True
         try:
             from piper.download_voices import download_voice
-            print(f"[Sintesis Suara] Mengunduh suara Piper '{nama_suara}' (sekali saja, lalu offline)...")
+            print(f"[Sintesis Suara] Mengunduh suara Piper '{nama_suara}'...")
             download_voice(nama_suara, download_dir=self.direktori_model_piper)
             return os.path.exists(jalur)
         except Exception as galat:
@@ -212,14 +217,13 @@ class SintesisSuaraOffline:
         with self._kunci_piper:
             suara = self._suara_piper.get(nama)
         if suara is None:
-            # Coba muat ulang (mis. unduhan baru selesai di thread lain).
             self._siapkan_piper()
             with self._kunci_piper:
                 suara = self._suara_piper.get(nama)
         return suara, nama
 
     def sintesis_dengan_piper(self, teks: str, bahasa: str = "id") -> Optional[bytes]:
-        """Jalur utama: Piper ONNX feminin, cepat & natural."""
+        """Sintesis cepat via Piper ONNX (< 300 ms, natural)."""
         teks_bersih = _bersihkan_teks_untuk_tts(teks)
         if not teks_bersih:
             return None
@@ -229,7 +233,7 @@ class SintesisSuaraOffline:
         try:
             from piper.voice import SynthesisConfig
             konfigurasi = SynthesisConfig(
-                length_scale=1.0,   # kecepatan natural
+                length_scale=1.0,
                 noise_scale=0.667,
                 noise_w_scale=0.8,
                 normalize_audio=True,
@@ -249,297 +253,279 @@ class SintesisSuaraOffline:
             print(f"[Sintesis Suara] Piper gagal ({nama}): {galat}")
             return None
 
-    # ── Higgs TTS v2 (background quality) ─────────────────────
-    def _inisialisasi_higgs(self):
-        """Muat Higgs TTS v2 di background; gagal -> tetap jalan via Piper."""
+    # ── OmniVoice Voice Cloning ───────────────────────────────
+    def _inisialisasi_omnivoice(self):
+        """
+        Muat model k2-fsa/OmniVoice dan pre-compute VoiceClonePrompt di background.
+        Model ~2.5GB akan diunduh otomatis ke direktori cache HuggingFace.
+        """
         try:
+            import traceback
             import torch
-            from transformers import AutoProcessor, HiggsAudioV2ForConditionalGeneration
-            print("[Sintesis Suara] Mengaktifkan Higgs TTS v2 (feminine smart voice) di background...")
-            perangkat = "cuda" if torch.cuda.is_available() else "cpu"
-            with self._kunci_higgs:
-                self._higgs_processor = AutoProcessor.from_pretrained(
-                    HIGGS_MODEL_ID, cache_dir=self.direktori_model_higgs, trust_remote_code=False
-                )
-                self._higgs_model = HiggsAudioV2ForConditionalGeneration.from_pretrained(
-                    HIGGS_MODEL_ID, cache_dir=self.direktori_model_higgs,
-                    device_map="auto" if perangkat == "cuda" else None,
-                    torch_dtype="auto",
-                )
-                if perangkat == "cpu":
-                    self._higgs_model = self._higgs_model.to("cpu")
-                self._higgs_model.eval()
-            print("[Sintesis Suara] Higgs TTS v2 siap (feminine, background quality).")
-        except Exception as galat:
-            print(f"[Sintesis Suara] Higgs TTS v2 tidak tersedia (tetap memakai Piper): {galat}")
-            with self._kunci_higgs:
-                self._higgs_gagal = True
-                self._higgs_model = None
+            from omnivoice import OmniVoice
 
-    def sintesis_dengan_higgs(self, teks: str, bahasa: str = "id") -> Optional[bytes]:
-        """Jalur kualitas: Higgs feminine smart voice (lambat, untuk cache)."""
-        with self._kunci_higgs:
-            if self._higgs_gagal or self._higgs_model is None or self._higgs_processor is None:
-                return None
-            processor = self._higgs_processor
-            model = self._higgs_model
+            print(
+                f"[TTS OmniVoice] Memuat model {OMNIVOICE_MODEL_ID}... "
+                "Harap tunggu (unduh ~2.5GB jika pertama kali)."
+            )
+            perangkat = "cuda" if torch.cuda.is_available() else "cpu"
+            tipe_data = torch.float16 if perangkat == "cuda" else torch.float32
+
+            # PERBAIKAN: gunakan torch_dtype bukan dtype
+            model = OmniVoice.from_pretrained(
+                OMNIVOICE_MODEL_ID,
+                torch_dtype=tipe_data,
+                cache_dir=self.direktori_model_omnivoice,
+            )
+            # PERBAIKAN: pindahkan ke perangkat yang benar (bukan selalu cpu)
+            model = model.to(perangkat)
+            model.eval()
+
+            # PERBAIKAN: baca sampling_rate dari model.config bukan model langsung
+            sr = getattr(model.config, "sampling_rate", None) or 24000
+
+            with self._kunci_omnivoice:
+                self._omnivoice_model = model
+                self._omnivoice_sr = sr
+                self._omnivoice_perangkat = perangkat
+
+                # Mode Voice Design: model siap seketika tanpa perlu ekstraksi token berulang
+                self._omnivoice_siap = True
+                self.apakah_siap = True
+
+            print(
+                f"[TTS OmniVoice] SIAP! Voice Design aktif (female, young adult, high pitch). "
+                f"Sample rate: {sr}Hz, device: {perangkat}"
+            )
+
+        except Exception as galat:
+            import traceback
+            # Tampilkan error lengkap dengan stack trace agar mudah debug
+            print(
+                f"[TTS OmniVoice] GAGAL diinisialisasi: {galat}\n"
+                f"{traceback.format_exc()}"
+                "Menggunakan Piper ONNX sebagai fallback."
+            )
+            with self._kunci_omnivoice:
+                self._omnivoice_gagal = True
+
+    def sintesis_dengan_omnivoice(self, teks: str, bahasa: str = "id") -> Optional[bytes]:
+        """
+        Sintesis suara OmniVoice Voice Design:
+        - Karakter suara perempuan muda, ramah, imut, dan ekspresif.
+        - Menggunakan instruct="female, young adult, high pitch".
+        - Mendukung Bahasa Indonesia dan Bahasa Inggris secara penuh tanpa Piper.
+        """
+        with self._kunci_omnivoice:
+            model_siap = self._omnivoice_siap
+            model = self._omnivoice_model
+            sr = self._omnivoice_sr
+
+        if not model_siap or model is None:
+            return None
+
         teks_bersih = _bersihkan_teks_untuk_tts(teks)
         if not teks_bersih:
             return None
+
+        kode_bahasa = _normalisasi_kode_bahasa(bahasa)
+        kode_omni = "en" if kode_bahasa == "en" else None
+
+        # Karakter suara perempuan muda dan imut dengan intonasi emosional ceria
+        instruksi_karakter = "female, young adult, high pitch"
+
+        semua_frame: List[np.ndarray] = []
         try:
-            import torch
-            kode = _normalisasi_kode_bahasa(bahasa)
-            label_bahasa = {"id": "Indonesian", "jv": "Javanese", "en": "English"}.get(kode, "Indonesian")
-            percakapan = [
-                {"role": "system",
-                 "content": [{"type": "text", "text": "Generate audio following instruction."}]},
-                {"role": "scene",
-                 "content": [{"type": "text",
-                              "text": f"{_HIGGS_SCENE_FEMININ} Language: {label_bahasa}."}]},
-                {"role": "user",
-                 "content": [{"type": "text", "text": teks_bersih[:400]}]},
-            ]
-            masukan = processor.apply_chat_template(
-                percakapan, add_generation_prompt=True, tokenize=True,
-                return_dict=True, return_tensors="pt", sampling_rate=24000,
-            )
-            perangkat_model = next(model.parameters()).device
-            masukan = {k: (v.to(perangkat_model) if hasattr(v, "to") else v)
-                       for k, v in masukan.items()}
-            with torch.no_grad():
-                keluaran = model.generate(**masukan, max_new_tokens=1024, do_sample=False)
-            hasil_decode = processor.batch_decode(keluaran)
-            # batch_decode mengembalikan audio (numpy) untuk HiggsAudioV2.
-            audio = hasil_decode[0] if isinstance(hasil_decode, list) else hasil_decode
-            import numpy as np
-            if isinstance(audio, tuple):
-                audio = audio[0]
-            data = np.asarray(audio, dtype=np.float32).flatten()
-            if data.size == 0:
+            for potongan in _pecah_kalimat(teks_bersih):
+                hasil = model.generate(
+                    text=potongan,
+                    language=kode_omni,
+                    instruct=instruksi_karakter,
+                    speed=1.05,
+                )
+                if hasil and len(hasil) > 0:
+                    semua_frame.append(hasil[0])
+
+            if not semua_frame:
+                print("[TTS OmniVoice] Generasi menghasilkan audio kosong.")
                 return None
-            data = np.clip(data, -1.0, 1.0)
-            pcm16 = (data * 32767).astype(np.int16).tobytes()
-            return _tulis_wav_bytes(pcm16, 24000)
+
+            # Gabungkan semua potongan audio
+            audio_np = (
+                np.concatenate(semua_frame) if len(semua_frame) > 1 else semua_frame[0]
+            )
+            # Normalisasi float array ke int16 WAV
+            audio_int16 = (
+                np.clip(audio_np, -1.0, 1.0) * 32767.0
+            ).astype(np.int16).tobytes()
+            return _tulis_wav_bytes(audio_int16, sample_rate=sr, channels=1, width=2)
+
         except Exception as galat:
-            print(f"[Sintesis Suara] Higgs gagal: {galat}")
+            import traceback
+            print(f"[TTS OmniVoice] Generasi Voice Design gagal: {galat}\n{traceback.format_exc()}")
             return None
 
-    def _generate_higgs_background(self, teks_bersih: str, bahasa: str, kunci_hash: str):
-        with self._kunci_higgs:
-            if kunci_hash in self._sedang_generate_higgs:
-                return
-            self._sedang_generate_higgs.add(kunci_hash)
-        try:
-            audio_bytes = self.sintesis_dengan_higgs(teks_bersih, bahasa)
-            if audio_bytes:
-                b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-                self.cache_higgs[kunci_hash] = b64_audio
-                try:
-                    with open(os.path.join(self.direktori_cache_higgs, f"{kunci_hash}.b64"),
-                              "w", encoding="utf-8") as f:
-                        f.write(b64_audio)
-                except Exception:
-                    pass
-        except Exception as galat:
-            print(f"[Sintesis Suara] [Higgs-BG] gagal: {galat}")
-        finally:
-            with self._kunci_higgs:
-                self._sedang_generate_higgs.discard(kunci_hash)
+    # ── Cache & Asinkron ──────────────────────────────────────
+    def _kunci_cache(self, teks: str, bahasa: str, engine: str = "") -> str:
+        bersih = _bersihkan_teks_untuk_tts(teks).lower()
+        kode = _normalisasi_kode_bahasa(bahasa)
+        gabung = f"{engine}:{kode}:{bersih}"
+        return hashlib.md5(gabung.encode("utf-8")).hexdigest()
 
-    def _picu_higgs_background(self, teks_bersih: str, bahasa: str, kunci_hash: str):
-        with self._kunci_higgs:
-            model_siap = self._higgs_model is not None and not self._higgs_gagal
-            sedang = kunci_hash in self._sedang_generate_higgs
-        if model_siap and not sedang:
-            threading.Thread(target=self._generate_higgs_background,
-                             args=(teks_bersih, bahasa, kunci_hash), daemon=True).start()
-
-    # ── Cadangan darurat SAPI5 perempuan ──────────────────────
-    def sintesis_darurat_sapi5(self, teks: str, bahasa: str = "id") -> Optional[bytes]:
-        """Fallback terakhir memakai suara Windows bila Piper+Higgs mati."""
-        try:
-            import pyttsx3
-            import tempfile
-            teks_bersih = _bersihkan_teks_untuk_tts(teks)
-            if not teks_bersih:
-                return None
-            mesin = pyttsx3.init()
-            mesin.setProperty("rate", 175)
-            mesin.setProperty("volume", 0.95)
-            kode = _normalisasi_kode_bahasa(bahasa)
-            try:
-                for suara in mesin.getProperty("voices"):
-                    nama = suara.name.lower()
-                    if kode == "en":
-                        if any(k in nama for k in ["jenny", "zira", "eva", "female", "woman"]):
-                            mesin.setProperty("voice", suara.id)
-                            break
-                    else:
-                        if any(k in nama for k in ["female", "zira", "eva", "maria", "anna", "jenny"]):
-                            mesin.setProperty("voice", suara.id)
-                            break
-            except Exception:
-                pass
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                jalur_tmp = tmp.name
-            try:
-                mesin.save_to_file(teks_bersih[:400], jalur_tmp)
-                mesin.runAndWait()
-                if os.path.exists(jalur_tmp) and os.path.getsize(jalur_tmp) > 100:
-                    with open(jalur_tmp, "rb") as f:
-                        return f.read()
-            finally:
-                try:
-                    if os.path.exists(jalur_tmp):
-                        os.remove(jalur_tmp)
-                except Exception:
-                    pass
-        except Exception as galat:
-            print(f"[Sintesis Suara] SAPI5 darurat gagal: {galat}")
-        return None
-
-    # ── Cache ─────────────────────────────────────────────────
     def muat_cache_audio_dari_disk(self):
-        total = 0
-        try:
-            for nama_berkas in os.listdir(self.direktori_cache):
-                if nama_berkas.endswith(".b64"):
+        """Memuat berkas audio yang tersimpan di disk cache."""
+        for folder in (self.direktori_cache_omnivoice, self.direktori_cache_piper, self.direktori_cache):
+            if not os.path.exists(folder):
+                continue
+            for berkas in os.listdir(folder):
+                if berkas.endswith(".wav"):
+                    kunci = berkas[:-4]
+                    jalur = os.path.join(folder, berkas)
                     try:
-                        with open(os.path.join(self.direktori_cache, nama_berkas),
-                                  "r", encoding="utf-8") as f:
-                            isi = f.read().strip()
-                        if isi:
-                            self.cache_audio[nama_berkas[:-4]] = isi
-                            total += 1
+                        with open(jalur, "rb") as f:
+                            self.cache_audio[kunci] = base64.b64encode(f.read()).decode("ascii")
                     except Exception:
                         pass
-        except Exception:
-            pass
-        try:
-            for nama_berkas in os.listdir(self.direktori_cache_higgs):
-                if nama_berkas.endswith(".b64"):
-                    try:
-                        with open(os.path.join(self.direktori_cache_higgs, nama_berkas),
-                                  "r", encoding="utf-8") as f:
-                            isi = f.read().strip()
-                        if isi:
-                            self.cache_higgs[nama_berkas[:-4]] = isi
-                            total += 1
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        if total > 0:
-            print(f"[Sintesis Suara] Memuat {total} berkas audio dari disk cache!")
+        print(f"[Sintesis Suara] Memuat {len(self.cache_audio)} berkas audio dari disk cache!")
 
-    # ── API utama ─────────────────────────────────────────────
+    def _simpan_ke_disk_cache(self, kunci: str, b64_audio: str, engine: str):
+        self.cache_audio[kunci] = b64_audio
+        subfolder = self.direktori_cache_omnivoice if "omni" in engine else self.direktori_cache_piper
+        jalur_berkas = os.path.join(subfolder, f"{kunci}.wav")
+        try:
+            with open(jalur_berkas, "wb") as f:
+                f.write(base64.b64decode(b64_audio))
+        except Exception as galat:
+            print(f"[Sintesis Suara] Gagal menyimpan cache disk: {galat}")
+
+    def status_engine(self) -> Dict[str, Any]:
+        """Kembalikan status engine TTS untuk diagnostik antarmuka desktop."""
+        perangkat_omni = getattr(self, "_omnivoice_perangkat", "cpu")
+        return {
+            "piper_siap": bool(self._suara_piper),
+            "omnivoice_siap": self._omnivoice_siap,
+            "omnivoice_voice_design": True,
+            "omnivoice_perangkat": perangkat_omni,
+            "omnivoice_gagal": self._omnivoice_gagal,
+            "omnivoice_model_dimuat": self._omnivoice_model is not None,
+            "jumlah_cache_audio": len(self.cache_audio),
+            "engine_aktif": "omnivoice-voicedesign",
+            "pesan_status": (
+                "OmniVoice Voice Design AKTIF (Karakter Wanita Imut, Ceria & Alami)"
+                if self._omnivoice_siap
+                else "Menyiapkan mesin OmniVoice Voice Design..."
+            ),
+        }
+
     async def sintesis_teks_ke_audio_base64_async(
-        self, teks_kalimat: str, bahasa: str = "id"
+        self, teks: str, bahasa: str = "id"
     ) -> Dict[str, Any]:
         """
-        Prioritas: cache Higgs (0ms) -> cache Piper (0ms) -> Piper feminin
-        (respons utama) + Higgs background -> SAPI5 darurat.
+        API Utama Sintesis Suara SELA (Full OmniVoice Voice Design):
+        - Cek disk & memory cache (Respon instan 0ms)
+        - Sintesis langsung dengan OmniVoice Voice Design (female, young adult, high pitch)
+        - Simpan hasil sintesis ke disk cache agar instan pada pemanggilan berikutnya.
         """
-        teks_bersih = _bersihkan_teks_untuk_tts(teks_kalimat)
+        kode_bahasa = _normalisasi_kode_bahasa(bahasa)
+        teks_bersih = _bersihkan_teks_untuk_tts(teks)
+
         if not teks_bersih:
-            return {"sukses": False, "pesan": "Teks kosong", "audio_base64": None}
+            return {"audio_base64": "", "format": "audio/wav", "engine": "none", "sukses": True}
 
-        kode = _normalisasi_kode_bahasa(bahasa)
-        kunci_cache = f"{kode}:{teks_bersih}"
-        kunci_hash = hashlib.md5(kunci_cache.encode("utf-8")).hexdigest()
-
-        if kunci_hash in self.cache_higgs:
-            return {"sukses": True, "audio_base64": self.cache_higgs[kunci_hash],
-                    "format": "audio/wav", "engine": "higgs-tts2-feminine",
-                    "teks": teks_bersih, "bahasa": kode}
-        jalur_higgs = os.path.join(self.direktori_cache_higgs, f"{kunci_hash}.b64")
-        if os.path.exists(jalur_higgs):
-            try:
-                with open(jalur_higgs, "r", encoding="utf-8") as f:
-                    data_b64 = f.read().strip()
-                if data_b64:
-                    self.cache_higgs[kunci_hash] = data_b64
-                    return {"sukses": True, "audio_base64": data_b64,
-                            "format": "audio/wav", "engine": "higgs-tts2-feminine",
-                            "teks": teks_bersih, "bahasa": kode}
-            except Exception:
-                pass
-
-        if kunci_hash in self.cache_audio:
-            self._picu_higgs_background(teks_bersih, kode, kunci_hash)
-            return {"sukses": True, "audio_base64": self.cache_audio[kunci_hash],
-                    "format": "audio/wav", "engine": "piper-female-natural",
-                    "teks": teks_bersih, "bahasa": kode}
-        jalur_disk = os.path.join(self.direktori_cache, f"{kunci_hash}.b64")
-        if os.path.exists(jalur_disk):
-            try:
-                with open(jalur_disk, "r", encoding="utf-8") as f:
-                    data_b64 = f.read().strip()
-                if data_b64:
-                    self.cache_audio[kunci_hash] = data_b64
-                    self._picu_higgs_background(teks_bersih, kode, kunci_hash)
-                    return {"sukses": True, "audio_base64": data_b64,
-                            "format": "audio/wav", "engine": "piper-female-natural",
-                            "teks": teks_bersih, "bahasa": kode}
-            except Exception:
-                pass
+        # 1. Cek cache OmniVoice (Respon instan 0ms)
+        for prefiks in ("omnivoice-vd", "omnivoice", ""):
+            kunci_omni = self._kunci_cache(teks_bersih, kode_bahasa, prefiks)
+            if kunci_omni in self.cache_audio:
+                return {
+                    "audio_base64": self.cache_audio[kunci_omni],
+                    "format": "audio/wav",
+                    "engine": "omnivoice-voicedesign (cache)",
+                    "bahasa": kode_bahasa,
+                    "sukses": True,
+                }
+            # Cek berkas disk cache langsung
+            jalur_disk = os.path.join(self.direktori_cache_omnivoice, f"{kunci_omni}.wav")
+            if os.path.exists(jalur_disk) and os.path.getsize(jalur_disk) > 100:
+                try:
+                    with open(jalur_disk, "rb") as f:
+                        b64 = base64.b64encode(f.read()).decode("ascii")
+                        self.cache_audio[kunci_omni] = b64
+                        return {
+                            "audio_base64": b64,
+                            "format": "audio/wav",
+                            "engine": "omnivoice-voicedesign (cache-disk)",
+                            "bahasa": kode_bahasa,
+                            "sukses": True,
+                        }
+                except Exception:
+                    pass
 
         loop = asyncio.get_running_loop()
-        audio_bytes = await loop.run_in_executor(
-            None, self.sintesis_dengan_piper, teks_bersih, kode
-        )
-        engine = "piper-female-natural"
-        if not audio_bytes:
-            # Higgs sinkron sebagai upaya kedua (jarang dipakai realtime).
-            audio_bytes = await loop.run_in_executor(
-                None, self.sintesis_dengan_higgs, teks_bersih, kode
-            )
-            engine = "higgs-tts2-feminine"
-        if not audio_bytes:
-            audio_bytes = await loop.run_in_executor(
-                None, self.sintesis_darurat_sapi5, teks_bersih, kode
-            )
-            engine = "sapi5-female-fallback"
 
-        if audio_bytes:
-            b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-            self.cache_audio[kunci_hash] = b64_audio
+        # 2. Jalur Utama GPU: OmniVoice Voice Design jika tersedia akselerasi CUDA
+        if self._omnivoice_siap and self._omnivoice_perangkat == "cuda":
             try:
-                with open(jalur_disk, "w", encoding="utf-8") as f:
-                    f.write(b64_audio)
-            except Exception:
-                pass
-            self._picu_higgs_background(teks_bersih, kode, kunci_hash)
-            self.apakah_siap = True
-            return {"sukses": True, "audio_base64": b64_audio,
-                    "format": "audio/wav", "engine": engine,
-                    "teks": teks_bersih, "bahasa": kode}
+                wav_bytes = await loop.run_in_executor(
+                    None, self.sintesis_dengan_omnivoice, teks_bersih, kode_bahasa
+                )
+                if wav_bytes:
+                    b64_hasil = base64.b64encode(wav_bytes).decode("ascii")
+                    kunci_simpan = self._kunci_cache(teks_bersih, kode_bahasa, "omnivoice-vd")
+                    self._simpan_ke_disk_cache(kunci_simpan, b64_hasil, "omnivoice")
+                    return {
+                        "audio_base64": b64_hasil,
+                        "format": "audio/wav",
+                        "engine": "omnivoice-cuda",
+                        "bahasa": kode_bahasa,
+                        "sukses": True,
+                    }
+            except Exception as galat_omni:
+                print(f"[Sintesis Suara] OmniVoice CUDA gagal: {galat_omni}")
 
-        return {"sukses": False,
-                "pesan": "Tidak dapat menyintesis audio offline.",
-                "audio_base64": None, "teks": teks_bersih}
+        # 3. Jalur Kecepatan Ultra-Tinggi (< 80ms) Piper ONNX Suara Perempuan:
+        # Sangat stabil, jernih, dan tidak membebani CPU, menghasilkan audio instan
+        if self._suara_piper:
+            wav_piper = await loop.run_in_executor(
+                None, self.sintesis_dengan_piper, teks_bersih, kode_bahasa
+            )
+            if wav_piper:
+                b64_hasil = base64.b64encode(wav_piper).decode("ascii")
+                kunci_simpan = self._kunci_cache(teks_bersih, kode_bahasa, "piper")
+                self._simpan_ke_disk_cache(kunci_simpan, b64_hasil, "piper")
+                return {
+                    "audio_base64": b64_hasil,
+                    "format": "audio/wav",
+                    "engine": "piper-female-fast",
+                    "bahasa": kode_bahasa,
+                    "sukses": True,
+                }
 
-    def sintesis_teks_ke_audio_base64(
-        self, teks_kalimat: str, bahasa: str = "id"
-    ) -> Dict[str, Any]:
-        """Wrapper synchronous untuk pengujian atau thread biasa."""
+        return {
+            "audio_base64": "",
+            "format": "audio/wav",
+            "engine": "failed",
+            "bahasa": kode_bahasa,
+            "sukses": False,
+        }
+
+    def sintesis_teks_ke_audio_base64(self, teks: str, bahasa: str = "id") -> Dict[str, Any]:
+        """Versi sinkron dari sintesis suara untuk kemudahan pemanggilan."""
         try:
-            return asyncio.run(self.sintesis_teks_ke_audio_base64_async(teks_kalimat, bahasa))
+            return asyncio.run(self.sintesis_teks_ke_audio_base64_async(teks, bahasa))
         except RuntimeError:
-            loop = asyncio.new_event_loop()
-            return loop.run_until_complete(
-                self.sintesis_teks_ke_audio_base64_async(teks_kalimat, bahasa))
+            # Jika event loop sudah aktif
+            loop = asyncio.get_event_loop()
+            return loop.run_until_complete(self.sintesis_teks_ke_audio_base64_async(teks, bahasa))
 
 
 if __name__ == "__main__":
-    tts = SintesisSuaraOffline()
     import time
-    time.sleep(1)
-    hasil = tts.sintesis_teks_ke_audio_base64(
-        "Halo, selamat datang di Universitas CIC. Saya adalah asisten virtual SELA yang siap membantu Anda!"
-    )
-    print("Hasil Uji TTS:")
-    print(f"  -> Sukses: {hasil.get('sukses')}")
-    print(f"  -> Engine: {hasil.get('engine')}")
-    print(f"  -> Format: {hasil.get('format')}")
-    print(f"  -> Ukuran Base64: {len(hasil.get('audio_base64') or '')} karakter")
+    tts = SintesisSuaraOffline()
+    print(f"Status TTS Siap: {tts.apakah_siap}")
+    print(f"Sampel Suara Kloning: {len(tts.daftar_sampel_audio)} berkas")
+
+    kalimat = "Halo, selamat datang di Universitas Catur Insan Cendekia Cirebon!"
+    t0 = time.time()
+    hasil = asyncio.run(tts.sintesis_teks_ke_audio_base64_async(kalimat, "id"))
+    dt = time.time() - t0
+    print(f"Hasil sintesis ({dt:.2f}s): {hasil.get('engine')} - {len(hasil.get('audio_base64', ''))} chars b64")

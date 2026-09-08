@@ -33,8 +33,8 @@ from typing import Optional, Dict, Any
 MODEL_PILIHAN = ("small", "base", "tiny")
 
 # Ambang gerbang energi (RMS sinyal 16kHz float32 [-1, 1]).
-AMBANG_RMS_HENING = 0.008
-DURASI_MIN_DETIK = 0.4
+AMBANG_RMS_HENING = 0.0015
+DURASI_MIN_DETIK = 0.2
 
 
 class PengenalSuaraOffline:
@@ -117,8 +117,8 @@ class PengenalSuaraOffline:
             vad_filter=True,
             vad_parameters=dict(
                 min_silence_duration_ms=400,
-                speech_pad_ms=200,
-                threshold=0.5,
+                speech_pad_ms=300,
+                threshold=0.35,
             ),
             condition_on_previous_text=False,
             compression_ratio_threshold=2.4,
@@ -132,7 +132,13 @@ class PengenalSuaraOffline:
         import importlib
         modul_fw = importlib.import_module("faster_whisper")
         WhisperModel = getattr(modul_fw, "WhisperModel")
-        for perangkat, tipe_komputasi in (("cuda", "float16"), ("cpu", "int8")):
+        import torch
+        daftar_perangkat = []
+        if torch.cuda.is_available():
+            daftar_perangkat.append(("cuda", "float16"))
+        daftar_perangkat.append(("cpu", "int8"))
+
+        for perangkat, tipe_komputasi in daftar_perangkat:
             try:
                 model = WhisperModel(
                     nama_model,
@@ -266,16 +272,37 @@ class PengenalSuaraOffline:
         """
         Decode WebM/WAV/MP3/PCM apa pun menjadi float32 mono 16kHz.
         Mengembalikan None bila berkas rusak/tak dikenali.
+        Mendukung fallback penyimpanan berkas sementara (mirip whisper-stt-indonesian).
         """
         try:
             from faster_whisper.audio import decode_audio
             pcm = decode_audio(io.BytesIO(data_audio_bytes), sampling_rate=16000)
-            if pcm is None or len(pcm) == 0:
-                return None
-            return pcm
+            if pcm is not None and len(pcm) > 0:
+                return pcm
         except Exception as galat:
-            print(f"[Pengenal Suara] Decode audio gagal: {galat}")
-            return None
+            print(f"[Pengenal Suara] Decode BytesIO audio gagal ({galat}), coba fallback berkas sementara...")
+
+        # Fallback: simpan sebagai berkas sementara agar PyAV/ffmpeg dapat mendeteksi format kontainer
+        import tempfile
+        temp_berkas = None
+        try:
+            from faster_whisper.audio import decode_audio
+            with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tf:
+                tf.write(data_audio_bytes)
+                temp_berkas = tf.name
+            pcm = decode_audio(temp_berkas, sampling_rate=16000)
+            if pcm is not None and len(pcm) > 0:
+                return pcm
+        except Exception as galat2:
+            print(f"[Pengenal Suara] Fallback decode berkas sementara gagal: {galat2}")
+        finally:
+            if temp_berkas and os.path.exists(temp_berkas):
+                try:
+                    os.remove(temp_berkas)
+                except Exception:
+                    pass
+
+        return None
 
     @staticmethod
     def _rms(pcm) -> float:

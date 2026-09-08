@@ -19,7 +19,8 @@
     "qrcode": "^1.5.4",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "three": "^0.179.1"
+    "three": "^0.179.1",
+    "wawa-lipsync": "^0.0.2"
   },
   "devDependencies": {
     "@types/react": "^18.2.15",
