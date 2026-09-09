@@ -56,7 +56,8 @@ function countReadableParagraphs(text = "") {
 }
 
 function extractLeadSentence(text = "", maxLength = 150) {
-  const flattened = String(text || "")
+  let flattened = String(text || "")
+    .replace(/^Baik,\s*berikut\s*informasi\s*resmi\s*dari\s*Universitas\s*Catur\s*Insan\s*Cendekia\s*\(UCIC\):\s*/i, "")
     .replace(/\[(.*?)\]/g, " ")
     .replace(/(?:^|\n)\s*\d+\.\s*/g, " ")
     .replace(/(?:^|\n)\s*-\s*/g, " ")
@@ -372,44 +373,35 @@ export function buildSpokenText(
   const cleanedText = String(displayText || "").trim();
   if (!cleanedText) return "";
 
-  // Untuk jawaban jurusan spesifik dengan daftar fakultas/prodi
-  if (plan.intent === "jurusan" && (plan.displayMode === "list_detail" || cleanedText.length > 120)) {
-    const { facultyCount, programCount } = extractJurusanCounts(matches);
-    if (facultyCount > 0 || programCount > 0) {
-      if (lang === "en") {
-        return `UCIC has ${facultyCount || "3"} faculties and ${programCount || "several"} study programs. I have displayed the full list on screen for you.`;
-      }
-      return `UCIC memiliki ${facultyCount || "3"} fakultas dan ${programCount || "10"} program studi. Daftar lengkapnya sudah Sela tampilkan di layar ya.`;
-    }
+  // Audio harus tetap berasal dari jawaban yang tampil, bukan template per
+  // intent. Ambil inti 2--3 gagasan sehingga terdengar natural, informatif,
+  // dan tidak membacakan URL/markdown secara harfiah.
+  const withoutLinks = cleanedText
+    .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/gi, "$1. Linknya bisa kamu akses di sini.")
+    .replace(/https?:\/\/\S+/gi, "Linknya bisa kamu akses di sini.")
+    .replace(/[*_`#>]/g, "");
+  const units = withoutLinks
+    .split(/\n+|(?<=[.!?])\s+/)
+    .map((unit) => unit.replace(/^\s*(?:[-*]|\d+[.)])\s*/, "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const selected = [];
+  const seen = new Set();
+  for (const unit of units) {
+    const key = normalizePlanText(unit);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    // Untuk daftar, nama item lebih enak didengar daripada uraian panjang
+    // setiap item. Kalimat pembuka tetap dipertahankan sebagai konteks.
+    const spokenUnit =
+      plan.displayMode === "list_detail" && unit.includes(":")
+        ? `${unit.split(":")[0].trim()}.`
+        : unit;
+    selected.push(spokenUnit);
+    if (selected.length >= (plan.displayMode === "brief" ? 2 : 2)) break;
   }
 
-  // Jika teks sangat pendek (<= 120 karakter) dan tidak memiliki list/bullet, bisa diucapkan langsung
-  const hasListMarkers = /(?:^|\n)\s*(?:[-*]|\d+[.)])\s+/m.test(cleanedText);
-  const paragraphCount = countReadableParagraphs(cleanedText);
-
-  if (cleanedText.length <= 120 && !hasListMarkers && paragraphCount <= 1) {
-    return cleanedText;
-  }
-
-  // Untuk teks panjang, daftar, atau langkah: buat intisari manusiawi yang ramah dan ringkas
-  const leadSentence = extractLeadSentence(cleanedText, 130);
-
-  if (lang === "en") {
-    if (plan.displayMode === "step_detail") {
-      return `${leadSentence} Full step-by-step guidance is displayed on the screen for you.`;
-    }
-    if (plan.displayMode === "list_detail") {
-      return `${leadSentence} The complete list is displayed on the screen for you.`;
-    }
-    return `${leadSentence} Full details are displayed on the screen for you.`;
-  }
-
-  // Bahasa Indonesia
-  if (plan.displayMode === "step_detail") {
-    return `${leadSentence} Langkah-langkah lengkapnya sudah Sela tampilkan di layar ya.`;
-  }
-  if (plan.displayMode === "list_detail") {
-    return `${leadSentence} Daftar lengkapnya sudah Sela tampilkan di layar ya.`;
-  }
-  return `${leadSentence} Rincian lengkapnya sudah Sela tampilkan di layar ya.`;
+  let spoken = selected.join(" ") || extractLeadSentence(withoutLinks, 320);
+  // Batas moderat menjaga OmniVoice CPU responsif tanpa mengorbankan inti.
+  if (spoken.length > 260) spoken = truncateSentence(spoken, 260);
+  return spoken;
 }

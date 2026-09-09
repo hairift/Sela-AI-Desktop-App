@@ -169,23 +169,16 @@ function SelaModel({ state }) {
   useEffect(() => {
     if (!actions) return
 
-    // Stop semua action yang sedang berjalan secara perlahan
-    Object.values(actions).forEach(action => action?.fadeOut(0.5))
-
-    let actionName = 'Idle'
-    if (state === 'listening') actionName = 'Idle'
-    if (state === 'thinking') actionName = 'Rest'
-    if (state === 'speaking') actionName = 'Talking'
-
-    const action = actions[actionName]
-    if (action) {
-      action.reset().fadeIn(0.5).play()
+    // Jalankan animasi Idle alami secara terus-menerus (tangan rileks di samping)
+    // Gerakan mulut saat bicara 100% dikendalikan oleh Wawa Lipsync di useFrame
+    const idleAction = actions['Idle'] || Object.values(actions)[0]
+    if (idleAction && !idleAction.isRunning()) {
+      Object.values(actions).forEach(act => {
+        if (act !== idleAction) act?.fadeOut(0.3)
+      })
+      idleAction.reset().fadeIn(0.4).play()
     }
-
-    return () => {
-      if (action) action.fadeOut(0.5)
-    }
-  }, [state, actions])
+  }, [actions])
 
   const bindings = useMemo(() => {
     const nextBindings = []
@@ -237,8 +230,16 @@ function SelaModel({ state }) {
       } catch (_) {}
     }
 
-    // Skala bukaan mulut berdasarkan volume audio nyata
-    const volumeMultiplier = state === 'speaking' ? Math.min(1.25, Math.max(0.2, currentVolume * 2.6)) : 0
+    // Skala bukaan mulut berbasis energi audio Wawa. Di beberapa GPU/browser,
+    // analyser memberi nol pada frame pembuka walau <audio> sudah berbunyi;
+    // gunakan gerak sangat kecil sementara sebagai jembatan agar avatar tidak
+    // tampak beku, lalu Wawa kembali mengambil alih begitu energi tersedia.
+    const wawaAktif = currentVolume > 0.012
+    const volumeMultiplier = state === 'speaking'
+      ? (wawaAktif
+          ? Math.min(1.25, Math.max(0.24, currentVolume * 2.6))
+          : 0.28 + Math.sin(t * 11) * 0.07)
+      : 0
 
     let targetAa = 0
     let targetIh = 0
@@ -282,9 +283,16 @@ function SelaModel({ state }) {
           targetE = 0.2 * volumeMultiplier
           break
         case VISEMES.PP:
-        case VISEMES.sil:
         default:
-          targetSil = 0.8
+          // Hanya gunakan animasi jembatan jika analyser belum menyediakan
+          // viseme. Nilai viseme dari Wawa tetap menjadi sumber utama.
+          if (!wawaAktif) {
+            targetAa = 0.48 * volumeMultiplier
+            targetE = 0.20 * volumeMultiplier
+            targetSil = 0.38
+          } else {
+            targetSil = 0.8
+          }
           break
       }
     }
@@ -368,56 +376,56 @@ function SelaAvatar3D({ state, theme }) {
         alpha: true,
         powerPreference: "high-performance",
         toneMapping: THREE.ACESFilmicToneMapping,
-        toneMappingExposure: isDark ? 1.05 : 1.25,
+        toneMappingExposure: isDark ? 1.08 : 1.15,
       }}
     >
       <PerspectiveCamera makeDefault position={[0, 0.8, 5.5]} fov={32} />
 
-      {/* Pencahayaan Studio Tiga Titik Berstandar AAA + Rim Light Sinematik */}
-      <ambientLight intensity={isDark ? 0.45 : 0.65} color="#ffffff" />
-      <hemisphereLight intensity={isDark ? 0.55 : 0.8} skyColor="#e0f2fe" groundColor="#0f172a" />
+      {/* Pencahayaan Studio Proporsional: Cerah, Segar, Berdimensi Alami, Bebas Busem dan Tidak Silau */}
+      <ambientLight intensity={isDark ? 0.48 : 0.58} color="#ffffff" />
+      <hemisphereLight intensity={isDark ? 0.46 : 0.58} skyColor="#f8fafc" groundColor="#1e293b" />
 
-      {/* Key Light: Cahaya utama hangat dari sudut atas kanan */}
+      {/* Key Light: Cahaya utama hangat lembut dari sudut atas kanan */}
       <directionalLight
-        position={[3.5, 3.5, 4.5]}
-        intensity={isDark ? 1.6 : 2.2}
-        color="#fffbeb"
+        position={[3.0, 3.5, 4.0]}
+        intensity={isDark ? 1.55 : 1.80}
+        color="#fffbf0"
       />
 
-      {/* Fill Light: Cahaya pengisi lembut dari kiri agar bayangan wajah transparan & halus */}
+      {/* Fill Light: Cahaya pengisi sejuk lembut dari kiri agar bayangan wajah transparan & kulit segar */}
       <directionalLight
-        position={[-3.5, 2.0, 3.0]}
-        intensity={isDark ? 0.85 : 1.15}
-        color="#e0f2fe"
+        position={[-3.0, 2.0, 3.0]}
+        intensity={isDark ? 0.85 : 1.05}
+        color="#f0f9ff"
       />
 
-      {/* Rim / Hair Backlight: Memberi outline biru lembut di tepi rambut dan bahu */}
+      {/* Rim / Hair Backlight: Garis kontur elektrik di tepi rambut & bahu */}
       <directionalLight
-        position={[0, 4.0, -3.5]}
-        intensity={isDark ? 2.8 : 3.4}
+        position={[0, 3.5, -3.0]}
+        intensity={isDark ? 2.2 : 2.6}
         color="#38bdf8"
       />
       <directionalLight
-        position={[-3.0, 3.0, -2.5]}
-        intensity={isDark ? 1.4 : 1.9}
+        position={[-2.5, 2.5, -2.0]}
+        intensity={isDark ? 1.1 : 1.4}
         color="#818cf8"
       />
 
-      {/* Beauty Front Light: Cahaya sorot lembut di mata & wajah agar segar (tidak butek) */}
+      {/* Beauty Front Light: Cahaya sorot titik lembut di mata & wajah agar segar dan berkilau alami */}
       <pointLight
-        position={[0, 1.2, 3.2]}
-        intensity={isDark ? 0.85 : 1.2}
-        distance={10}
+        position={[0, 1.2, 3.0]}
+        intensity={isDark ? 0.65 : 0.85}
+        distance={8}
         color="#ffffff"
       />
 
       <Suspense fallback={<AvatarFallback />}>
-        {/* Environment map untuk pantulan global natural */}
-        <Environment preset="city" environmentIntensity={isDark ? 0.55 : 0.8} />
+        {/* Environment map dengan intensitas proporsional untuk refleksi halus */}
+        <Environment preset="city" environmentIntensity={isDark ? 0.50 : 0.60} />
         <SelaModel state={state} />
         <ContactShadows
           position={[0, SHADOW_Y, 0]}
-          opacity={isDark ? 0.35 : 0.22}
+          opacity={isDark ? 0.4 : 0.25}
           scale={5.5}
           blur={2.0}
           far={4.5}
@@ -470,4 +478,3 @@ export default function AvatarPlaceholder({ state = 'idle', theme = 'light' }) {
 try {
   useGLTF.preload('/models/SELA_BARU.glb')
 } catch (_) {}
-

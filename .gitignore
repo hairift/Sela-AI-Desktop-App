@@ -17,6 +17,8 @@ dist-ssr
 ai-engine/models/
 ai-engine/cache_audio/
 ai-engine/voice_samples/*.wav
+ai-engine/data_user.json
+unsloth_compiled_cache/
 __pycache__/
 */__pycache__/
 *.pyc

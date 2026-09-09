@@ -215,6 +215,85 @@ class MesinRagOffline:
                     "ditemukan": True,
                 }
 
+        # 5. Curhat / Konsultasi Personal (Empathetic Response)
+        pola_curhat = [
+            r"(bingung|ragu|takut|khawatir|cemas|gelisah|stress|stres|capek|lelah|putus\s+asa)",
+            r"(bingung\s+(milih|memilih|pilih).*(jurusan|fakultas|prodi|kuliah))",
+            r"(ragu.*(diterima|masuk|daftar|mendaftar))",
+            r"(tidak\s+(yakin|percaya\s+diri).*(diri|kuliah|mampu))",
+            r"(mau\s+nanya.*tapi.*malu)",
+            r"(galau|sedih|kesel|nyesel|kecewa|frustasi)",
+            r"(cerita|curhat|keluh|keluhan)",
+            r"(orang\s+tua.*(marah|ngotak|tidak\s+setuju|nggak\s+setuju|kurang\s+setuju))",
+            r"(biaya.*mahal.*keluarga|biaya.*berat|tidak\s+mampu.*biaya)",
+            r"(kerja\s+sambil\s+kuliah|kuliah\s+sambil\s+kerja)",
+            r"(putus\s+kuliah|drop\s+out|nyerah|menyerah)",
+            r"(lagi\s+sedih|lagi\s+galau|lagi\s+stress|lagi\s+stres)",
+            r"(negatif|dipandang\s+sebelah\s+mata|dihina|diremehkan|dinilai)",
+            r"(kesepian|sepi|sendirian|tidak\s+punya\s+teman)",
+            r"(motivasi|semangat|semangatin|beri\s+semangat)",
+            r"(patah\s+hati|patah\s+semangat|gagal\s+tes|gagal\s+masuk|ditolak)",
+            r"(takut\s+gagal|khawatir\s+gagal|berat\s+banget)",
+            r"(mau\s+nyerah|capek\s+banget|lelah\s+banget|penat)",
+        ]
+        for pola in pola_curhat:
+            if re.search(pola, q):
+                # Respons curhat yang bervariasi dan hidup
+                import random as _rng
+                pembuka_curhat = [
+                    "SELA dengar keluh kesahmu.",
+                    "Aku paham perasaanmu saat ini.",
+                    "Wajar banget kalau kamu merasa begitu.",
+                    "Terima kasih sudah berbagi ke SELA.",
+                    "Aku di sini buat kamu.",
+                ]
+                isi_curhat = (
+                    "Setiap orang punya jalan masing-masing, dan kamu tidak sendirian dalam merasakan ini.\n\n"
+                    "Kalau boleh SELA tahu, kamu sebenarnya tertarik dengan bidang apa? "
+                    "Soal biaya, UCIC punya program beasiswa KIP Kuliah dan opsi kelas sore/karyawan "
+                    "untuk mahasiswa yang ingin bekerja sambil kuliah.\n\n"
+                )
+                penutup_curhat = [
+                    "Yang penting jangan menyerah ya. Coba ceritakan lebih detail, mungkin SELA bisa bantu.",
+                    "Kamu hebat sudah berani cerita. Cerita lagi dong, SELA simak.",
+                    "Jangan ragu buat terus cerita. SELA di sini buat kamu kok.",
+                    "Sekarang atau nanti, SELA tetap siap dengar kamu. Semangat ya!",
+                ]
+                jawaban_curhat = (
+                    f"{_rng.choice(pembuka_curhat)} {isi_curhat}{_rng.choice(penutup_curhat)}"
+                )
+                return {
+                    "intent": "curhat",
+                    "jawaban": jawaban_curhat,
+                    "ditemukan": True,
+                }
+
+        # 6. Pertanyaan Non-Kampus yang Hidup (Solusi & Saran Hidup)
+        pola_non_kampus_hidup = [
+            r"(gimana\s+caranya\s+(belajar|rajin\s+belajar|fokus|belajar\s+efektif))",
+            r"(tips|motive tips|cara\s+(motivasi|semangat|rajin))",
+            r"(gimana\s+cara\s+(tidak\s+malas|fokus\s+kuliah|manajemen\s+waktu))",
+            r"(jauhi\s+(gangguan|distaksi|hp|sosmed|media\s+sosial))",
+            r"(atlet|olahraga|gym|fitness|nafas|stamina)",
+            r"(gimana\s+caranya\s+(lulus|lancar|good\s+grade|ipk\s+tinggi))",
+            r"(tips\s+masuk\s+kuliah|tips\s+kuliah|tips\s+maba)",
+        ]
+        for pola in pola_non_kampus_hidup:
+            if re.search(pola, q):
+                return {
+                    "intent": "solusi_hidup",
+                    "jawaban": (
+                        "Pertanyaan bagus! Ini beberapa tips dari SELA:\n"
+                        "1. Buat jadwal harian — alokasikan waktu belajar, istirahat, dan hiburan secara seimbang.\n"
+                        "2. Gunakan teknik Pomodoro (25 menit fokus, 5 menit istirahat).\n"
+                        "3. Matikan notifikasi HP saat belajar.\n"
+                        "4. Tidur cukup 7-8 jam — otak yang segar menyerap lebih cepat.\n"
+                        "5. Jangan ragu minta bantuan dosen atau teman kalau ada yang sulit dipahami.\n\n"
+                        "Kalau kamu mahasiswa UCIC, kamu bisa manfaatkan lab dan perpustakaan kampus juga lho!"
+                    ),
+                    "ditemukan": True,
+                }
+
         return None
 
     # ── Context Linking Percakapan Multi-Turn ─────────────────────
@@ -371,6 +450,64 @@ class MesinRagOffline:
 
         teks_konteks = "\n\n".join(bagian_konteks)
         return teks_konteks, dokumen_cocok, True
+
+    def buat_prompt_instruksi_dari_konteks(
+        self, query: str, riwayat_obrolan: Optional[List[Dict[str, str]]] = None,
+        konteks: str = "", dokumen_cocok: List[Dict[str, Any]] = None,
+        ditemukan: bool = False
+    ) -> str:
+        """
+        Membangun prompt instruksi dari konteks grounding yang SUDAH dihitung sebelumnya.
+        Menghindari eksekusi ganda bangun_konteks_grounding().
+        """
+        system_prompt = (
+            "Kamu adalah SELA, asisten virtual dan resepsionis cerdas resmi Universitas Catur Insan Cendekia (UCIC) Cirebon.\n"
+            "Pedoman Menjawab:\n"
+            "1. Jawablah dengan ramah, santun, jelas, dan percaya diri seperti resepsionis customer service profesional.\n"
+            "2. WAJIB menggunakan informasi HANYA dari DOKUMEN RESMI yang disediakan di bawah.\n"
+            "3. DILARANG KERAS mengarang, berhalusinasi, atau menambahkan asumsi di luar isi dokumen.\n"
+            "4. Jika informasi spesifik tidak ditemukan di dokumen, sampaikan dengan jujur dan arahkan pengunjung untuk menghubungi Admin PMB/BAA UCIC.\n"
+            "5. Berikan jawaban dalam bentuk ringkasan poin yang mudah dibaca dan didengar.\n"
+            "6. JANGAN ulangi informasi yang sudah disebutkan dalam jawaban yang sama.\n"
+            "7. Variasikan pembuka setiap kali menjawab. Jangan gunakan kalimat pembuka yang sama persis."
+        )
+
+        # Kasus Intent Percakapan Cepat (Sapaan / Identitas / Terima Kasih)
+        if konteks.startswith("INTENT_PERCAKAPAN:"):
+            parts = konteks.split(":", 2)
+            jawaban_langsung = parts[2] if len(parts) > 2 else ""
+            prompt_lengkap = (
+                f"<|im_start|>system\n{system_prompt}\n<|im_end|>\n"
+                f"<|im_start|>user\n{query}\n<|im_end|>\n"
+                f"<|im_start|>assistant\n{jawaban_langsung}\n<|im_end|>"
+            )
+            return prompt_lengkap
+
+        if not ditemukan:
+            prompt_lengkap = (
+                f"<|im_start|>system\n{system_prompt}\n<|im_end|>\n"
+                f"<|im_start|>user\n{query}\n<|im_end|>\n"
+                f"<|im_start|>assistant\n"
+                f"Halo! Untuk pertanyaan mengenai '{query}', informasinya saat ini belum tercantum secara spesifik dalam basis data resmi kami. "
+                f"Silakan dapat langsung menghubungi Front Desk / Layanan Informasi Kampus UCIC melalui WhatsApp PMB di 0812 1670 0519 atau mengunjungi website resmi di https://pmb.cic.ac.id ya! Ada hal lain yang bisa SELA bantu?"
+            )
+            return prompt_lengkap
+
+        prompt_lengkap = (
+            f"<|im_start|>system\n{system_prompt}\n\n"
+            f"DOKUMEN RESMI KAMPUS UCIC:\n{konteks}\n<|im_end|>\n"
+        )
+
+        # Menambahkan riwayat obrolan sebelumnya bila ada
+        if riwayat_obrolan:
+            for pesan in riwayat_obrolan[-4:]:
+                peran = pesan.get("role", "user")
+                teks = pesan.get("text", "") or pesan.get("content", "")
+                nama_peran = "assistant" if peran == "assistant" else "user"
+                prompt_lengkap += f"<|im_start|>{nama_peran}\n{teks}\n<|im_end|>\n"
+
+        prompt_lengkap += f"<|im_start|>user\n{query}\n<|im_end|>\n<|im_start|>assistant\n"
+        return prompt_lengkap
 
     def buat_prompt_instruksi_ketat(
         self, query: str, riwayat_obrolan: Optional[List[Dict[str, str]]] = None

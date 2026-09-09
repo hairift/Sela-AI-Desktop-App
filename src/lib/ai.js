@@ -1937,17 +1937,61 @@ function buildDatasetAnswerFromMatches(
     .filter(Boolean);
   if (contents.length === 0) return "";
 
-  const topContent = contents[0];
+  // ANTI-DOUBLE TEKS: Hapus duplikasi konten yang muncul dari multiple matches
+  // Normalisasi teks untuk perbandingan, lalu ambil hanya konten unik
+  const seenNormalized = new Set();
+  const uniqueContents = [];
+  for (const content of contents) {
+    // Normalisasi: hapus spasi berlebih, lowercase, strip tanda baca untuk perbandingan
+    const normalized = content
+      .replace(/\s+/g, " ")
+      .toLowerCase()
+      .replace(/[.,!?;:()"'\[\]]/g, "")
+      .trim();
+    // Cek apakah konten ini sudah ada (bisa jadi subset dari konten sebelumnya)
+    let isDuplicate = false;
+    for (const seen of seenNormalized) {
+      // Jika satu adalah substring dari yang lain (overlap > 70%)
+      if (
+        normalized.length > 20 &&
+        seen.length > 20 &&
+        (seen.includes(normalized) ||
+          normalized.includes(seen) ||
+          _textSimilarity(normalized, seen) > 0.7)
+      ) {
+        isDuplicate = true;
+        break;
+      }
+    }
+    if (!isDuplicate) {
+      seenNormalized.add(normalized);
+      uniqueContents.push(content);
+    }
+  }
+
+  const topContent = uniqueContents[0];
   if (!responsePlan || responsePlan.displayMode === "brief") {
     const content = truncateForVoice(topContent);
     if (effectiveLang === "en") return content;
     return content;
   }
 
-  const maxSections = responsePlan.displayMode === "list_detail" ? 4 : 2;
-  const merged = [...new Set(contents)].slice(0, maxSections).join("\n\n");
+  const maxSections = responsePlan.displayMode === "list_detail" ? 3 : 2;
+  const merged = uniqueContents.slice(0, maxSections).join("\n\n");
   if (effectiveLang === "en") return merged;
   return merged;
+}
+
+// Helper: hitung rasio kemiripan teks (Jaccard similarity berbasis kata)
+function _textSimilarity(a, b) {
+  const wordsA = new Set(a.split(" "));
+  const wordsB = new Set(b.split(" "));
+  let intersection = 0;
+  for (const w of wordsA) {
+    if (wordsB.has(w)) intersection++;
+  }
+  const union = wordsA.size + wordsB.size - intersection;
+  return union > 0 ? intersection / union : 0;
 }
 
 function applySessionLearningToArtifacts(artifacts, session) {
@@ -2631,6 +2675,132 @@ export async function transcribeAudio(audioBlob, lang = "id") {
   return text;
 }
 
+// ── Web Search Real-Time (Gratis, DuckDuckGo + Wikipedia) ──────────────────────
+
+const WEB_SEARCH_PATTERNS = [
+  /presiden\s+(indonesia|sekarang|saat\s+ini)/i,
+  /walikota\s+(cirebon|sekarang|saat\s+ini)/i,
+  /berita\s+(terbaru|sekarang|hari\s+ini|cirebon)/i,
+  /kabar\s+(terbaru|terkini|hari\s+ini)/i,
+  /cuaca\s+(hari\s+ini|sekarang|cirebon)/i,
+  /siapa\s+presiden/i,
+  /siapa\s+walikota/i,
+  /apa\s+yang\s+sedang\s+terjadi/i,
+  /peristiwa\s+(terbaru|terkini)/i,
+];
+
+async function needsWebSearch(query) {
+  const q = (query || "").toLowerCase().trim();
+  for (const pattern of WEB_SEARCH_PATTERNS) {
+    if (pattern.test(q)) return true;
+  }
+  const keywords = [
+    "presiden sekarang", "walikota cirebon", "berita terbaru",
+    "kabar terkini", "apa yang terjadi", "peristiwa terbaru",
+    "hari ini", "saat ini", "sekarang",
+  ];
+  for (const kw of keywords) {
+    if (q.includes(kw)) return true;
+  }
+  return false;
+}
+
+async function doWebSearch(query) {
+  try {
+    const res = await fetch("/api/web-search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.ditemukan && data.konteks) {
+      return { context: data.konteks };
+    }
+    return null;
+  } catch (err) {
+    console.error("[Web Search] Error:", err);
+    return null;
+  }
+}
+
+// ── Pengenalan & Memori User ──────────────────────────────────────────────────
+
+const USER_NAME_PATTERNS = [
+  /(?:nama\s+saya|namaku|nama\s+aku)\s+([A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20}(?:\s+[A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20})?)/,
+  /(?:panggil\s+(?:saya|aku))\s+([A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20}(?:\s+[A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20})?)/,
+  /(?:saya|aku)\s+(?:adalah|itu)\s+([A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20}(?:\s+[A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20})?)/,
+  /perkenalkan.*?([A-ZÀ-Ý][a-z]{2,15}(?:\s+[A-ZÀ-Ý][a-z]{2,15})?)/,
+  /(?:halo|hai|hello).*(?:saya|aku)\s+([A-ZÀ-Ý][a-z]{2,15}(?:\s+[A-ZÀ-Ý][a-z]{2,15})?)/,
+];
+
+const FORBIDDEN_NAMES = new Set([
+  "sela", "tidak", "ingin", "mau", "saja", "belum", "sudah",
+  "kalau", "jika", "yang", "ini", "itu", "ada", "bukan",
+  "ya", "dong", "sih", "nih", "tapi", "dan", "atau", "karena",
+  "sekarang", "nanti", "kuliah", "kampus", "ucic", "cirebon",
+  "mahasiswa", "daftar", "pendaftaran", "biaya", "jurusan",
+]);
+
+function extractUserName(query) {
+  if (!query) return null;
+  for (const pattern of USER_NAME_PATTERNS) {
+    const match = query.match(pattern);
+    if (match) {
+      const name = match[1].trim();
+      if (name.length >= 2 && !FORBIDDEN_NAMES.has(name.toLowerCase())) {
+        return name;
+      }
+    }
+  }
+  return null;
+}
+
+function saveUserName(name) {
+  try {
+    localStorage.setItem("sela_user_name", name);
+  } catch (_) {}
+}
+
+function getUserName() {
+  try {
+    return localStorage.getItem("sela_user_name") || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function getUserMemory() {
+  const name = getUserName();
+  if (!name) return "";
+  let memory = `Nama user yang sedang diajak bicara: ${name}. Gunakan namanya secara natural dalam percakapan (tidak setiap kalimat, cukup sesekali).`;
+  try {
+    const minat = JSON.parse(localStorage.getItem("sela_user_minat") || "[]");
+    if (minat.length > 0) {
+      memory += `\nMinat/jurusan yang sedang dipertimbangkan user: ${minat.slice(-3).join(", ")}`;
+    }
+  } catch (_) {}
+  return memory;
+}
+
+function isGreetingOrIdentity(query) {
+  if (!query) return false;
+  const q = query.toLowerCase().trim();
+  const patterns = [
+    /^(halo|hai|hello|hi|hei|helo)/,
+    /^selamat\s+(pagi|siang|sore|malam)/,
+    /^assalam/,
+    /^apa\s*kabar/,
+    /siapa\s+kamu/,
+    /kamu\s+siapa/,
+    /kamu\s+bisa\s+apa/,
+  ];
+  for (const p of patterns) {
+    if (p.test(q)) return true;
+  }
+  return false;
+}
+
 // ── Chat Completion ──────────────────────────────────────────────────────────
 
 /**
@@ -2738,14 +2908,59 @@ export async function getChatCompletion(messageHistory, lang = "id") {
     day: "numeric",
   });
 
+  // Web search real-time untuk pertanyaan yang membutuhkan info terkini
+  let webSearchContext = "";
+  if (await needsWebSearch(userQuery)) {
+    try {
+      console.log("[SELA Web Search] Pertanyaan membutuhkan web search real-time");
+      const webResult = await doWebSearch(userQuery);
+      if (webResult && webResult.context) {
+        webSearchContext = webResult.context;
+      }
+    } catch (err) {
+      console.error("[SELA Web Search] Error:", err);
+    }
+  }
+
+  // Pengenalan nama user: cek apakah user menyebutkan namanya
+  let userMemoryContext = "";
+  try {
+    const userName = extractUserName(userQuery);
+    if (userName) {
+      saveUserName(userName);
+      console.log(`[SELA Memory] Nama user disimpan: ${userName}`);
+    }
+    const memory = getUserMemory();
+    if (memory) {
+      userMemoryContext = memory;
+    }
+    // Jika user belum dikenal dan ini sepertinya awal percakapan, tambahkan instruksi
+    if (!getUserName() && isGreetingOrIdentity(userQuery)) {
+      userMemoryContext += "\n\nINSTRUKSI: User belum mengenalkan dirinya. Setelah menjawab, tanyakan namanya dengan ramah dan natural, misal: 'Ngomong-ngomong, boleh kenalan? Nama kamu siapa?' atau 'Sebelumnya, SELA belum tahu namamu. Boleh SELA panggil apa?'";
+    }
+  } catch (err) {
+    console.error("[SELA Memory] Error:", err);
+  }
+
   const systemPromptID = `Kamu adalah SELA, wujud Customer Service virtual Universitas Catur Insan Cendekia (UCIC) yang berkarakter lembut, karismatik, berwibawa, dan memancarkan aura cerdas.
 Hari ini adalah ${today}.
 Gaya bicaramu tenang, hangat, elegan, dan profesional. Kamu adalah "Wajah Digital" UCIC.
 Kamu boleh menggunakan partikel bahasa lisan seperti 'nih', 'sih', 'dong', atau 'ya', namun penggunaannya HARUS sangat tepat, natural secara tata bahasa, dan tidak berlebihan agar wibawamu tetap terjaga. Penempatannya harus dilihat dari kata sebelumnya apakah cocok atau tidak.
 Jawabanmu HARUS singkat, ramah, dan langsung ke inti seperti customer service. Hindari pembuka panjang, promosi, dan penjelasan tambahan yang tidak ditanya. Untuk daftar, langkah, atau perbandingan, gunakan nomor pendek (1, 2, 3), bukan bullet lingkaran. Untuk fakta tunggal, jawab dalam 1 kalimat.
 
+[VARIASI JAWABAN - SANGAT PENTING]:
+Setiap jawabanmu HARUS bervariasi. Jangan pernah mengulang kalimat pembuka atau penutup yang sama persis seperti jawaban sebelumnya. Variasikan pembukaan, pilihan kata, dan susunan kalimat. Contoh variasi pembuka: "Tentu, ini infonya...", "Jadi begini...", "Untuk yang itu...", "Menarik pertanyaannya! Begini...", "Baik, terkait hal itu...". Jangan pernah menyalin teks yang sama dua kali dalam satu jawaban. Jika informasi sudah disebut, JANGAN ulangi lagi di jawaban yang sama.
+
+[KEMAMPUAN CURHAT & SOLUSI]:
+Kamu juga bisa diajak curhat oleh mahasiswa. Jika user mengungkapkan kebingungan, kecemasan, atau keraguan (misal bingung memilih jurusan/fakultas, takut tidak diterima, ragu dengan masa depan), kamu BISA dan BOLEH:
+- Mendengarkan dengan empati dan merespons sebagai teman yang peduli
+- Memberikan solusi, saran, atau perspektif yang membangun
+- Menanyakan minat atau kelebihan user untuk membantu mempersempit pilihan
+- Menceritakan informasi prodi UCIC yang mungkin relevan dengan minatnya
+Tetap jaga wibawa dan profesionalisme, tapi tunjukkan kehangatan dan kepedulian.
+
 [TUGAS UTAMAMU]:
-Kamu HANYA bertugas dan DIIZINKAN menjawab pertanyaan seputar kampus UCIC (seperti Pendaftaran, Akademik, Fasilitas, dan Informasi Kampus lainnya).
+Kamu bertugas menjawab pertanyaan seputar kampus UCIC (seperti Pendaftaran, Akademik, Fasilitas, dan Informasi Kampus lainnya). Namun kamu JUGA bisa menjawab sapaan, pertanyaan umum, dan diajak curhat dengan ramah dan hidup seperti manusia.
 
 [ATURAN MENJAWAB]:
 1. Jika pertanyaan BERHUBUNGAN dengan UCIC:
@@ -2762,10 +2977,12 @@ Kamu HANYA bertugas dan DIIZINKAN menjawab pertanyaan seputar kampus UCIC (seper
    - Jika transcript user tampak mengulang frasa yang sama, ANGGAP itu artefak suara. Jangan menegur, jangan berkomentar bahwa user mengulang, dan jangan mengatakan akan menjelaskan sekali saja. Cukup jawab inti pertanyaannya dengan normal.
    - Jika [KONTEKS KAMPUS] kosong atau benar-benar tidak memuat informasinya, tolak dengan jujur dan berwibawa: "Mohon maaf, SELA belum punya informasi sedetail itu saat ini. Mungkin Anda bisa menanyakannya langsung ke bagian informasi kampus." Jangan mengarang info.
 
-2. Jika pertanyaan TIDAK BERHUBUNGAN dengan UCIC (Topik umum, tokoh dunia, cuaca, hiburan, politik, dll):
-   - Kamu DILARANG KERAS menjawab kelanjutan dari pertanyaan tersebut (Bahkan jika kamu tahu faktanya).
-   - Selalu tolak dengan elegan dan lembut khas SELA, lalu arahkan kembali pembicaraan ke UCIC.
-   - Contoh penolakan elegan: "Maaf ya, ranah SELA saat ini spesifik hanya untuk membantu informasi seputar kampus UCIC. Ada hal tentang pendaftaran atau akademik yang bisa SELA bantu jelaskan?"
+2. Jika pertanyaan TIDAK BERHUBUNGAN dengan UCIC (Topik umum, tokoh dunia, cuaca, hiburan, dll):
+   - Jika itu sapaan seperti "siapa kamu" atau "halo", jawab dengan ramah dan bervariasi. Perkenalkan dirimu sebagai SELA, lalu arahkan percakapan ke UCIC secara natural.
+   - Jika user curhat atau bingung memilih jurusan/fakultas, BERTINDAKLAH sebagai teman yang peduli. Berikan solusi dan saran yang membangun. Kamu BOLEH menjawab pertanyaan curhat.
+   - Jika pertanyaan membutuhkan informasi real-time (seperti "siapa presiden sekarang" atau "walikota Cirebon"), dan [KONTEKS WEB SEARCH] tersedia, gunakan konteks tersebut untuk menjawab.
+   - Jika pertanyaan benar-benar di luar ranah kampus dan bukan curhat/sapaan, jawab dengan singkat dan ramah, lalu arahkan kembali ke UCIC. Jangan menolak keras, tapi arahkan dengan elegan.
+   - Contoh pengalihan elegan: "Itu pertanyaan menarik! Kalau soal kampus UCIC, SELA bisa bantu banyak nih. Ada yang ingin ditanyakan tentang pendaftaran atau jurusan?"
 
 3. ANTI-NOISE (ABAIKAN OBROLAN ACAK):
    - Jika kalimat dari user sangat pendek, tidak memiliki makna yang jelas, atau terdengar seperti potongan obrolan orang yang sedang lewat (contoh: "eh", "iya", "halo", "oh gitu", "lagi apa", "makan yuk"), JANGAN dijawab.
@@ -2775,10 +2992,10 @@ Kamu HANYA bertugas dan DIIZINKAN menjawab pertanyaan seputar kampus UCIC (seper
 [KONTEKS KAMPUS]:
 ${contextStr || "Kosong"}
 
-[KONTEKS PERCAKAPAN UNTUK RUJUKAN]:
+${webSearchContext ? `[KONTEKS WEB SEARCH (real-time)]:\n${webSearchContext}\n\n` : ""}[KONTEKS PERCAKAPAN UNTUK RUJUKAN]:
 ${conversationContextHint || "Tidak ada. Pertanyaan terbaru berdiri sendiri."}
 
-[ATURAN KEDALAMAN JAWABAN]:
+${userMemoryContext ? `[MEMORI USER]:\n${userMemoryContext}\n\n` : ""}[ATURAN KEDALAMAN JAWABAN]:
 ${buildResponsePlanPrompt(responsePlan, "id")}
 
 [ARAH KLARIFIKASI]:
@@ -2803,8 +3020,19 @@ Your speaking style is calm, warm, elegant, and highly professional. You are the
 Your answers MUST be concise, friendly, and direct like a customer service representative. Avoid long openings, promotion-like wording, and extra details the user did not ask for. For lists, steps, or comparisons, use short numbered lines (1, 2, 3), not bullet points. For a single fact, answer in one sentence.
 You MUST ALWAYS answer the user in ENGLISH.
 
+[ANSWER VARIATION - VERY IMPORTANT]:
+Every answer MUST vary. Never repeat the exact same opening or closing sentence as the previous answer. Vary your phrasing, word choice, and sentence structure. Never duplicate the same text twice within one answer.
+
+[EMPATHY & LIFE ADVICE]:
+You can also be a listening ear for students. If the user expresses confusion, anxiety, or doubt (e.g., unsure about choosing a major, afraid of not being accepted, uncertain about the future), you CAN and SHOULD:
+- Listen with empathy and respond as a caring friend
+- Provide constructive solutions, advice, or perspective
+- Ask about the user's interests or strengths to help narrow choices
+- Share relevant UCIC program information
+Maintain professionalism but show warmth and care.
+
 [YOUR MAIN TASK]:
-You ONLY serve and are PERMITTED to answer questions related to the UCIC campus (such as Admissions, Academics, Facilities, and other Campus Information).
+You serve questions about the UCIC campus (Admissions, Academics, Facilities, etc.). But you ALSO can answer greetings, general questions, and be a listening ear with a human-like, lively personality.
 
 [ANSWERING RULES]:
 1. If the question is RELATED to UCIC:
@@ -2821,10 +3049,12 @@ You ONLY serve and are PERMITTED to answer questions related to the UCIC campus 
    - If the transcript appears to repeat the same phrase, treat that as a voice artifact. Do not scold the user, do not comment on repetition, and do not say you will explain it only once. Just answer normally.
    - If the [CAMPUS CONTEXT] is empty or truly does not contain the specific info, answer honestly and elegantly: "I apologize, but SELA does not have detailed information on that just yet. You might want to check with the campus staff." Do not make up answers.
 
-2. If the question is NOT RELATED to UCIC (General topics, world figures, weather, entertainment, politics, etc.):
-   - You are STRICTLY FORBIDDEN from answering the question.
-   - Always politely decline in your gentle and authoritative style, then steer the conversation back to UCIC topics.
-   - Example refusal: "I apologize, but SELA's focus is perfectly tailored to serving information regarding the UCIC campus. Is there anything about our academic programs or admissions that I can help you with?"
+2. If the question is NOT RELATED to UCIC (General topics, world figures, weather, entertainment, etc.):
+   - If it's a greeting like "who are you" or "hello", answer warmly and with variety. Introduce yourself as SELA, then naturally steer to UCIC.
+   - If the user is venting or unsure about choosing a major, ACT as a caring friend. Give constructive advice. You CAN answer emotional/venting questions.
+   - If the question requires real-time info (e.g., "who is the president now"), and [WEB SEARCH CONTEXT] is available, use it to answer.
+   - If truly outside campus scope and not a greeting/venting, answer briefly and warmly, then redirect to UCIC. Don't refuse harshly.
+   - Example: "That's an interesting question! When it comes to UCIC campus, SELA can help a lot. Is there anything about admissions or programs you'd like to know?"
 
 3. ANTI-NOISE (IGNORE RANDOM CHATTER):
    - If the user's sentence is very short, meaningless, or sounds like fragmented background chatter of passersby (e.g., "uh", "yeah", "hello", "oh really", "what's up", "let's eat"), DO NOT answer it.
@@ -2834,10 +3064,10 @@ You ONLY serve and are PERMITTED to answer questions related to the UCIC campus 
 [CAMPUS CONTEXT]:
 ${contextStr || "Empty"}
 
-[CONVERSATION CONTEXT FOR REFERENCE]:
+${webSearchContext ? `[WEB SEARCH CONTEXT (real-time)]:\n${webSearchContext}\n\n` : ""}[CONVERSATION CONTEXT FOR REFERENCE]:
 ${conversationContextHint || "None. The latest question is standalone."}
 
-[RESPONSE DEPTH RULE]:
+${userMemoryContext ? `[USER MEMORY]:\n${userMemoryContext}\n\n` : ""}[RESPONSE DEPTH RULE]:
 ${buildResponsePlanPrompt(responsePlan, "en")}
 
 [CLARIFICATION DIRECTION]:
@@ -2934,11 +3164,13 @@ IF you DECLINE to answer because the topic is unrelated to the campus, DO NOT ad
 
 // Variabel referensi pemutar audio aktif untuk interupsi instan (barge-in)
 let pemutarAudioAktif = null;
+let sesiPemutaranAktif = 0;
 
 /**
  * Menghentikan seluruh pemutaran suara yang sedang berjalan (Audio Cloned & Web Speech)
  */
 export function stopSpeaking() {
+  sesiPemutaranAktif += 1;
   audioQueueManager.stop();
   if (pemutarAudioAktif) {
     try {
@@ -3027,6 +3259,18 @@ export function streamChatAndVoice({
       const data = JSON.parse(event.data);
       if (data.tipe === "potongan_teks" && data.kalimat) {
         if (onTextChunk) onTextChunk(data.kalimat);
+      } else if (data.tipe === "potongan_teks_fallback_tts" && data.kalimat) {
+        // TTS server gagal - gunakan Web Speech API untuk kalimat ini
+        if (onTextChunk) onTextChunk(data.kalimat);
+        try {
+          if ("speechSynthesis" in window) {
+            const utter = new SpeechSynthesisUtterance(data.kalimat);
+            utter.lang = data.bahasa === "en" ? "en-US" : "id-ID";
+            utter.rate = 1.0;
+            utter.pitch = 1.1;
+            window.speechSynthesis.speak(utter);
+          }
+        } catch (_) {}
       } else if (data.tipe === "potongan_audio" && data.audio_base64) {
         audioQueueManager.enqueue({
           audio_base64: data.audio_base64,
@@ -3077,6 +3321,7 @@ export function streamChatAndVoice({
 export async function speakText(text, onStart, onEnd, lang = "id") {
   // Hentikan suara sebelumnya seketika (barge-in)
   stopSpeaking();
+  const sesiIni = sesiPemutaranAktif;
   unlockAudioContext();
 
   if (!text || !text.trim()) {
@@ -3084,10 +3329,24 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
     return;
   }
 
-  // 1. Prioritaskan sintesis audio OmniVoice Voice Design dari server AI lokal
+  const masihSesiAktif = () => sesiIni === sesiPemutaranAktif;
+  let fallbackDimulai = false;
+  const selesai = () => {
+    if (masihSesiAktif() && onEnd) onEnd();
+  };
+  const akhiriKegagalanOmni = () => {
+    if (!masihSesiAktif() || fallbackDimulai) return;
+    fallbackDimulai = true;
+    console.warn("[SELA TTS] Audio OmniVoice gagal diputar; tidak mengganti suara SELA dengan engine lain.");
+    selesai();
+  };
+
+  // Hanya gunakan audio OmniVoice agar karakter suara SELA konsisten.
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 35000);
+    // OmniVoice pada CPU dapat memerlukan lebih dari 15 detik untuk jawaban
+    // baru. Timeout lama mencegah audio dibatalkan tepat sebelum siap.
+    const timeoutId = setTimeout(() => controller.abort(), 120000);
 
     const respons = await fetch("/api/sintesis", {
       method: "POST",
@@ -3118,20 +3377,20 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
         connectAudioToLipsync(audio);
 
         audio.onplay = () => {
-          if (onStart) onStart();
+          if (masihSesiAktif() && onStart) onStart();
         };
 
         audio.onended = () => {
           URL.revokeObjectURL(audioUrl);
-          pemutarAudioAktif = null;
-          if (onEnd) onEnd();
+          if (masihSesiAktif()) pemutarAudioAktif = null;
+          selesai();
         };
 
         audio.onerror = (galatAudio) => {
           console.warn("[SELA TTS] Kendala pemutaran audio OmniVoice:", galatAudio);
           URL.revokeObjectURL(audioUrl);
-          pemutarAudioAktif = null;
-          if (onEnd) onEnd();
+          if (masihSesiAktif()) pemutarAudioAktif = null;
+          akhiriKegagalanOmni();
         };
 
         try {
@@ -3140,8 +3399,8 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
         } catch (playErr) {
           console.warn("[SELA TTS] audio.play() gagal diputar (kebijakan browser):", playErr);
           URL.revokeObjectURL(audioUrl);
-          pemutarAudioAktif = null;
-          if (onEnd) onEnd();
+          if (masihSesiAktif()) pemutarAudioAktif = null;
+          akhiriKegagalanOmni();
           return;
         }
       }
@@ -3150,8 +3409,7 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
     console.warn("[SELA TTS] Endpoint sintesis backend error:", galatKoneksi?.message);
   }
 
-  // Jika gagal, akhiri speaking tanpa memutar robot default browser
-  if (onEnd) onEnd();
+  akhiriKegagalanOmni();
 }
 
 // ── Time-based Greeting ──────────────────────────────────────────────────────
@@ -3162,38 +3420,10 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
  * @returns {string} - Time-appropriate greeting
  */
 export function getTimeBasedGreeting(lang = "id") {
-  const hour = new Date().getHours();
-  let period;
-
-  if (hour >= 5 && hour < 11) period = "morning";
-  else if (hour >= 11 && hour < 15) period = "afternoon";
-  else if (hour >= 15 && hour < 19) period = "evening";
-  else period = "night";
-
-  const greetings = {
-    id: {
-      morning:
-        "Selamat pagi. SELA siap membantu melayani Anda hari ini. Ada informasi kampus yang bisa dibantu?",
-      afternoon:
-        "Selamat siang. Mari, ada informasi seputar UCIC yang bisa SELA pandu untuk Anda?",
-      evening:
-        "Selamat sore. SELA siap membantu menjawab pertanyaan Anda terkait kampus tercinta ini.",
-      night:
-        "Selamat malam. Ada informasi pendaftaran atau akademik yang ingin Anda ketahui dari SELA?",
-    },
-    en: {
-      morning:
-        "Good morning. SELA is ready to assist you today. How may I help?",
-      afternoon:
-        "Good afternoon. Is there any campus information I can guide you through?",
-      evening:
-        "Good evening. SELA is here to kindly assist with your questions about UCIC.",
-      night:
-        "Good night. Is there anything regarding academics or admissions you would like to know?",
-    },
-  };
-
-  return greetings[lang]?.[period] || greetings[lang].afternoon;
+  if (lang === "en") {
+    return "Hello! Welcome to Catur Insan Cendekia University. How can Sela assist you today?";
+  }
+  return "Halo! Selamat datang di Universitas Catur Insan Cendekia Cirebon. Ada yang bisa Sela bantu?";
 }
 
 // ── Follow-up Suggestion Parser ──────────────────────────────────────────────

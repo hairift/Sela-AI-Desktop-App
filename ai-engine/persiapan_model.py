@@ -10,17 +10,11 @@ DIREKTORI_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mode
 os.makedirs(DIREKTORI_MODEL, exist_ok=True)
 
 MODEL_REKOMENDASI = {
-    "qwen2.5-7b": {
-        "nama_berkas": "qwen2.5-7b-instruct-q4_k_m.gguf",
-        "ukuran": "~4.68 GB",
-        "url": "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-GGUF/resolve/main/qwen2.5-7b-instruct-q4_k_m.gguf",
-        "deskripsi": "Model utama akurasi tinggi, pas untuk VRAM 6GB RTX 3050."
-    },
-    "qwen2.5-3b": {
-        "nama_berkas": "qwen2.5-3b-instruct-q4_k_m.gguf",
-        "ukuran": "~2.1 GB",
-        "url": "https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/qwen2.5-3b-instruct-q4_k_m.gguf",
-        "deskripsi": "Model super cepat, latency rendah (<50ms), hemat VRAM (hanya butuh 2.5GB)."
+    "qwen3.5-4b": {
+        "nama_berkas": "Qwen3.5-4B-UD-Q4_K_XL.gguf",
+        "ukuran": "~2.99 GB",
+        "url": "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF",
+        "deskripsi": "Model resmi Qwen 3.5 4B Parameter ultra-cerdas, optimal untuk RTX 3050 (35 layer GPU offload via llama.cpp Vulkan)."
     }
 }
 

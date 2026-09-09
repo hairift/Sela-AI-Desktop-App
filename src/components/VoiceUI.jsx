@@ -275,6 +275,11 @@ export default function VoiceUI({
     langRef.current = lang;
   }, [lang]);
 
+  const quickChipsRef = useRef(null);
+  const scrollQuickChips = (direction) => {
+    quickChipsRef.current?.scrollBy({ left: direction * 150, behavior: "smooth" });
+  };
+
   // Kiosk mode — jika URL mengandung ?kiosk=1, langsung unlock audio tanpa tap
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -934,10 +939,19 @@ export default function VoiceUI({
     setAvatarState("thinking");
     const requestId = ++aiRequestSeqRef.current;
 
-    const history = (currentChat?.messages || []).map((m) => ({
-      role: m.role,
-      content: m.text,
-    }));
+    // ``onSend`` memperbarui state secara async. Pada sebagian render pesan
+    // terbaru sudah ada di currentChat, pada sebagian lain belum. Bentuk
+    // riwayat secara deterministik agar kueri tidak terkirim dua kali.
+    const normalizedQuery = userText.trim().toLocaleLowerCase();
+    const history = (currentChat?.messages || [])
+      .map((m) => ({ role: m.role, content: m.text }))
+      .filter(
+        (m) =>
+          !(
+            m.role === "user" &&
+            String(m.content || "").trim().toLocaleLowerCase() === normalizedQuery
+          ),
+      );
     history.push({ role: "user", content: userText });
 
     try {
@@ -1391,23 +1405,55 @@ export default function VoiceUI({
           )}
         </div>
 
-        {/* Quick chips bila pesan sudah ada */}
+        {/* Quick chips bila pesan sudah ada dengan navigasi tombol Kiri & Kanan */}
         {messages.length > 0 && (
-          <div className="flex items-center gap-1.5 overflow-x-auto hide-scrollbar py-1 mb-1 z-10">
-            {quickReplies[lang]?.map((qr, idx) => (
-              <button
-                key={idx}
-                type="button"
-                onClick={(e) => {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  handleSubmit(qr.text);
-                }}
-                className="whitespace-nowrap text-[11px] font-medium px-3 py-1 rounded-lg bg-blue-50 dark:bg-slate-800 text-blue-600 dark:text-blue-300 border border-blue-200/60 dark:border-slate-700 hover:bg-blue-100 dark:hover:bg-slate-700 transition-all flex-shrink-0 active:scale-95 cursor-pointer"
-              >
-                {qr.label}
-              </button>
-            ))}
+          <div className="relative flex items-center gap-1 w-full py-1 mb-1 z-10">
+            {/* Tombol Geser Kiri */}
+            <button
+              type="button"
+              onClick={() => scrollQuickChips(-1)}
+              className="w-5 h-5 rounded-full bg-white/95 dark:bg-slate-800/95 border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-blue-600 dark:text-slate-400 dark:hover:text-blue-400 shadow-sm flex items-center justify-center shrink-0 hover:scale-105 active:scale-95 transition-all cursor-pointer z-10"
+              title="Geser topik ke kiri"
+              aria-label="Sebelumnya"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+              </svg>
+            </button>
+
+            {/* Kontainer Tombol Cepat Berjalan Horizontal */}
+            <div
+              ref={quickChipsRef}
+              className="flex-1 flex items-center gap-1.5 overflow-x-auto scroll-smooth hide-scrollbar py-0.5"
+            >
+              {quickReplies[lang]?.map((qr, idx) => (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleSubmit(qr.text);
+                  }}
+                  className="whitespace-nowrap text-[11px] font-medium px-3 py-1 rounded-lg bg-blue-50 dark:bg-slate-800 text-blue-600 dark:text-blue-300 border border-blue-200/60 dark:border-slate-700 hover:bg-blue-100 dark:hover:bg-slate-700 transition-all flex-shrink-0 active:scale-95 cursor-pointer shadow-xs"
+                >
+                  {qr.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Tombol Geser Kanan */}
+            <button
+              type="button"
+              onClick={() => scrollQuickChips(1)}
+              className="w-5 h-5 rounded-full bg-white/95 dark:bg-slate-800/95 border border-slate-200 dark:border-slate-700 text-slate-500 hover:text-blue-600 dark:text-slate-400 dark:hover:text-blue-400 shadow-sm flex items-center justify-center shrink-0 hover:scale-105 active:scale-95 transition-all cursor-pointer z-10"
+              title="Geser topik ke kanan"
+              aria-label="Berikutnya"
+            >
+              <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+              </svg>
+            </button>
           </div>
         )}
 
@@ -1470,7 +1516,7 @@ export default function VoiceUI({
 
       {/* Live Caption Terapung di Tengah (Tampil saat bilah chat disembunyikan) */}
       {!showChatPanel && (
-        <div className="absolute bottom-44 left-1/2 -translate-x-1/2 w-full max-w-2xl z-20 pointer-events-none px-4 flex flex-col items-center">
+        <div className="absolute bottom-60 left-1/2 -translate-x-1/2 w-full max-w-2xl z-20 pointer-events-none px-4 flex flex-col items-center">
           <LiveCaption
             text={latestSpokenText}
             isLoading={isWaitingAI}
@@ -1479,9 +1525,9 @@ export default function VoiceUI({
         </div>
       )}
 
-      {/* Tombol Cepat Topik Populer Terapung (Tampil saat bilah chat disembunyikan) */}
+      {/* Tombol Cepat Topik Populer Terapung (Tampil saat bilah chat disembunyikan, di atas tombol mic) */}
       {!showChatPanel && (
-        <div className="absolute bottom-28 left-1/2 -translate-x-1/2 z-20 flex items-center justify-center gap-2 max-w-2xl flex-wrap px-4 pointer-events-auto">
+        <div className="absolute bottom-40 left-1/2 -translate-x-1/2 z-20 flex items-center justify-center gap-2 max-w-2xl flex-wrap px-4 pointer-events-auto">
           {quickReplies[lang]?.map((qr, idx) => (
             <button
               key={idx}
@@ -1490,7 +1536,7 @@ export default function VoiceUI({
                 e.preventDefault();
                 handleSubmit(qr.text);
               }}
-              className="px-3.5 py-1.5 rounded-full bg-white/80 dark:bg-slate-900/80 hover:bg-blue-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 hover:text-blue-600 dark:hover:text-blue-400 border border-slate-200/80 dark:border-slate-700/80 shadow-md backdrop-blur-md text-xs font-semibold active:scale-95 transition-all cursor-pointer flex items-center gap-1.5"
+              className="px-3.5 py-1.5 rounded-full bg-white/90 dark:bg-slate-900/90 hover:bg-blue-50 dark:hover:bg-slate-800 text-slate-700 dark:text-slate-200 hover:text-blue-600 dark:hover:text-blue-400 border border-slate-200/80 dark:border-slate-700/80 shadow-lg backdrop-blur-md text-xs font-semibold active:scale-95 transition-all cursor-pointer flex items-center gap-1.5"
             >
               <span>{qr.label}</span>
             </button>

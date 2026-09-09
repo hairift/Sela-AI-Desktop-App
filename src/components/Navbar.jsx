@@ -31,31 +31,16 @@ function TtsStatusBadge() {
 
   if (!status) return null // Belum ada data
 
-  if (status.omnivoice_cepat) {
+  if (status.omnivoice_siap || status.omnivoice_voice_design) {
     return (
       <div
         id="tts-status-badge"
-        title="OmniVoice Voice Cloning aktif (Akselerasi CUDA)"
-        className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 border border-emerald-300 dark:border-emerald-600"
+        title={status.pesan_status || "OmniVoice Voice Design Aktif (Karakter Perempuan Imut, Ceria & Alami)"}
+        className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 border border-emerald-300 dark:border-emerald-600"
       >
         <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
         <span className="text-[9px] font-bold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide hidden sm:inline">
-          Voice Clone
-        </span>
-      </div>
-    )
-  }
-
-  if (status.piper_siap) {
-    return (
-      <div
-        id="tts-status-badge"
-        title="Suara Neural Piper Siap (Respon instan <150ms)"
-        className="flex items-center gap-1 px-2 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 border border-emerald-300 dark:border-emerald-600"
-      >
-        <span className="w-2 h-2 rounded-full bg-emerald-500" />
-        <span className="text-[9px] font-bold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide hidden sm:inline">
-          Suara Siap
+          OmniVoice
         </span>
       </div>
     )
@@ -70,22 +55,22 @@ function TtsStatusBadge() {
       >
         <span className="w-2 h-2 rounded-full bg-amber-500" />
         <span className="text-[9px] font-bold text-amber-700 dark:text-amber-300 uppercase tracking-wide hidden sm:inline">
-          Piper
+          TTS Error
         </span>
       </div>
     )
   }
 
-  // OmniVoice sedang loading
+  // OmniVoice sedang memuat
   return (
     <div
       id="tts-status-badge"
-      title="OmniVoice sedang diunduh (~2.5GB) — menggunakan Piper sementara"
+      title="Memuat model OmniVoice..."
       className="flex items-center gap-1 px-2 py-1 rounded-lg bg-blue-100 dark:bg-blue-900/40 border border-blue-300 dark:border-blue-600"
     >
       <span className="w-2 h-2 rounded-full bg-blue-500 animate-ping" />
       <span className="text-[9px] font-bold text-blue-700 dark:text-blue-300 uppercase tracking-wide hidden sm:inline">
-        Unduh AI...
+        Memuat AI...
       </span>
     </div>
   )

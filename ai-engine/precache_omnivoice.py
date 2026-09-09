@@ -27,17 +27,17 @@ KALIMAT_POPULER = [
     ("Sama-sama! Senang bisa membantu. Selamat datang kembali kapan saja ya!", "id"),
     ("You're welcome! Happy to help. Feel free to come back anytime!", "en"),
 
-    # 4 Tombol Cepat Navigasi
-    ("Pendaftaran mahasiswa baru di UCIC bisa dilakukan secara online melalui website resmi PMB. Langkah-langkah lengkapnya sudah Sela tampilkan di layar ya.", "id"),
-    ("Biaya kuliah di UCIC sangat terjangkau dengan berbagai pilihan cicilan dan beasiswa. Rincian lengkapnya sudah Sela tampilkan di layar ya.", "id"),
-    ("UCIC memiliki 3 fakultas dan 10 program studi. Daftar lengkapnya sudah Sela tampilkan di layar ya.", "id"),
-    ("Kampus utama UCIC beralamat di Jalan Kesambi Nomor 202 Cirebon. Rincian lengkapnya sudah Sela tampilkan di layar ya.", "id"),
+    # Ringkasan jawaban kampus yang paling sering terdengar.
+    ("Pendaftaran mahasiswa baru di UCIC bisa dilakukan secara online melalui website resmi PMB.", "id"),
+    ("Biaya kuliah di UCIC tersedia dengan pilihan cicilan dan beasiswa.", "id"),
+    ("UCIC memiliki tiga fakultas dan beragam program studi.", "id"),
+    ("Kampus utama UCIC beralamat di Jalan Kesambi Nomor 202, Cirebon.", "id"),
 
     # Pertanyaan Kampus Populer Lainnya
     ("Rektor Universitas Catur Insan Cendekia saat ini adalah Dr. Chandra Lukita, M.M.", "id"),
-    ("UCIC menyediakan berbagai pilihan beasiswa seperti KIP Kuliah dan beasiswa yayasan. Daftar lengkapnya sudah Sela tampilkan di layar ya.", "id"),
-    ("Fasilitas kampus UCIC meliputi laboratorium komputer, perpustakaan digital, hingga sarana olahraga. Daftar lengkapnya sudah Sela tampilkan di layar ya.", "id"),
-    ("Syarat pendaftaran mahasiswa baru meliputi scan ijazah atau SKL, KTP, dan pas foto. Langkah-langkah lengkapnya sudah Sela tampilkan di layar ya.", "id"),
+    ("UCIC menyediakan pilihan beasiswa seperti KIP Kuliah dan beasiswa yayasan.", "id"),
+    ("Fasilitas kampus UCIC mencakup laboratorium komputer, perpustakaan digital, dan sarana olahraga.", "id"),
+    ("Syarat pendaftaran mahasiswa baru meliputi ijazah atau SKL, KTP, dan pas foto.", "id"),
 ]
 
 def jalankan_precache():

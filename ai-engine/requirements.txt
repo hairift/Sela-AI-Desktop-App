@@ -38,10 +38,6 @@ omnivoice==0.2.1
 webdataset>=1.0.0
 tensorboardX>=2.6
 braceexpand>=0.1.7
-# Jalur kecepatan tinggi: Piper ONNX (ringan, natural, female ID/EN, CPU <200ms)
-piper-tts==1.8.0
-# Cadangan: pyttsx3 SAPI5 (Windows, tanpa unduhan)
-pyttsx3==2.99
 
 # ── LLM offline ─────────────────────────────────────────────
 # Jalur utama: model chat kecil via `transformers`

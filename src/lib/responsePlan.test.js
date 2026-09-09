@@ -75,7 +75,7 @@ test("prioritizeResponseMatches pins aggregate jurusan entries first", () => {
   );
 });
 
-test("buildSpokenText shortens jurusan detail answers for TTS", () => {
+test("buildSpokenText speaks the answer's actual core rather than a fixed template", () => {
   const plan = buildResponsePlan("ucic ada jurusan apa aja", {
     intent: "jurusan",
   });
@@ -102,12 +102,11 @@ Daftar lengkap setiap program studi saya tampilkan di layar agar lebih mudah dib
 
   const spoken = buildSpokenText(longAnswer, plan, "id", matches);
 
-  assert.match(spoken, /3 fakultas/i);
-  assert.match(spoken, /10 program studi/i);
-  assert.doesNotMatch(spoken, /Teknik Informatika, S1 Sistem Informasi/i);
+  assert.match(spoken, /UCIC memiliki 3 fakultas/i);
+  assert.doesNotMatch(spoken, /tampilkan di layar/i);
 });
 
-test("buildSpokenText shortens detailed list answers with on-screen notice", () => {
+test("buildSpokenText preserves a useful spoken summary for detailed lists", () => {
   const plan = buildResponsePlan("kalau saya suka komputer masuk jurusan apa ya", {
     intent: "jurusan",
   });
@@ -118,12 +117,12 @@ Sistem Informasi: jurusan ini fokus pada pengelolaan sistem informasi dan aplika
 
   const spoken = buildSpokenText(shortAnswer, plan, "id", []);
 
-  assert.match(spoken, /layar/i);
+  assert.match(spoken, /Teknik Informatika/i);
   assert.match(spoken, /Jika Anda suka komputer/i);
   assert.doesNotMatch(spoken, /pengelolaan sistem informasi dan aplikasi/i);
 });
 
-test("buildSpokenText summarizes multi-paragraph answers into concise voice speech", () => {
+test("buildSpokenText summarizes multi-paragraph answers without on-screen filler", () => {
   const plan = buildResponsePlan("kalau saya suka komputer masuk jurusan apa ya", {
     intent: "jurusan",
   });
@@ -136,6 +135,17 @@ Sistem Informasi lebih cocok jika Anda suka kombinasi komputer, data, dan proses
   const spoken = buildSpokenText(detailedAnswer, plan, "id", []);
 
   assert.notEqual(spoken, detailedAnswer);
-  assert.match(spoken, /layar/i);
+  assert.doesNotMatch(spoken, /layar/i);
   assert.match(spoken, /Teknik Informatika atau Sistem Informasi/i);
+});
+
+test("buildSpokenText replaces raw URLs with a natural spoken cue", () => {
+  const spoken = buildSpokenText(
+    "Daftar melalui https://pmb.example.test/daftar untuk melanjutkan proses.",
+    buildResponsePlan("cara daftar", { intent: "pendaftaran" }),
+    "id",
+  );
+
+  assert.match(spoken, /Linknya bisa kamu akses di sini/i);
+  assert.doesNotMatch(spoken, /https?:\/\//i);
 });

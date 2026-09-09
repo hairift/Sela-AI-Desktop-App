@@ -62,6 +62,10 @@ class PengenalSuaraOffline:
             "Akuntansi, Bisnis Digital, pendaftaran, PMB, beasiswa, UKT, biaya kuliah, KRS, wisuda."
         )
 
+        # Auto-correct untuk hasil transkripsi ASR
+        from koreksi_asr import KoreksiAsr
+        self.koreksi_asr = KoreksiAsr()
+
         self.inisialisasi_whisper()
 
     # ── Inisialisasi ──────────────────────────────────────────
@@ -405,6 +409,12 @@ class PengenalSuaraOffline:
             teks_gabungan, bahasa_terdeteksi = self._transkripsi_dengan_fallback_cpu(
                 pcm, kode_bahasa
             )
+            # Auto-correct hasil transkripsi (perbaiki typo pengucapan)
+            if teks_gabungan and hasattr(self, 'koreksi_asr'):
+                teks_asli = teks_gabungan
+                teks_gabungan = self.koreksi_asr.koreksi_teks(teks_gabungan)
+                if teks_asli != teks_gabungan:
+                    print(f"[Pengenal Suara] Auto-correct: '{teks_asli}' -> '{teks_gabungan}'")
             return {"teks": teks_gabungan, "sukses": True,
                     "bahasa": bahasa_terdeteksi,
                     "durasi": round(durasi, 2), "energi": round(energi, 4)}
@@ -420,6 +430,12 @@ class PengenalSuaraOffline:
                         condition_on_previous_text=False, no_speech_threshold=0.6)
             hasil = self.model_whisper.transcribe(np.asarray(pcm, dtype=np.float32), **opsi)
             teks = (hasil.get("text") or "").strip()
+            # Auto-correct hasil transkripsi
+            if teks and hasattr(self, 'koreksi_asr'):
+                teks_asli = teks
+                teks = self.koreksi_asr.koreksi_teks(teks)
+                if teks_asli != teks:
+                    print(f"[Pengenal Suara] Auto-correct (standar): '{teks_asli}' -> '{teks}'")
             return {"teks": teks, "sukses": True, "bahasa": kode_bahasa or "id",
                     "durasi": round(durasi, 2), "energi": round(energi, 4)}
         except Exception as galat:
