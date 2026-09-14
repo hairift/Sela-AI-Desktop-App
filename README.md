@@ -2,11 +2,17 @@
 
 SELA AI Desktop - AI Receptionist and Campus Customer Service UCIC.
 
+## Tampilan
+
+![Tampilan antarmuka SELA AI Desktop](docs/tangkapan-layar.png)
+
 ## Struktur
 - `src/` - Frontend React + Vite
 - `electron/` - Electron main process
 - `ai-engine/` - Python backend (Whisper ASR, LLM, Piper TTS, RAG)
 - `public/` - Aset statis
+- `assets/3d-source/` - Sumber model 3D editable (tidak ikut bundel Vite)
+- `docs/` - Tangkapan layar dan dokumentasi
 
 ## Cara jalan
 ```bat
