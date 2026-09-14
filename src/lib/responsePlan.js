@@ -346,6 +346,11 @@ export function buildSpokenText(
   const withoutLinks = cleanedText
     .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/gi, "$1. Linknya bisa kamu akses di sini.")
     .replace(/https?:\/\/\S+/gi, "Linknya bisa kamu akses di sini.")
+    // Saran pertanyaan lanjutan ditulis backend sebagai "[Pertanyaan?] | [Pertanyaan?]".
+    // Kurung siku dan pemisah pipa tidak boleh ikut diucapkan mesin suara, jadi
+    // tanda-tandanya dibuang sementara pertanyaannya tetap dibacakan.
+    .replace(/\[([^\]\n]*)\]/g, "$1")
+    .replace(/\s*\|\s*/g, " ")
     .replace(/[*_`#>]/g, "");
 
   const units = withoutLinks

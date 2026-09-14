@@ -86,7 +86,11 @@ function normalizeMarkdownStructure(text = '') {
       .replace(/:\s+(?=(?:[-*]\s+|(?:[1-9]|[1-9]\d)[.)]\s+))/g, ':\n')
       .replace(/(^|\n)((?:[1-9]|[1-9]\d)[.)])(?=\S)/g, '$1$2 ')
       .replace(/([^\n])[\s,;]+((?:[1-9]|[1-9]\d)[.)]\s+)/g, '$1\n$2')
-      .replace(/([^\n\d])[\s,;]+([-*]\s+(?=[A-Za-z0-9(]))/g, '$1\n$2')
+      // Tanda hubung hanya dianggap awal bullet bila didahului akhir kalimat
+      // atau baris baru. Sebelumnya spasi di sekitar tanda pisah biasa
+      // ("biaya - sekitar empat juta") ikut diubah menjadi bullet sehingga
+      // potongan kalimat tampil sebagai poin daftar.
+      .replace(/([.!?])\s+([-*]\s+(?=[A-Z0-9]))/g, '$1\n$2')
 
     // Label bagian yang sering muncul dari dataset dibuat sebagai baris sendiri
     // agar "Program S1:" tidak menempel dengan paragraf sebelumnya.
@@ -164,9 +168,9 @@ function splitMarkdownBlocks(text = '') {
     const unorderedMatch = trimmed.match(/^[-*]\s+(.*)$/)
     if (unorderedMatch) {
       flushParagraph()
-      if (!activeList || activeList.type !== 'ordered-list') {
+      if (!activeList || activeList.type !== 'unordered-list') {
         flushList()
-        activeList = { type: 'ordered-list', items: [] }
+        activeList = { type: 'unordered-list', items: [] }
       }
       activeList.items.push(unorderedMatch[1])
       return
@@ -311,7 +315,7 @@ function ChatContent({ text, qrVisibleMs = null }) {
 
   return (
     <ChatSuggestionLayout suggestions={suggestions}>
-      <div className="space-y-2 break-words">
+      <div className="space-y-3 break-words">
         {blocks.length === 0 ? (
           <span className="whitespace-pre-wrap break-words">
             {renderInlineMarkdown(answerText, 'fallback')}
@@ -331,20 +335,26 @@ function ChatContent({ text, qrVisibleMs = null }) {
               )
             }
 
-            if (block.type === 'ordered-list') {
+            if (block.type === 'ordered-list' || block.type === 'unordered-list') {
+              const Daftar = block.type === 'ordered-list' ? 'ol' : 'ul'
+              const gayaPenanda = block.type === 'ordered-list' ? 'list-decimal' : 'list-disc'
+
               return (
-                <ol key={`ol-${blockIndex}`} className="list-decimal space-y-1.5 pl-5 leading-relaxed">
+                <Daftar
+                  key={`list-${blockIndex}`}
+                  className={`${gayaPenanda} space-y-1.5 pl-5 leading-relaxed marker:text-gray-400 dark:marker:text-gray-500`}
+                >
                   {block.items.map((item, itemIndex) => (
-                    <li key={`ol-${blockIndex}-${itemIndex}`} className="whitespace-pre-wrap pl-0.5">
-                      {renderInlineMarkdown(item, `ol-${blockIndex}-${itemIndex}`)}
+                    <li key={`list-${blockIndex}-${itemIndex}`} className="break-words pl-0.5">
+                      {renderInlineMarkdown(item, `list-${blockIndex}-${itemIndex}`)}
                     </li>
                   ))}
-                </ol>
+                </Daftar>
               )
             }
 
             return (
-              <p key={`p-${blockIndex}`} className="whitespace-pre-wrap break-words">
+              <p key={`p-${blockIndex}`} className="whitespace-pre-wrap break-words leading-relaxed">
                 {renderInlineMarkdown(block.content, `p-${blockIndex}`)}
               </p>
             )

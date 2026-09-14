@@ -173,3 +173,46 @@ test("buildSpokenText replaces raw URLs with a natural spoken cue", () => {
   assert.match(spoken, /Linknya bisa kamu akses di sini/i);
   assert.doesNotMatch(spoken, /https?:\/\//i);
 });
+
+test("buildSpokenText strips list markers so TTS never reads dashes or numbers", () => {
+  // UI kini boleh menampilkan daftar bullet/bernomor (agar mudah dibaca),
+  // tetapi mesin suara tidak boleh mengucapkan penanda "- " atau "1. ".
+  const answer = `Ada dua paket biaya kuliah.
+
+- Early Bird standar mulai dua juta delapan ratus ribu rupiah.
+- Early Bird diskon lima puluh lima persen sekitar empat juta rupiah.
+
+Langkah pendaftarannya:
+1. Isi formulir pendaftaran secara online.
+2. Bayar biaya pendaftaran dua ratus lima puluh ribu rupiah.`;
+
+  const spoken = buildSpokenText(answer, null, "id", []);
+
+  // Penanda daftar tidak boleh tersisa dalam teks yang diucapkan.
+  assert.doesNotMatch(spoken, /(^|\s)[-*]\s/);
+  assert.doesNotMatch(spoken, /\b\d+[.)]\s/);
+
+  // Namun seluruh isi setiap poin tetap dibacakan.
+  assert.match(spoken, /Early Bird standar mulai dua juta delapan ratus ribu rupiah/i);
+  assert.match(spoken, /Early Bird diskon lima puluh lima persen sekitar empat juta rupiah/i);
+  assert.match(spoken, /Isi formulir pendaftaran secara online/i);
+  assert.match(spoken, /Bayar biaya pendaftaran dua ratus lima puluh ribu rupiah/i);
+});
+
+test("buildSpokenText speaks follow-up suggestions without brackets or pipe", () => {
+  // Backend menulis saran lanjutan sebagai "[Pertanyaan?] | [Pertanyaan?]".
+  // Tanda kurung siku dan pipa tidak boleh ikut diucapkan mesin suara.
+  const answer =
+    "Pendaftaran UCIC dibuka bulan Maret. " +
+    "[Bagaimana cara mendaftar ke UCIC?] | [Apa saja syarat pendaftarannya?]";
+
+  const spoken = buildSpokenText(answer, null, "id", []);
+
+  assert.ok(!spoken.includes("["), "kurung siku buka tidak boleh diucapkan");
+  assert.ok(!spoken.includes("]"), "kurung siku tutup tidak boleh diucapkan");
+  assert.ok(!spoken.includes("|"), "pemisah pipa tidak boleh diucapkan");
+
+  // Namun pertanyaan saran tetap dibacakan.
+  assert.match(spoken, /Bagaimana cara mendaftar ke UCIC\?/);
+  assert.match(spoken, /Apa saja syarat pendaftarannya\?/);
+});

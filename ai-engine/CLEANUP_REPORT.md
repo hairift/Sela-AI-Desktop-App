@@ -846,3 +846,73 @@ memotret layar. Dua kendala lingkungan yang harus dilewati:
 Hasil tangkapan layar: avatar tampil utuh dari kepala sampai pinggul, wajah dan kedua tangan
 terlihat, hanya menyisakan peringatan CSP Electron (tidak berkaitan). Tidak ada galat pemuatan
 `/models/sela.glb`.
+
+---
+
+## 21. Tampilan teks obrolan dirapikan (paragraf + daftar), TTS tetap utuh
+
+**Keluhan:** jawaban AI tampil sebagai satu blok teks padat sehingga melelahkan dibaca; paragraf
+dan daftar diminta dibungkus serapi mungkin, tanpa merusak cara mesin suara menyebutkannya.
+
+### Empat penyebab yang ditemukan (bukan satu)
+
+1. **`_bersihkan_teks()` membuang SEMUA baris kosong.** `server.py` menyaring baris dengan
+   `if b.strip()`, sehingga pemisah paragraf dari LLM hilang dan semua gagasan menempel menjadi
+   satu blok. Dibuktikan langsung: masukan dengan 3 pemisah paragraf keluar dengan **0**.
+2. **Prompt melarang seluruh markdown.** `MASTER_PERSONA` aturan 2 berbunyi "tanpa markdown,
+   tanpa bintang, tanpa tanda pagar" karena jawaban diucapkan mesin suara. Akibatnya model tidak
+   punya cara membuat daftar dan selalu menulis prosa.
+3. **Bug di `ChatBubble.jsx`:** cabang daftar *bullet* membuat tipe `'ordered-list'`, dan tidak
+   ada cabang render untuk `unordered-list`. Jadi `- item` dirender sebagai angka, bukan bullet.
+4. **Aturan konversi tanda hubung terlalu agresif:** `([^\n\d])[\s,;]+([-*]\s+...)` mengubah
+   tanda pisah di tengah kalimat biasa ("biaya - sekitar empat juta") menjadi awal bullet,
+   sehingga potongan kalimat tampil sebagai poin daftar.
+
+### Dua bug laten yang ikut ketahuan saat pengujian
+
+- **Jawaban bisa menjadi KOSONG.** Pola `"<\|im_start\|>.*?<\|im_end\|>"` menghapus **seluruh
+  blok**, termasuk jawaban yang berada di antara kedua tag. Diganti: hanya tag-nya yang dibuang
+  (`<\|im_(?:start|end)\|>`), lalu label peran bocor di awal (`assistant`) dibersihkan.
+  Sekarang `"<|im_start|>assistant\nHalo, ini SELA.<|im_end|>"` → `"Halo, ini SELA."` (dulu → kosong).
+- **Angka bertitik terpecah (regresi yang sempat saya buat sendiri).** Pemroses kalimat memakai
+  `[^.!?]*[.!?]+\s*` lalu menggabung ulang dengan spasi, sehingga `Rp170.000` menjadi
+  `Rp170. 000` dan `2.500.000` menjadi `2. 500. 000` — mesin suara akan menyebutnya dua bagian
+  terpisah. Diperbaiki dengan memecah kalimat **hanya bila tanda baca diikuti spasi**
+  (`re.split(r"(?<=[.!?])\s+", ...)`), lalu diuji: keempat contoh angka kembali identik.
+
+### Perubahan
+
+| Berkas | Perubahan |
+|---|---|
+| `ai-engine/server.py` | `_bersihkan_teks()` mempertahankan **satu** baris kosong sebagai pemisah blok; tag template hanya dibuang tag-nya; pemecahan kalimat tidak lagi merusak angka bertitik. Ditambah `_pecah_paragraf_panjang()` + `_rapikan_paragraf()` sebagai **jaring pengaman tata letak**. |
+| `ai-engine/prompts/sela_prompts.py` | Aturan gaya bicara diperluas: boleh memakai daftar (`- ` dan `1. `), wajib memisah gagasan dengan satu baris kosong, satu poin satu kalimat pendek. Tetap dilarang: bintang ganda, tanda pagar, tabel, emoji, tautan mentah. Aturan pertanyaan lanjutan wajib di baris baru terpisah. |
+| `src/components/ChatBubble.jsx` | Tipe daftar bullet diperbaiki (`unordered-list`), ditambah render `<ul>` dengan `list-disc` + `marker:text-gray-400`, jarak antar blok `space-y-2` → `space-y-3`, aturan tanda hubung dipersempit agar tidak salah deteksi. |
+| `src/lib/responsePlan.js` | `buildSpokenText()` membuang kurung siku dan pemisah pipa saran lanjutan (`[Tanya?] \| [Tanya?]`) tetapi tetap membacakan pertanyaannya. |
+
+### Jaring pengaman: blok panjang dipecah otomatis
+Kepatuhan model tidak bisa dijamin (temperature 0.6). Karena itu `_rapikan_paragraf()` memecah blok
+prosa yang melewati ~320 karakter atau >3 kalimat menjadi beberapa paragraf pendek. Pemecahan ini
+**murni tata letak** — kata, urutan, dan isi tidak berubah, sehingga mesin suara membacakan teks
+yang persis sama (diuji: `" ".join(masukan.split()) == " ".join(keluaran.split())` → `True`).
+Blok yang memuat baris daftar tidak pernah dipecah.
+
+### Verifikasi
+- **Uji backend:** 86 lulus / 0 gagal (naik dari 72). Bagian **[17] Pembersih teks jawaban** baru:
+  11 pemeriksaan (pemisah paragraf, bullet, penomoran, dedupe, tag template, pemecahan blok panjang,
+  dan angka bertitik utuh).
+- **Uji frontend:** 10 lulus / 0 gagal (naik dari 8) — termasuk penanda daftar tidak diucapkan dan
+  saran lanjutan dibacakan tanpa kurung siku/pipa.
+- **Kepatuhan prompt diukur:** 5 sampel pertanyaan yang sama → **5/5** memuat daftar bullet
+  (2–8 poin) dan 3–9 pemisah paragraf.
+- **Jalur TTS diperiksa pada jawaban nyata:** penanda `- ` dan `1.` **tidak** tersisa, tidak ada
+  baris baru, angka `Rp2.820.000` / `Rp13.410.000` utuh, dan seluruh kalimat di layar ikut
+  diucapkan (`True`).
+- **Tangkapan layar nyata** (Electron, `dist/` hasil build) untuk dua pertanyaan: jawaban kini
+  tampil sebagai paragraf pendek + daftar bullet berindentasi menggantung, bukan dinding teks.
+
+### Catatan operasional
+- **Server yang sedang berjalan harus di-restart** agar prompt baru berlaku (prompt adalah
+  konstanta modul, dibaca saat start).
+- Saat menguji, port 8008 sudah dipakai server lama sehingga server uji gagal bind
+  (`Errno 10048`). Server uji dijalankan di port lain (`PORT_SELA_AI=8123`) agar tidak
+  mengganggu server milik pengguna. **Selalu pastikan hanya satu server per port.**

@@ -19,6 +19,7 @@ Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 14. Routing ranah (kampus / umum / real-time)
 15. Server FastAPI (opsional, set SELA_UJI_SERVER=1)
 16. Pengunduh model (truncate berkas rusak / resume / verifikasi)
+17. Pembersih teks jawaban (pemisah paragraf & daftar tetap utuh)
 
 Jalankan:  python ai-engine/test_server.py
 """
@@ -396,6 +397,13 @@ def uji_prompts() -> None:
     _cek("ATURAN_PERTANYAAN_LANJUTAN ada", "[Pertanyaan" in ATURAN_PERTANYAAN_LANJUTAN)
     _cek("pesan_sistem_kampus terformat", "DOKUMEN RESMI" in pesan_sistem_kampus("KONTEKS", "tanya"))
     _cek("pesan_sistem_umum terformat", "LUAR KAMPUS" in pesan_sistem_umum("tanya"))
+    # Kontrak tampilan: prompt WAJIB mengizinkan daftar & mewajibkan pemisah
+    # paragraf. Bila aturan ini hilang, jawaban kembali menjadi prosa padat.
+    _cek("MASTER_PERSONA mengizinkan bullet & nomor",
+         '"- "' in MASTER_PERSONA and '"1. "' in MASTER_PERSONA)
+    _cek("MASTER_PERSONA wajib pisah paragraf", "SATU baris kosong" in MASTER_PERSONA)
+    _cek("MASTER_PERSONA tetap larang format tebal/tabel",
+         "bintang ganda" in MASTER_PERSONA and "tabel" in MASTER_PERSONA)
 
 
 def uji_routing() -> None:
@@ -530,6 +538,77 @@ def uji_unduh_model() -> None:
             peladen.server_close()
 
 
+def uji_bersihkan_teks() -> None:
+    print("\n[17] Pembersih teks jawaban (paragraf & daftar)")
+    from server import _bersihkan_teks
+
+    jawaban = (
+        "Hai, aku SELA dari UCIC Cirebon. Ada dua paket biaya kuliah.\n"
+        "\n"
+        "Paket yang tersedia:\n"
+        "- Early Bird standar: mulai dua juta delapan ratus ribu rupiah.\n"
+        "- Early Bird diskon lima puluh lima persen: sekitar empat juta rupiah.\n"
+        "\n"
+        "Langkah pendaftaran:\n"
+        "1. Isi formulir pendaftaran secara online.\n"
+        "2. Bayar biaya pendaftaran dua ratus lima puluh ribu rupiah.\n"
+        "\n"
+        "Silakan hubungi admin untuk rincian."
+    )
+
+    hasil = _bersihkan_teks(jawaban)
+
+    # Regresi: versi lama membuang SEMUA baris kosong sehingga paragraf dan
+    # daftar menempel menjadi satu blok padat di UI.
+    _cek("pemisah paragraf dipertahankan", hasil.count("\n\n") == 3,
+         f"baris kosong = {hasil.count(chr(10) * 2)}, harap 3")
+    _cek("baris bullet tetap utuh", hasil.count("- Early Bird") == 2)
+    _cek("penomoran daftar tetap utuh",
+         "1. Isi formulir" in hasil and "2. Bayar biaya" in hasil)
+    _cek("isi poin tidak hilang", "sekitar empat juta rupiah" in hasil)
+
+    # Dedupe kalimat & pembersihan tag template harus tetap bekerja.
+    ganda = _bersihkan_teks(
+        "Biaya pendaftaran lima ratus ribu. "
+        "Biaya pendaftaran lima ratus ribu. "
+        "Uang gedung empat juta."
+    )
+    _cek("kalimat duplikat dibuang", ganda.count("Biaya pendaftaran") == 1)
+
+    bocor = _bersihkan_teks("<|im_start|>assistant\nHalo, ini SELA.<|im_end|>")
+    _cek("tag template bocor dibuang", "im_start" not in bocor and "SELA" in bocor)
+
+    # Jaring pengaman tata letak: blok prosa panjang harus dipecah menjadi
+    # paragraf pendek, TANPA mengubah satu kata pun (TTS membaca teks sama).
+    dinding = (
+        "Biaya kuliah UCIC tergantung pilihan pembayaran dan program studi. "
+        "Ada tiga opsi pembayaran dengan potongan yang berbeda-beda. "
+        "Untuk Teknik Informatika, skema Early Bird reguler mulai dari dua juta "
+        "delapan ratus dua puluh ribu hingga delapan juta enam ratus sembilan "
+        "puluh ribu rupiah. Kelas sore lebih mahal sekitar dua ratus sembilan "
+        "puluh tujuh ribu rupiah untuk skema yang sama. Total sudah termasuk "
+        "pendaftaran, perlengkapan, dan diskon penuh untuk DPP serta uang gedung."
+    )
+    pecah = _bersihkan_teks(dinding)
+    paragraf = [p for p in pecah.split("\n\n") if p.strip()]
+    _cek("blok panjang dipecah jadi beberapa paragraf",
+         len(paragraf) >= 2, f"paragraf = {len(paragraf)}")
+    _cek("tiap paragraf tidak kelewat panjang",
+         all(len(p) <= 400 for p in paragraf),
+         f"terpanjang = {max(len(p) for p in paragraf)} karakter")
+    _cek("isi tidak berubah saat dipecah",
+         " ".join(dinding.split()) == " ".join(pecah.split()))
+
+    # Regresi: pemisah ribuan TIDAK boleh terpecah. Dulu "Rp170.000" berubah
+    # menjadi "Rp170. 000" sehingga mesin suara menyebutnya dua bagian terpisah.
+    for angka in (
+        "Potongan sebesar Rp170.000 untuk satu semester.",
+        "Totalnya 2.500.000 rupiah. Cukup terjangkau.",
+    ):
+        _cek(f"angka bertitik utuh: {angka[:24]}...",
+             _bersihkan_teks(angka) == angka, repr(_bersihkan_teks(angka)))
+
+
 def main() -> int:
     print("=" * 64)
     print(" [SELA AI Desktop] Uji Asap Arsitektur Baru")
@@ -548,6 +627,7 @@ def main() -> int:
     uji_vad()
     uji_prompts()
     uji_unduh_model()
+    uji_bersihkan_teks()
     if os.environ.get("SELA_UJI_SERVER") == "1":
         uji_routing()
         uji_server()

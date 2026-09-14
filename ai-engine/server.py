@@ -296,34 +296,125 @@ def susun_rencana(kueri: str, riwayat: Optional[List[Dict[str, str]]], bahasa: s
     }
 
 
+def _pecah_paragraf_panjang(paragraf: str, maks_kalimat: int = 3, maks_karakter: int = 320) -> List[str]:
+    """Pecah satu paragraf panjang menjadi beberapa paragraf pendek.
+
+    Model bahasa kadang tetap menulis satu blok panjang walau sudah diminta
+    memisah paragraf. Pemecahan di sini murni TATA LETAK: isi, urutan, dan
+    kalimat tidak diubah sama sekali, sehingga mesin suara membacakan teks yang
+    persis sama. Tujuannya hanya agar blok panjang tidak melelahkan dibaca.
+    """
+    bersih = paragraf.strip()
+    if not bersih:
+        return []
+    if len(bersih) <= maks_karakter:
+        return [bersih]
+
+    # Kalimat hanya dipecah bila tanda baca diikuti spasi/akhir teks. Tanpa
+    # syarat ini, pemisah ribuan seperti "Rp170.000" ikut terpecah dan berubah
+    # menjadi "Rp170. 000" sehingga mesin suara menyebutnya dua kali terpisah.
+    kalimat = [k.strip() for k in re.split(r"(?<=[.!?])\s+", bersih) if k.strip()]
+    if len(kalimat) <= maks_kalimat:
+        return [bersih]
+
+    hasil: List[str] = []
+    kelompok: List[str] = []
+    panjang = 0
+    for k in kalimat:
+        tambahan = len(k) + (1 if kelompok else 0)
+        if kelompok and (len(kelompok) >= maks_kalimat or panjang + tambahan > maks_karakter):
+            hasil.append(" ".join(kelompok))
+            kelompok = []
+            panjang = 0
+        kelompok.append(k)
+        panjang += tambahan
+    if kelompok:
+        hasil.append(" ".join(kelompok))
+    return hasil
+
+
+def _rapikan_paragraf(teks: str) -> str:
+    """Pisahkan blok panjang menjadi paragraf pendek, kecuali blok daftar.
+
+    Blok yang memuat baris daftar ("- " atau "1. ") dibiarkan utuh agar
+    strukturnya tidak rusak.
+    """
+    keluaran: List[str] = []
+    for blok in re.split(r"\n\s*\n", teks):
+        baris = [b for b in blok.split("\n") if b.strip()]
+        if not baris:
+            continue
+        ada_daftar = any(re.match(r"^\s*(?:[-*]|\d+[.)])\s+", b) for b in baris)
+        if ada_daftar:
+            keluaran.append("\n".join(baris))
+            continue
+        keluaran.extend(_pecah_paragraf_panjang(" ".join(baris)))
+    return "\n\n".join(keluaran)
+
+
 def _bersihkan_teks(teks: str) -> str:
-    """Buang tag template bocor, baris/kalimat duplikat, dan spasi ganda."""
+    """Buang tag template bocor, baris/kalimat duplikat, dan spasi ganda.
+
+    Struktur paragraf DIPERTAHANKAN. Versi sebelumnya membuang SEMUA baris
+    kosong, sehingga paragraf dan blok daftar dari LLM menempel menjadi satu
+    blok teks padat yang melelahkan dibaca di UI. Sekarang maksimal satu baris
+    kosong tetap disimpan sebagai pemisah blok.
+    """
     if not teks:
         return teks
-    teks = re.sub(r"<\|im_start\|>.*?<\|im_end\|>", "", teks, flags=re.DOTALL)
-    teks = re.sub(r"<\|im_(start|end)\|>", "", teks)
+    # Buang tag template yang bocor TANPA membuang isi jawaban di dalamnya.
+    # Pola lama "<|im_start|>.*?<|im_end|>" menghapus seluruh blok, termasuk
+    # jawaban yang ada di antaranya, sehingga jawaban bisa menjadi kosong.
+    teks = re.sub(r"<\|im_(?:start|end)\|>", "", teks)
+    # Label peran yang ikut bocor di awal jawaban (mis. "assistant").
+    teks = re.sub(r"^\s*(?:assistant|asisten)\s*:?\s*", "", teks, flags=re.IGNORECASE)
+
+    # Rapikan baris: buang spasi ujung, baris duplikat berurutan, dan tumpukan
+    # baris kosong. Satu baris kosong dipertahankan sebagai pemisah paragraf.
     baris_bersih: List[str] = []
+    isi_terakhir: Optional[str] = None
     for b in teks.split("\n"):
-        if b.strip() and (not baris_bersih or b.strip() != baris_bersih[-1].strip()):
-            baris_bersih.append(b)
+        isi = b.strip()
+        if not isi:
+            if baris_bersih and baris_bersih[-1] != "":
+                baris_bersih.append("")
+            continue
+        if isi_terakhir is not None and isi == isi_terakhir:
+            continue
+        isi_terakhir = isi
+        baris_bersih.append(isi)
+    while baris_bersih and baris_bersih[-1] == "":
+        baris_bersih.pop()
     teks = "\n".join(baris_bersih)
-    kalimat = re.findall(r"[^.!?]*[.!?]\s*", teks) or [teks]
-    sisa = teks[len("".join(kalimat)):]
-    if sisa.strip():
-        kalimat.append(sisa)
-    hasil: List[str] = []
+
+    # Buang kalimat duplikat, tetapi diproses PER BARIS supaya batas paragraf
+    # dan daftar tidak ikut hilang saat kalimat-kalimat disatukan kembali.
     terlihat = set()
-    for k in kalimat:
-        k_bersih = k.strip()
-        if not k_bersih:
+    baris_final: List[str] = []
+    for baris in teks.split("\n"):
+        if not baris:
+            baris_final.append("")
             continue
-        k_norm = re.sub(r"[^\w]+", " ", k_bersih.lower()).strip()
-        if k_norm in terlihat:
-            continue
-        terlihat.add(k_norm)
-        hasil.append(k)
-    teks = "".join(hasil)
-    teks = re.sub(r" {2,}", " ", teks)
+        # Pisah kalimat HANYA pada tanda baca yang diikuti spasi. Tanpa syarat
+        # ini, angka bertitik seperti "Rp170.000" terpecah menjadi "Rp170. 000"
+        # dan mesin suara menyebutnya sebagai dua bagian terpisah.
+        bagian: List[str] = []
+        for k in re.split(r"(?<=[.!?])\s+", baris):
+            k_bersih = k.strip()
+            if not k_bersih:
+                continue
+            k_norm = re.sub(r"[^\w]+", " ", k_bersih.lower()).strip()
+            if k_norm in terlihat:
+                continue
+            terlihat.add(k_norm)
+            bagian.append(k_bersih)
+        baris_final.append(" ".join(bagian))
+
+    teks = "\n".join(baris_final)
+    # Jaring pengaman tata letak: pecah blok prosa yang kelewat panjang supaya
+    # tidak ada lagi dinding teks, walau model tidak memisah paragraf sendiri.
+    teks = _rapikan_paragraf(teks)
+    teks = re.sub(r"[ \t]{2,}", " ", teks)
     teks = re.sub(r"\n{3,}", "\n\n", teks)
     return teks.strip()
 
