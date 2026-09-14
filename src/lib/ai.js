@@ -1,18 +1,10 @@
-import Fuse from "fuse.js";
 import dataset from "../data/ucic_dataset.json";
-import ragGoldens from "../data/rag_goldens.json";
-import {
-  buildResponsePlan,
-  buildResponsePlanPrompt,
-  buildSpokenText,
-  prioritizeResponseMatches,
-} from "./responsePlan";
+import { buildSpokenText } from "./responsePlan";
 import { connectAudioToLipsync, unlockAudioContext } from "./lipsync";
 import { audioQueueManager } from "./streamingAudioQueue";
 
 // ── RAG Setup ────────────────────────────────────────────────────────────────
 
-let fuse = null;
 let learnedTypoCache = null;
 
 const EXCLUDED_RAG_CATEGORIES = new Set([]);
@@ -251,15 +243,6 @@ const RAG_SYNONYMS = {
   visi: ["misi", "tujuan"],
 };
 
-const BROAD_SYNONYM_KEYS = new Set(["akademik"]);
-const GENERIC_REVERSE_SYNONYM_TOKENS = new Set([
-  "fakultas",
-  "jurusan",
-  "prodi",
-  "program",
-  "studi",
-]);
-
 const TYPO_TOKEN_MAP = {
   dmn: "dimana",
   dmnnya: "dimana",
@@ -293,27 +276,6 @@ const TYPO_TOKEN_MAP = {
   ewallet: "ewallet",
   gopaynya: "gopay",
 };
-
-const REFERENTIAL_TOKENS = new Set([
-  "itu",
-  "ituh",
-  "tadi",
-  "yang",
-  "yg",
-  "nya",
-  "terus",
-  "trus",
-  "lanjut",
-  "lanjutnya",
-  "kalo",
-  "kalau",
-  "tersebut",
-  "begitu",
-  "gitu",
-  "gini",
-  "ini",
-  "ygitu",
-]);
 
 const TOPIC_HINTS = {
   pendaftaran: [
@@ -509,11 +471,8 @@ const CANONICAL_REWRITE_MAP = {
 const RAG_FAILURE_LOG_KEY = "sela_rag_failure_log";
 const SESSION_ARCHIVE_KEY = "sela_session_archive_v1";
 const LEARNED_ARTIFACTS_KEY = "sela_learned_artifacts_v1";
-const RAG_EVALUATION_KEY = "sela_rag_evaluation_v1";
 const SESSION_RETENTION_LIMIT = 20;
 const SESSION_RETENTION_MS = 1000 * 60 * 60 * 24 * 14;
-const SHADOW_REVIEW_MIN_SOURCE_COUNT = 2;
-
 const SLOT_PATTERNS = {
   biaya: {
     pendaftaran: ["pendaftaran", "daftar", "uang daftar", "uang masuk"],
@@ -585,51 +544,6 @@ const SHORT_VALID_QUERY_TOKENS = new Set([
   "biayanya",
   "syaratnya",
 ]);
-
-const PROGRAM_REFERENCE_ALIASES = [
-  {
-    label: "S1 Teknik Informatika",
-    aliases: ["s1 teknik informatika", "teknik informatika", "informatika", "ti"],
-  },
-  {
-    label: "S1 Sistem Informasi",
-    aliases: ["s1 sistem informasi", "sistem informasi", "si"],
-  },
-  {
-    label: "S1 Desain Komunikasi Visual",
-    aliases: ["s1 desain komunikasi visual", "desain komunikasi visual", "dkv"],
-  },
-  {
-    label: "D3 Manajemen Informatika",
-    aliases: ["d3 manajemen informatika", "manajemen informatika"],
-  },
-  {
-    label: "S1 Manajemen",
-    aliases: ["s1 manajemen", "manajemen"],
-  },
-  {
-    label: "S1 Akuntansi",
-    aliases: ["s1 akuntansi", "akuntansi"],
-  },
-  {
-    label: "S1 Bisnis Digital",
-    aliases: ["s1 bisnis digital", "bisnis digital"],
-  },
-  {
-    label: "D3 Manajemen Bisnis",
-    aliases: ["d3 manajemen bisnis", "manajemen bisnis"],
-  },
-  {
-    label: "S1 Pendidikan Kepelatihan Olahraga",
-    aliases: [
-      "s1 pendidikan kepelatihan olahraga",
-      "pendidikan kepelatihan olahraga",
-      "pko",
-      "pkor",
-      "olahraga",
-    ],
-  },
-];
 
 function normalizeText(text = "") {
   let normalized = String(text)
@@ -1076,201 +990,11 @@ function normalizeToken(token = "") {
   return normalized;
 }
 
-function getSearchTokens(text = "") {
-  const tokens = getBaseSearchTokens(text);
-
-  const expanded = new Set(tokens);
-  for (const token of tokens) {
-    if (RAG_SYNONYMS[token] && !BROAD_SYNONYM_KEYS.has(token)) {
-      RAG_SYNONYMS[token].forEach((alias) => expanded.add(alias));
-    }
-    for (const [canonical, aliases] of Object.entries(RAG_SYNONYMS)) {
-      if (
-        aliases.includes(token) &&
-        !GENERIC_REVERSE_SYNONYM_TOKENS.has(token)
-      ) {
-        expanded.add(canonical);
-      }
-    }
-  }
-
-  return [...expanded];
-}
-
 function getBaseSearchTokens(text = "") {
   return normalizeText(text)
     .split(" ")
     .map(normalizeToken)
     .filter((token) => token.length > 1 && !RAG_STOPWORDS.has(token));
-}
-
-function getExplicitTopics(text = "") {
-  return [
-    ...new Set([
-      classifyCampusIntent(text),
-      ...detectTopicHints(text),
-      ...getAliasBoostTopics(text),
-    ].filter(Boolean)),
-  ];
-}
-
-function includesNormalizedPhrase(text = "", phrase = "") {
-  const normalizedText = ` ${normalizeText(text)} `;
-  const normalizedPhrase = normalizeText(phrase);
-  if (!normalizedPhrase) return false;
-  return normalizedText.includes(` ${normalizedPhrase} `);
-}
-
-function extractProgramReferences(text = "") {
-  return PROGRAM_REFERENCE_ALIASES.filter((program) =>
-    program.aliases.some((alias) => includesNormalizedPhrase(text, alias)),
-  ).map((program) => program.label);
-}
-
-function getRecentReferencedPrograms(
-  messageHistory = [],
-  queryContinuity = "standalone",
-) {
-  if (queryContinuity === "standalone") return [];
-
-  const referenceMessages = getRecentReferenceMessages(
-    messageHistory,
-    getReferenceMessageLimit(queryContinuity),
-  );
-
-  const latestAssistantWithPrograms = [...referenceMessages]
-    .reverse()
-    .find((message) => {
-      if (message.role !== "assistant") return false;
-      return extractProgramReferences(message.content).length > 0;
-    });
-
-  if (latestAssistantWithPrograms) {
-    return [
-      ...new Set(extractProgramReferences(latestAssistantWithPrograms.content)),
-    ];
-  }
-
-  return [
-    ...new Set(
-      referenceMessages.flatMap((message) =>
-        extractProgramReferences(message.content),
-      ),
-    ),
-  ];
-}
-
-function isComparisonFollowUp(text = "") {
-  const normalized = normalizeText(text);
-  return [
-    "beda",
-    "bedanya",
-    "perbedaan",
-    "perbedaannya",
-    "banding",
-    "bandingkan",
-    "dibanding",
-    "vs",
-    "versus",
-  ].some((phrase) => normalized.includes(phrase));
-}
-
-function hasReferentialSignal(text = "") {
-  const normalized = normalizeText(text);
-  const tokens = normalized.split(" ").filter(Boolean);
-  return tokens.some(
-    (token) =>
-      REFERENTIAL_TOKENS.has(token) ||
-      (token.length > 4 && token.endsWith("nya")),
-  );
-}
-
-function classifyQueryContinuity(userQuery = "", messageHistory = []) {
-  const previousUserMessages = messageHistory
-    .slice(0, -1)
-    .filter((message) => message.role === "user" && message.content);
-  if (previousUserMessages.length === 0) return "standalone";
-
-  const baseTokens = getBaseSearchTokens(userQuery);
-  const explicitTopics = getExplicitTopics(userQuery);
-  const referential = hasReferentialSignal(userQuery);
-
-  if (referential) return "referential_followup";
-  if (baseTokens.length <= 1 && explicitTopics.length === 0)
-    return "ambiguous_followup";
-
-  return "standalone";
-}
-
-function getRecentReferenceMessages(messageHistory = [], limit = 4) {
-  return messageHistory
-    .slice(0, -1)
-    .filter(
-      (message) =>
-        (message.role === "user" || message.role === "assistant") &&
-        message.content,
-    )
-    .slice(-limit);
-}
-
-function getReferenceMessageText(message = "", maxLength = 500) {
-  return String(message?.content || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, maxLength);
-}
-
-function getReferenceMessageLimit(queryContinuity = "standalone") {
-  return queryContinuity === "referential_followup" ? 2 : 4;
-}
-
-function buildConversationContextHint(
-  messageHistory = [],
-  latestIntent = null,
-  queryContinuity = "standalone",
-) {
-  if (queryContinuity === "standalone") return "";
-
-  const referenceMessages = getRecentReferenceMessages(
-    messageHistory,
-    getReferenceMessageLimit(queryContinuity),
-  );
-  if (referenceMessages.length === 0) return "";
-
-  const topics = [];
-  const details = [];
-  const referencedPrograms = getRecentReferencedPrograms(
-    messageHistory,
-    queryContinuity,
-  );
-
-  for (const message of [...referenceMessages].reverse()) {
-    const content = getReferenceMessageText(message, 400);
-    topics.push(...getExplicitTopics(content));
-    details.push(...getBaseSearchTokens(content).slice(0, 14));
-  }
-
-  const topicText = [...new Set(topics.filter((topic) => topic !== latestIntent))]
-    .slice(0, 3)
-    .join(", ");
-  const detailText = [...new Set(details)].slice(0, 14).join(", ");
-
-  if (!topicText && !detailText) return "";
-
-  return [
-    "Pertanyaan terbaru tampak merujuk ke percakapan sebelumnya.",
-    referencedPrograms.length > 0
-      ? `Rujukan paling mungkin: ${referencedPrograms.join(", ")}.`
-      : "",
-    topicText ? `Topik sebelumnya: ${topicText}.` : "",
-    detailText ? `Kata kunci sebelumnya: ${detailText}.` : "",
-    referencedPrograms.length > 1 && isComparisonFollowUp(messageHistory.at(-1)?.content)
-      ? "Jika user menanyakan perbedaan/bedanya, bandingkan rujukan tersebut saja."
-      : "",
-    "Gunakan ini hanya untuk memahami rujukan user di sesi aktif; fakta jawaban tetap wajib dari KONTEKS KAMPUS. Jangan anggap ini sebagai preferensi permanen.",
-  ]
-    .filter(Boolean)
-    .join(" ");
 }
 
 function detectTopicHints(text = "") {
@@ -1431,569 +1155,6 @@ function extractSessionSignals(messages = []) {
   };
 }
 
-function getAliasBoostTopics(text = "") {
-  const normalized = normalizeText(text);
-  const topics = new Set();
-  for (const [topic, aliases] of Object.entries(getIntentSynonymBank())) {
-    if (
-      (aliases || []).some((alias) => normalized.includes(normalizeText(alias)))
-    )
-      topics.add(topic);
-  }
-  return [...topics];
-}
-
-function deriveConversationTopicState(messageHistory = []) {
-  const recentUserMessages = [...messageHistory]
-    .filter((message) => message.role === "user" && message.content)
-    .slice(-4);
-
-  const scores = new Map();
-  const orderedTopics = [];
-  const learnedPatterns = getLearnedArtifacts().learned_topic_patterns || {};
-
-  for (const message of recentUserMessages) {
-    const topics = new Set(
-      [
-        classifyCampusIntent(message.content),
-        ...detectTopicHints(message.content),
-        ...getAliasBoostTopics(message.content),
-      ].filter(Boolean),
-    );
-
-    for (const topic of topics) {
-      scores.set(topic, (scores.get(topic) || 0) + 1);
-    }
-  }
-
-  const latestMessage =
-    recentUserMessages[recentUserMessages.length - 1]?.content || "";
-  const latestNormalized = normalizeText(latestMessage);
-  for (const [topic, patternData] of Object.entries(learnedPatterns)) {
-    if (
-      (patternData?.common_followups || []).some((pattern) =>
-        latestNormalized.includes(normalizeText(pattern)),
-      )
-    ) {
-      scores.set(topic, (scores.get(topic) || 0) + 2);
-    }
-  }
-
-  orderedTopics.push(
-    ...[...scores.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .map(([topic]) => topic),
-  );
-
-  return {
-    activeTopic: orderedTopics[0] || null,
-    orderedTopics,
-    recentUserMessages: recentUserMessages.map((message) => message.content),
-  };
-}
-
-function getTokenVariants(token) {
-  const variants = new Set([token]);
-  if (RAG_SYNONYMS[token] && !BROAD_SYNONYM_KEYS.has(token)) {
-    RAG_SYNONYMS[token].forEach((alias) => variants.add(alias));
-  }
-  for (const [canonical, aliases] of Object.entries(RAG_SYNONYMS)) {
-    if (
-      aliases.includes(token) &&
-      !GENERIC_REVERSE_SYNONYM_TOKENS.has(token)
-    ) {
-      variants.add(canonical);
-    }
-  }
-  return [...variants];
-}
-
-function itemContainsTokenVariant(item, token) {
-  const variants = getTokenVariants(token);
-  const title = normalizeText(item.title);
-  const category = normalizeText(item.category);
-  const keywords = (item.keywords || []).map(normalizeText);
-  const content = normalizeText(item.content);
-
-  return variants.some(
-    (variant) =>
-      keywords.some((keyword) => keyword.includes(variant)) ||
-      title.includes(variant) ||
-      category.includes(variant) ||
-      content.includes(variant),
-  );
-}
-
-function getMatchedTokenCount(item, baseTokens) {
-  return baseTokens.filter((token) =>
-    itemContainsTokenVariant(item, token),
-  ).length;
-}
-
-function hasStrongFieldMatch(item, baseTokens) {
-  const title = normalizeText(item.title);
-  const category = normalizeText(item.category);
-  const keywords = (item.keywords || []).map(normalizeText);
-
-  return baseTokens.some((token) => {
-    const variants = getTokenVariants(token);
-    return variants.some(
-      (variant) =>
-        category === variant ||
-        title.split(" ").includes(variant) ||
-        keywords.some(
-          (keyword) => keyword === variant || keyword.split(" ").includes(variant),
-        ),
-    );
-  });
-}
-
-function hasEnoughTokenCoverage(item, baseTokens, score = 0) {
-  if (baseTokens.length === 0) return item.id === "profil_ucic";
-  const matchedCount = getMatchedTokenCount(item, baseTokens);
-  if (matchedCount === 0) return false;
-  if (baseTokens.length <= 2) return true;
-  if (hasStrongFieldMatch(item, baseTokens)) return true;
-  if (score >= 14 && matchedCount >= 1) return true;
-
-  const requiredMatches =
-    baseTokens.length === 1 ? 1 : Math.min(2, baseTokens.length);
-  return matchedCount >= requiredMatches;
-}
-
-function scoreDatasetItem(item, tokens, topicHints = [], userQuery = "") {
-  if (tokens.length === 0) {
-    const q = normalizeText(item.title);
-    return item.id === "profil_ucic" || q.includes("profil universitas")
-      ? 1
-      : 0;
-  }
-
-  const title = normalizeText(item.title);
-  const category = normalizeText(item.category);
-  const keywords = (item.keywords || []).map(normalizeText);
-  const content = normalizeText(item.content);
-  const searchableText = [title, category, ...keywords, content].join(" ");
-  const normalizedQuery = normalizeText(userQuery);
-  let score = 0;
-
-  if (normalizedQuery) {
-    if (keywords.some((keyword) => keyword.includes(normalizedQuery)))
-      score += 24;
-    if (title.includes(normalizedQuery)) score += 18;
-    if (content.includes(normalizedQuery)) score += 6;
-
-    for (const keyword of keywords) {
-      if (keyword.length < 4) continue;
-      if (normalizedQuery.includes(keyword)) score += 18;
-    }
-  }
-
-  for (const token of tokens) {
-    if (keywords.some((keyword) => keyword === token)) score += 8;
-    if (keywords.some((keyword) => keyword.includes(token))) score += 4;
-    if (title.split(" ").includes(token)) score += 7;
-    else if (title.includes(token)) score += 3;
-    if (category === token) score += 3;
-    if (content.split(" ").includes(token)) score += 2.5;
-    else if (content.includes(token)) score += 1;
-  }
-
-  const matchedTokens = tokens.filter(
-    (token) =>
-      keywords.some((keyword) => keyword.includes(token)) ||
-      title.includes(token) ||
-      content.includes(token) ||
-      category.includes(token),
-  );
-
-  if (tokens.length > 1 && matchedTokens.length > 1)
-    score += matchedTokens.length * 3;
-
-  for (const topic of topicHints) {
-    if (
-      keywords.some((keyword) => keyword.includes(topic)) ||
-      title.includes(topic) ||
-      category.includes(topic) ||
-      content.includes(topic)
-    ) {
-      score += 4;
-    }
-  }
-
-  const adjacentPairs = tokens
-    .map((token, index) => [token, tokens[index + 1]].filter(Boolean).join(" "))
-    .filter((pair) => pair.split(" ").length === 2);
-  for (const pair of adjacentPairs) {
-    if (keywords.some((keyword) => keyword.includes(pair))) score += 12;
-    else if (title.includes(pair)) score += 10;
-    else if (content.includes(pair)) score += 5;
-  }
-
-  return score;
-}
-
-function retrieveCampusContext(userQuery, fuseResults = [], topicState = null) {
-  const tokens = getSearchTokens(userQuery);
-  const baseTokens = getBaseSearchTokens(userQuery);
-  const explicitTopics = [
-    ...new Set([
-      classifyCampusIntent(userQuery),
-      ...detectTopicHints(userQuery),
-      ...getAliasBoostTopics(userQuery),
-    ].filter(Boolean)),
-  ];
-  const topicHints = [
-    ...new Set(
-      explicitTopics.length > 0
-        ? explicitTopics
-        : (topicState?.orderedTopics || []).slice(0, 2),
-    ),
-  ];
-  const intent = explicitTopics[0] || topicState?.activeTopic || null;
-  const fuseRank = new Map(
-    fuseResults.map((result, index) => [
-      result.item.id,
-      {
-        score: result.score ?? 1,
-        rank: index,
-      },
-    ]),
-  );
-
-  const ranked = ragDataset
-    .map((item) => {
-      const lexicalScore = scoreDatasetItem(item, tokens, topicHints, userQuery);
-      const fuseMeta = fuseRank.get(item.id);
-      const fuseBoost = fuseMeta ? Math.max(0, 4 - fuseMeta.rank * 0.35) : 0;
-      const fuseQualityBoost = fuseMeta ? Math.max(0, 1 - fuseMeta.score) : 0;
-      const score = lexicalScore + fuseBoost + fuseQualityBoost;
-      return {
-        item,
-        score,
-        matchedTokenCount: getMatchedTokenCount(item, baseTokens),
-        fuseScore: fuseMeta?.score,
-      };
-    })
-    .filter(
-      (result) =>
-        result.score >= 4 &&
-        hasEnoughTokenCoverage(result.item, baseTokens, result.score),
-    )
-    .sort((a, b) => b.score - a.score);
-
-  const fuseFallback = fuseResults
-    .slice(0, 5)
-    .filter((result) => (result.score ?? 1) <= 0.42)
-    .map((result, index) => ({
-      item: result.item,
-      score: Math.max(8, 14 - index),
-      fuseScore: result.score,
-    }))
-    .filter(
-      (result) =>
-        !ranked.some((rankedResult) => rankedResult.item.id === result.item.id),
-    );
-
-  const combined = [...ranked, ...fuseFallback].sort(
-    (a, b) => b.score - a.score,
-  );
-
-  return {
-    matches: combined.slice(0, 5),
-    tokens,
-    topicHints,
-    intent,
-  };
-}
-
-function getTopicFallbackMatches(intent = null, topicHints = []) {
-  const topics = new Set([intent, ...topicHints].filter(Boolean));
-  if (topics.size === 0) return [];
-
-  const fallback = ragDataset
-    .map((item) => ({
-      item,
-      score: scoreDatasetItem(item, [...topics], [...topics]),
-    }))
-    .filter((result) => result.score >= 6)
-    .sort((a, b) => b.score - a.score);
-
-  return fallback.slice(0, 3);
-}
-
-function buildCanonicalRewrite(userQuery = "", topicState = null) {
-  const decomposed = decomposeUserQuery(userQuery, topicState);
-  const rewrites = decomposed
-    .map((part) => {
-      const detectedTopic =
-        part.intent ||
-        detectTopicHints(part.text)[0] ||
-        getAliasBoostTopics(part.text)[0] ||
-        topicState?.activeTopic ||
-        null;
-
-      if (!detectedTopic) return "";
-
-      const canonical = CANONICAL_REWRITE_MAP[detectedTopic] || "";
-      if (!canonical) return "";
-
-      const slotTokens = Object.keys(part.slots || {}).join(" ");
-      const baseTokens = getBaseSearchTokens(part.text);
-      const specifics = baseTokens
-        .filter((token) => !Object.keys(CANONICAL_REWRITE_MAP).includes(token))
-        .slice(0, 4)
-        .join(" ");
-
-      return `${canonical} ${slotTokens} ${specifics}`.trim();
-    })
-    .filter(Boolean);
-
-  return rewrites.join(" ");
-}
-
-function buildRetrievalQuery(
-  messageHistory = [],
-  userQuery = "",
-  topicState = null,
-  queryContinuity = "standalone",
-) {
-  const explicitLatestTopics = getExplicitTopics(userQuery);
-
-  if (queryContinuity === "standalone") return userQuery;
-  const referenceMessages = getRecentReferenceMessages(
-    messageHistory,
-    getReferenceMessageLimit(queryContinuity),
-  );
-  if (referenceMessages.length === 0) return userQuery;
-
-  const previousContext = referenceMessages
-    .map((message) => getReferenceMessageText(message, 500))
-    .filter(Boolean)
-    .join(" ");
-
-  const historyTopics = detectTopicHints(previousContext).filter(
-    (topic) => !explicitLatestTopics.includes(topic),
-  );
-  const topicSuffix =
-    historyTopics.length > 0 ? ` ${historyTopics.join(" ")}` : "";
-  const canonicalRewrite = buildCanonicalRewrite(userQuery, topicState);
-  const referencedPrograms = getRecentReferencedPrograms(
-    messageHistory,
-    queryContinuity,
-  );
-  const referenceFocus =
-    referencedPrograms.length > 0
-      ? `${isComparisonFollowUp(userQuery) ? "perbedaan " : ""}${referencedPrograms.join(" ")}`
-      : "";
-
-  return `${referenceFocus} ${previousContext} ${userQuery} ${canonicalRewrite}${topicSuffix}`.trim();
-}
-
-function computeAnswerability(
-  finalMatches = [],
-  userQuery = "",
-  topicState = null,
-) {
-  if (finalMatches.length === 0) return { level: "none", reason: "no_match" };
-
-  const top = finalMatches[0];
-  const score = top.score || 0;
-  const detectedTopic =
-    classifyCampusIntent(userQuery) || topicState?.activeTopic;
-
-  if (score >= 18)
-    return { level: "high", reason: "strong_match", detectedTopic };
-  if (score >= 10)
-    return { level: "partial", reason: "medium_match", detectedTopic };
-  return { level: "weak", reason: "low_confidence", detectedTopic };
-}
-
-function buildClarificationHint(answerability, decomposedQueries, topicState) {
-  if (answerability.level === "high") return "";
-
-  const intents = [
-    ...new Set(decomposedQueries.map((part) => part.intent).filter(Boolean)),
-  ];
-  if (intents.length > 1) {
-    return `User tampaknya menanyakan beberapa hal sekaligus: ${intents.join(", ")}. Jika konteks tidak cukup untuk semua bagian, jawab bagian yang jelas terlebih dahulu lalu minta user memilih bagian yang ingin diperjelas.`;
-  }
-
-  if (answerability.level === "partial") {
-    return `Jika ada informasi yang hanya terjawab sebagian, berikan jawaban parsial dulu lalu akhiri dengan satu klarifikasi singkat yang spesifik ke topik ${answerability.detectedTopic || topicState?.activeTopic || "kampus"}.`;
-  }
-
-  return `Maksud user masih samar. Ajukan satu pertanyaan klarifikasi yang sangat singkat dan ramah, fokus pada topik ${answerability.detectedTopic || topicState?.activeTopic || "yang paling mungkin dimaksud"}.`;
-}
-
-function buildConfidenceRouting(answerability, decomposedQueries, topicState) {
-  const intents = [
-    ...new Set(decomposedQueries.map((part) => part.intent).filter(Boolean)),
-  ];
-  const primaryTopic =
-    answerability.detectedTopic ||
-    topicState?.activeTopic ||
-    intents[0] ||
-    "kampus";
-
-  if (answerability.level === "high") {
-    return {
-      route: "answer_direct",
-      label: "tinggi",
-      instruction: `Confidence tinggi. Jawab langsung dengan fokus utama pada topik ${primaryTopic}.`,
-    };
-  }
-
-  if (answerability.level === "partial") {
-    return {
-      route: "answer_then_clarify",
-      label: "sedang",
-      instruction: `Confidence sedang. Jawab dulu bagian yang paling jelas dari topik ${primaryTopic}, lalu akhiri dengan satu klarifikasi singkat jika masih ada detail yang belum pasti.`,
-    };
-  }
-
-  return {
-    route: "clarify_first",
-    label: "rendah",
-    instruction: `Confidence rendah. Jangan menebak. Ajukan satu pertanyaan klarifikasi yang pendek, ramah, dan spesifik ke topik ${primaryTopic}.`,
-  };
-}
-
-function buildIntentResponseGuide(intent = null) {
-  switch (intent) {
-    case "pendaftaran":
-      return "Untuk topik pendaftaran, jawab cara daftar dan langkah inti saja. Jangan jelaskan detail lain kecuali diminta.";
-    case "biaya":
-      return "Untuk topik biaya, jawab nominal yang ditanya secara langsung. Tambahkan komponen lain hanya jika user meminta rincian.";
-    case "jurusan":
-      return "Untuk topik jurusan, jawab sesuai yang ditanya: daftar prodi jika user minta daftar, rekomendasi jika user minta jurusan yang cocok, atau perbedaan prodi jika user minta bedanya. Jangan melebar ke semua prodi jika user sedang merujuk prodi tertentu dari percakapan sebelumnya.";
-    case "syarat":
-      return "Untuk topik syarat, beri daftar berkas inti saja dengan nomor pendek.";
-    case "kelas":
-      return "Untuk topik kelas, sebutkan pilihan kelas dan jamnya secara singkat.";
-    case "lokasi":
-      return "Untuk topik lokasi, jawab alamat langsung. Jika ada dua kampus, sebutkan keduanya secara singkat.";
-    case "akademik":
-      return "Untuk topik akademik, jawab sesuai prosedur BAAK atau pedoman akademik di konteks. Sebutkan syarat, alur, atau batasan penting yang memang tertulis.";
-    case "kurikulum":
-      return "Untuk topik kurikulum, sebutkan program studi yang dimaksud dan ringkas mata kuliah atau semester yang tersedia di konteks.";
-    case "fasilitas":
-      return "Untuk topik fasilitas, sebutkan fasilitas yang relevan saja. Jika user menanyakan tempat tertentu seperti perpustakaan, lab, parkir, atau WiFi, fokus ke tempat itu.";
-    case "dosen":
-      return "Untuk topik dosen, sebutkan nama dosen dan bidang atau prodi terkait hanya jika ada di konteks.";
-    case "kegiatan":
-      return "Untuk topik kegiatan mahasiswa, jawab jenis kegiatan, UKM, organisasi, atau agenda mahasiswa yang tersedia di konteks.";
-    case "profil":
-      return "Untuk topik profil kampus, jawab fakta identitas, sejarah, pimpinan, kerja sama, atau keunggulan UCIC sesuai konteks.";
-    case "rektor":
-      return "Untuk topik rektor atau pimpinan, jawab nama rektor secara langsung sesuai konteks. Jangan meminta user menghubungi kampus jika nama rektor ada di konteks.";
-    default:
-      return "Jawab ringkas, ramah, dan langsung ke inti informasi yang ditanya.";
-  }
-}
-
-const UNAVAILABLE_RESPONSE_PATTERNS = [
-  /belum punya informasi/i,
-  /belum memiliki informasi/i,
-  /tidak memiliki informasi/i,
-  /tidak punya informasi/i,
-  /informasi.*belum tersedia/i,
-  /menanyakannya langsung/i,
-  /hubungi.*kampus/i,
-  /check with the campus/i,
-  /does not have.*information/i,
-  /do not have.*information/i,
-  /not have.*information/i,
-  /information.*not available/i,
-];
-
-function looksLikeUnavailableAnswer(text = "") {
-  return UNAVAILABLE_RESPONSE_PATTERNS.some((pattern) =>
-    pattern.test(String(text || "")),
-  );
-}
-
-function truncateForVoice(text = "", maxLength = 650) {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxLength) return normalized;
-
-  const clipped = normalized.slice(0, maxLength);
-  const sentenceEnd = Math.max(
-    clipped.lastIndexOf("."),
-    clipped.lastIndexOf("?"),
-    clipped.lastIndexOf("!"),
-  );
-  if (sentenceEnd > 180) return clipped.slice(0, sentenceEnd + 1).trim();
-  return `${clipped.replace(/\s+\S*$/, "").trim()}.`;
-}
-
-function buildDatasetAnswerFromMatches(
-  matches = [],
-  effectiveLang = "id",
-  responsePlan = null,
-) {
-  const contents = matches
-    .map((match) => match?.item?.content?.trim())
-    .filter(Boolean);
-  if (contents.length === 0) return "";
-
-  // ANTI-DOUBLE TEKS: Hapus duplikasi konten yang muncul dari multiple matches
-  // Normalisasi teks untuk perbandingan, lalu ambil hanya konten unik
-  const seenNormalized = new Set();
-  const uniqueContents = [];
-  for (const content of contents) {
-    // Normalisasi: hapus spasi berlebih, lowercase, strip tanda baca untuk perbandingan
-    const normalized = content
-      .replace(/\s+/g, " ")
-      .toLowerCase()
-      .replace(/[.,!?;:()"'\[\]]/g, "")
-      .trim();
-    // Cek apakah konten ini sudah ada (bisa jadi subset dari konten sebelumnya)
-    let isDuplicate = false;
-    for (const seen of seenNormalized) {
-      // Jika satu adalah substring dari yang lain (overlap > 70%)
-      if (
-        normalized.length > 20 &&
-        seen.length > 20 &&
-        (seen.includes(normalized) ||
-          normalized.includes(seen) ||
-          _textSimilarity(normalized, seen) > 0.7)
-      ) {
-        isDuplicate = true;
-        break;
-      }
-    }
-    if (!isDuplicate) {
-      seenNormalized.add(normalized);
-      uniqueContents.push(content);
-    }
-  }
-
-  const topContent = uniqueContents[0];
-  if (!responsePlan || responsePlan.displayMode === "brief") {
-    const content = truncateForVoice(topContent);
-    if (effectiveLang === "en") return content;
-    return content;
-  }
-
-  const maxSections = responsePlan.displayMode === "list_detail" ? 3 : 2;
-  const merged = uniqueContents.slice(0, maxSections).join("\n\n");
-  if (effectiveLang === "en") return merged;
-  return merged;
-}
-
-// Helper: hitung rasio kemiripan teks (Jaccard similarity berbasis kata)
-function _textSimilarity(a, b) {
-  const wordsA = new Set(a.split(" "));
-  const wordsB = new Set(b.split(" "));
-  let intersection = 0;
-  for (const w of wordsA) {
-    if (wordsB.has(w)) intersection++;
-  }
-  const union = wordsA.size + wordsB.size - intersection;
-  return union > 0 ? intersection / union : 0;
-}
-
 function applySessionLearningToArtifacts(artifacts, session) {
   const next =
     typeof structuredClone !== "undefined"
@@ -2133,275 +1294,6 @@ export function archiveConversationSession({
   };
 }
 
-function logRetrievalFailure(payload) {
-  console.warn("[SELA RAG] Retrieval weakness:", payload);
-  if (typeof window === "undefined" || !window.localStorage) return;
-  try {
-    const existing = JSON.parse(
-      window.localStorage.getItem(RAG_FAILURE_LOG_KEY) || "[]",
-    );
-    const next = [
-      ...existing,
-      { ...payload, ts: new Date().toISOString() },
-    ].slice(-50);
-    window.localStorage.setItem(RAG_FAILURE_LOG_KEY, JSON.stringify(next));
-    learnedTypoCache = null;
-  } catch (error) {
-    console.warn("[SELA RAG] Gagal menyimpan log retrieval:", error);
-  }
-}
-
-function setLatestRetrievalEvaluation(report) {
-  setStoredJson(RAG_EVALUATION_KEY, report);
-}
-
-export function getLatestRetrievalEvaluation() {
-  return getStoredJson(RAG_EVALUATION_KEY, null);
-}
-
-async function getFuse() {
-  if (fuse) return fuse;
-  try {
-    fuse = new Fuse(ragDataset, {
-      keys: [
-        { name: "title", weight: 0.4 },
-        { name: "keywords", weight: 0.35 },
-        { name: "category", weight: 0.1 },
-        { name: "content", weight: 0.15 },
-      ],
-      threshold: 0.65,
-      ignoreLocation: true,
-      includeScore: true,
-    });
-  } catch (e) {
-    console.error("Gagal inisialisasi RAG dataset:", e);
-  }
-  return fuse;
-}
-
-async function resolveRetrievalState(messageHistory = [], userQuery = "") {
-  const cappedHistory = messageHistory.slice(-10);
-  const topicState = deriveConversationTopicState(cappedHistory);
-  const queryContinuity = classifyQueryContinuity(userQuery, cappedHistory);
-  const decomposedQueries = decomposeUserQuery(userQuery, topicState);
-  const retrievalQuery = buildRetrievalQuery(
-    cappedHistory,
-    userQuery,
-    topicState,
-    queryContinuity,
-  );
-  const canonicalRewrite = buildCanonicalRewrite(userQuery, topicState);
-  const f = await getFuse();
-  const initialIntent = classifyCampusIntent(userQuery) || topicState.activeTopic;
-
-  let matches = [];
-  let finalMatches = [];
-  let topicHints = [];
-  let intent = initialIntent;
-  let ragScore = 1;
-  let contextStr = "";
-  let mediaResults = [];
-  let responsePlan = buildResponsePlan(userQuery, { intent: initialIntent });
-  let conversationContextHint = "";
-  let answerability = {
-    level: "none",
-    reason: "no_match",
-    detectedTopic: topicState.activeTopic || null,
-  };
-
-  if (f && userQuery) {
-    const fuseResults = f.search(retrievalQuery);
-    const retrieval = retrieveCampusContext(
-      retrievalQuery,
-      fuseResults,
-      topicState,
-    );
-    matches = retrieval.matches;
-    topicHints = retrieval.topicHints;
-    intent = retrieval.intent || initialIntent;
-    responsePlan = buildResponsePlan(userQuery, { intent });
-    const rawMatches =
-      matches.length > 0 ? matches : getTopicFallbackMatches(intent, topicHints);
-    finalMatches = prioritizeResponseMatches(rawMatches, {
-      responsePlan,
-      intent,
-      catalog: ragDataset,
-    });
-    answerability = computeAnswerability(finalMatches, userQuery, topicState);
-    conversationContextHint = buildConversationContextHint(
-      cappedHistory,
-      intent,
-      queryContinuity,
-    );
-
-    if (finalMatches.length > 0) {
-      ragScore =
-        finalMatches[0].fuseScore ??
-        Math.max(0, 1 - finalMatches[0].score / 20);
-      contextStr = finalMatches
-        .map(
-          (r) =>
-            `Topik: ${r.item.title}\nKategori: ${r.item.category}\nInfo: ${r.item.content}`,
-        )
-        .join("\n\n");
-      mediaResults = finalMatches
-        .flatMap((r) => r.item.media || [])
-        .filter((m) => m?.url);
-    }
-  }
-
-  return {
-    cappedHistory,
-    queryContinuity,
-    conversationContextHint,
-    topicState,
-    decomposedQueries,
-    retrievalQuery,
-    canonicalRewrite,
-    matches,
-    finalMatches,
-    topicHints,
-    intent,
-    responsePlan,
-    ragScore,
-    contextStr,
-    mediaResults,
-    answerability,
-    confidenceRouting: buildConfidenceRouting(
-      answerability,
-      decomposedQueries,
-      topicState,
-    ),
-    clarificationHint: buildClarificationHint(
-      answerability,
-      decomposedQueries,
-      topicState,
-    ),
-  };
-}
-
-export const __debugResolveRetrievalState = resolveRetrievalState;
-
-export async function evaluateRetrievalGoldens() {
-  const cases = [];
-  let passed = 0;
-
-  for (const golden of ragGoldens) {
-    const state = await resolveRetrievalState(
-      [{ role: "user", content: golden.query }],
-      golden.query,
-    );
-    const topIds = state.finalMatches.map((match) => match.item.id);
-    const retrievedIntents = [
-      ...new Set(
-        [
-          state.intent,
-          state.answerability.detectedTopic,
-          ...state.topicHints,
-          ...state.decomposedQueries.map((part) => part.intent),
-        ].filter(Boolean),
-      ),
-    ];
-    const idHit = (golden.expected_ids || []).some((id) => topIds.includes(id));
-    const intentHit = (golden.expected_intents || []).some((intentName) =>
-      retrievedIntents.includes(intentName),
-    );
-    const ok = idHit || intentHit;
-
-    cases.push({
-      id: golden.id,
-      query: golden.query,
-      ok,
-      answerability: state.answerability.level,
-      confidence_route: state.confidenceRouting.route,
-      expected_ids: golden.expected_ids || [],
-      expected_intents: golden.expected_intents || [],
-      top_ids: topIds.slice(0, 5),
-      retrieved_intents: retrievedIntents,
-    });
-
-    if (ok) passed += 1;
-  }
-
-  const report = {
-    evaluated_at: new Date().toISOString(),
-    total: ragGoldens.length,
-    passed,
-    failed: ragGoldens.length - passed,
-    pass_rate:
-      ragGoldens.length > 0
-        ? Number(((passed / ragGoldens.length) * 100).toFixed(1))
-        : 0,
-    cases,
-  };
-
-  setLatestRetrievalEvaluation(report);
-  return report;
-}
-
-export function getShadowFaqReviewQueue(
-  minSourceCount = SHADOW_REVIEW_MIN_SOURCE_COUNT,
-) {
-  const artifacts = getLearnedArtifacts();
-  const approvedTopics = artifacts.shadow_faq_reviews?.approved_topics || {};
-  const rejectedTopics = artifacts.shadow_faq_reviews?.rejected_topics || {};
-
-  return (artifacts.shadow_faq_candidates || [])
-    .filter((candidate) => (candidate.source_count || 0) >= minSourceCount)
-    .filter(
-      (candidate) =>
-        !approvedTopics[candidate.suggested_topic] &&
-        !rejectedTopics[candidate.suggested_topic],
-    )
-    .sort((a, b) => (b.source_count || 0) - (a.source_count || 0));
-}
-
-export function reviewShadowFaqCandidate(topic, action = "approve") {
-  if (!topic) return null;
-
-  const artifacts = getLearnedArtifacts();
-  const candidate = (artifacts.shadow_faq_candidates || []).find(
-    (item) => item.suggested_topic === topic,
-  );
-  if (!candidate) return null;
-
-  const next =
-    typeof structuredClone !== "undefined"
-      ? structuredClone(artifacts)
-      : JSON.parse(JSON.stringify(artifacts));
-
-  next.shadow_faq_reviews = next.shadow_faq_reviews || {
-    approved_topics: {},
-    rejected_topics: {},
-    last_reviewed_at: null,
-  };
-
-  if (action === "approve") {
-    next.shadow_faq_reviews.approved_topics[topic] = {
-      ...candidate,
-      reviewed_at: new Date().toISOString(),
-    };
-    delete next.shadow_faq_reviews.rejected_topics[topic];
-    next.learned_awam_aliases[topic] = mergeUniqueStrings(
-      next.learned_awam_aliases[topic],
-      candidate.query_forms || [],
-      60,
-    );
-  } else {
-    next.shadow_faq_reviews.rejected_topics[topic] = {
-      topic,
-      reviewed_at: new Date().toISOString(),
-    };
-    delete next.shadow_faq_reviews.approved_topics[topic];
-  }
-
-  next.shadow_faq_reviews.last_reviewed_at = new Date().toISOString();
-  setLearnedArtifacts(next);
-  learnedTypoCache = null;
-
-  return next.shadow_faq_reviews;
-}
-
 // ── Language Auto-Detection ──────────────────────────────────────────────────
 // Deteksi bahasa dari teks user — digunakan untuk override lang prop
 // kalau user jelas bicara dalam bahasa yang berbeda
@@ -2477,182 +1369,6 @@ function detectLang(text) {
   return null; // tidak yakin — pakai lang dari prop
 }
 
-// ── Enhanced Audio Quality Detection ──────────────────────────────────────
-/**
- * Analisis audio untuk mendeteksi kualitas suara
- * Hitung metrik untuk membedakan ucapan manusia dari background noise
- * @param {Uint8Array} audioData - Time-domain audio samples (0-255)
- * @returns {object} Audio quality metrics
- */
-function analyzeAudioQuality(audioData) {
-  if (!audioData || audioData.length < 512) {
-    return {
-      speechScore: 0.3,
-      isLikelyNoise: true,
-      confidence: 0.2,
-    };
-  }
-
-  // 1. RMS Energy untuk speech presence
-  const rms = Math.sqrt(
-    audioData.reduce((s, v) => s + (v - 128) * (v - 128), 0) / audioData.length,
-  );
-  const normalizedRms = Math.min(rms / 50, 1); // normalize ke 0-1
-
-  // 2. Zero-Crossing Rate — human speech punya ZCR tertentu
-  let zeroCrossingCount = 0;
-  for (let i = 1; i < audioData.length; i++) {
-    const crossing = (audioData[i] - 128) * (audioData[i - 1] - 128) < 0;
-    if (crossing) zeroCrossingCount++;
-  }
-  const zcr = zeroCrossingCount / audioData.length;
-  // Speech ZCR biasanya 0.04-0.15, noise bisa lebih tinggi atau lebih rendah
-  const zcrScore = Math.max(0, 1 - Math.abs(zcr - 0.08) / 0.15);
-
-  // 3. Spectral properties — gunakan Fourier untuk frequency analysis
-  const frequencies = computeFrequencyDomain(audioData);
-  const { spectralCentroid, voiceFrequencyRatio } =
-    analyzeSpectralContent(frequencies);
-
-  // Speech biasanya terkonsentrasi di 200-3000Hz
-  // Background noise sering ada di frequencies ekstrem
-  const spectralScore = voiceFrequencyRatio;
-
-  // 4. Entropy — speech punya higher entropy dibanding pure tone/noise
-  const entropy = calculateEntropy(audioData);
-  const entropyScore = Math.min(entropy, 1.0) / 8; // normalize
-
-  // 5. Dynamic Range — speech punya variety amplitude, pure tone repetitif
-  const { min, max } = getAmplitudeRange(audioData);
-  const dynamicRange = (max - min) / 255;
-  const rangeScore = Math.min(dynamicRange * 1.5, 1);
-
-  // Combine scores dengan weights
-  const speechScore =
-    normalizedRms * 0.2 +
-    zcrScore * 0.2 +
-    spectralScore * 0.35 +
-    entropyScore * 0.15 +
-    rangeScore * 0.1;
-
-  // Deteksi likely noise
-  const isLikelyNoise =
-    speechScore < 0.35 ||
-    (normalizedRms < 0.15 && voiceFrequencyRatio < 0.4) ||
-    zcr > 0.25 ||
-    zcr < 0.02; // ekstrem ZCR
-
-  return {
-    speechScore: speechScore,
-    rmsLevel: normalizedRms,
-    zcr: zcr,
-    spectralCentroid: spectralCentroid,
-    voiceFrequencyRatio: voiceFrequencyRatio,
-    entropy: entropy,
-    dynamicRange: dynamicRange,
-    isLikelyNoise: isLikelyNoise,
-    confidence: Math.max(Math.min(speechScore, 1), 0),
-  };
-}
-
-/**
- * Simple FFT untuk mendapat frequency domain
- * @param {Uint8Array} timeDomain
- * @returns {array} Magnitude spectrum
- */
-function computeFrequencyDomain(timeDomain) {
-  const N = timeDomain.length;
-  const real = new Array(N);
-  const imag = new Array(N);
-
-  for (let i = 0; i < N; i++) {
-    real[i] = (timeDomain[i] - 128) / 128;
-    imag[i] = 0;
-  }
-
-  // Simple Cooley-Tukey FFT
-  const X = fft(real, imag);
-  return X;
-}
-/**
- * Cooley-Tukey FFT implementation
- */
-function fft(real, imag) {
-  const N = real.length;
-  if (N <= 1) return { real, imag };
-
-  const mag = new Array(N);
-  for (let i = 0; i < N; i++) {
-    mag[i] = Math.sqrt(real[i] * real[i] + imag[i] * imag[i]);
-  }
-  return mag;
-}
-/**
- * Analisis konten spectral untuk deteksi voice frequencies
- */
-function analyzeSpectralContent(frequencies) {
-  const N = frequencies.length;
-  if (N === 0) return { spectralCentroid: 0, voiceFrequencyRatio: 0 };
-
-  // Hitung spectral centroid (center of mass dari frequency)
-  let weightedSum = 0;
-  let magnitudeSum = 0;
-  for (let i = 0; i < N; i++) {
-    weightedSum += i * frequencies[i];
-    magnitudeSum += frequencies[i];
-  }
-  const spectralCentroid = magnitudeSum > 0 ? weightedSum / magnitudeSum : 0;
-
-  // Hitung ratio energy di voice frequency range (250-3000Hz @ 16kHz sample rate)
-  // Bin range: 250Hz = bin ~2, 3000Hz = bin ~24 (roughly @ 16kHz)
-  const voiceBinStart = Math.floor((N * 250) / 8000); // assuming 16kHz
-  const voiceBinEnd = Math.floor((N * 3000) / 8000);
-
-  let voiceEnergy = 0;
-  let totalEnergy = 0;
-  for (let i = 0; i < N; i++) {
-    totalEnergy += frequencies[i];
-    if (i >= voiceBinStart && i <= voiceBinEnd) {
-      voiceEnergy += frequencies[i];
-    }
-  }
-
-  const voiceFrequencyRatio = totalEnergy > 0 ? voiceEnergy / totalEnergy : 0;
-  return { spectralCentroid, voiceFrequencyRatio };
-}
-/**
- * Calculate Shannon entropy sebagai measure dari randomness
- */
-function calculateEntropy(audioData) {
-  const bins = 256;
-  const hist = new Array(bins).fill(0);
-  for (let i = 0; i < audioData.length; i++) {
-    hist[audioData[i]]++;
-  }
-
-  const N = audioData.length;
-  let entropy = 0;
-  for (let i = 0; i < bins; i++) {
-    if (hist[i] > 0) {
-      const p = hist[i] / N;
-      entropy -= p * Math.log2(p);
-    }
-  }
-  return entropy;
-}
-/**
- * Get amplitude range
- */
-function getAmplitudeRange(audioData) {
-  let min = 255;
-  let max = 0;
-  for (let i = 0; i < audioData.length; i++) {
-    if (audioData[i] < min) min = audioData[i];
-    if (audioData[i] > max) max = audioData[i];
-  }
-  return { min, max };
-}
-
 // ── Transcribe ───────────────────────────────────────────────────────────────
 
 /**
@@ -2675,137 +1391,12 @@ export async function transcribeAudio(audioBlob, lang = "id") {
   return text;
 }
 
-// ── Web Search Real-Time (Gratis, DuckDuckGo + Wikipedia) ──────────────────────
-
-const WEB_SEARCH_PATTERNS = [
-  /presiden\s+(indonesia|sekarang|saat\s+ini)/i,
-  /walikota\s+(cirebon|sekarang|saat\s+ini)/i,
-  /berita\s+(terbaru|sekarang|hari\s+ini|cirebon)/i,
-  /kabar\s+(terbaru|terkini|hari\s+ini)/i,
-  /cuaca\s+(hari\s+ini|sekarang|cirebon)/i,
-  /siapa\s+presiden/i,
-  /siapa\s+walikota/i,
-  /apa\s+yang\s+sedang\s+terjadi/i,
-  /peristiwa\s+(terbaru|terkini)/i,
-];
-
-async function needsWebSearch(query) {
-  const q = (query || "").toLowerCase().trim();
-  for (const pattern of WEB_SEARCH_PATTERNS) {
-    if (pattern.test(q)) return true;
-  }
-  const keywords = [
-    "presiden sekarang", "walikota cirebon", "berita terbaru",
-    "kabar terkini", "apa yang terjadi", "peristiwa terbaru",
-    "hari ini", "saat ini", "sekarang",
-  ];
-  for (const kw of keywords) {
-    if (q.includes(kw)) return true;
-  }
-  return false;
-}
-
-async function doWebSearch(query) {
-  try {
-    const res = await fetch("/api/web-search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query }),
-    });
-    if (!res.ok) return null;
-    const data = await res.json();
-    if (data.ditemukan && data.konteks) {
-      return { context: data.konteks };
-    }
-    return null;
-  } catch (err) {
-    console.error("[Web Search] Error:", err);
-    return null;
-  }
-}
-
-// ── Pengenalan & Memori User ──────────────────────────────────────────────────
-
-const USER_NAME_PATTERNS = [
-  /(?:nama\s+saya|namaku|nama\s+aku)\s+([A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20}(?:\s+[A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20})?)/,
-  /(?:panggil\s+(?:saya|aku))\s+([A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20}(?:\s+[A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20})?)/,
-  /(?:saya|aku)\s+(?:adalah|itu)\s+([A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20}(?:\s+[A-ZÀ-Ýa-z][a-zA-ZÀ-Ý]{1,20})?)/,
-  /perkenalkan.*?([A-ZÀ-Ý][a-z]{2,15}(?:\s+[A-ZÀ-Ý][a-z]{2,15})?)/,
-  /(?:halo|hai|hello).*(?:saya|aku)\s+([A-ZÀ-Ý][a-z]{2,15}(?:\s+[A-ZÀ-Ý][a-z]{2,15})?)/,
-];
-
-const FORBIDDEN_NAMES = new Set([
-  "sela", "tidak", "ingin", "mau", "saja", "belum", "sudah",
-  "kalau", "jika", "yang", "ini", "itu", "ada", "bukan",
-  "ya", "dong", "sih", "nih", "tapi", "dan", "atau", "karena",
-  "sekarang", "nanti", "kuliah", "kampus", "ucic", "cirebon",
-  "mahasiswa", "daftar", "pendaftaran", "biaya", "jurusan",
-]);
-
-function extractUserName(query) {
-  if (!query) return null;
-  for (const pattern of USER_NAME_PATTERNS) {
-    const match = query.match(pattern);
-    if (match) {
-      const name = match[1].trim();
-      if (name.length >= 2 && !FORBIDDEN_NAMES.has(name.toLowerCase())) {
-        return name;
-      }
-    }
-  }
-  return null;
-}
-
-function saveUserName(name) {
-  try {
-    localStorage.setItem("sela_user_name", name);
-  } catch (_) {}
-}
-
-function getUserName() {
-  try {
-    return localStorage.getItem("sela_user_name") || null;
-  } catch (_) {
-    return null;
-  }
-}
-
-function getUserMemory() {
-  const name = getUserName();
-  if (!name) return "";
-  let memory = `Nama user yang sedang diajak bicara: ${name}. Gunakan namanya secara natural dalam percakapan (tidak setiap kalimat, cukup sesekali).`;
-  try {
-    const minat = JSON.parse(localStorage.getItem("sela_user_minat") || "[]");
-    if (minat.length > 0) {
-      memory += `\nMinat/jurusan yang sedang dipertimbangkan user: ${minat.slice(-3).join(", ")}`;
-    }
-  } catch (_) {}
-  return memory;
-}
-
-function isGreetingOrIdentity(query) {
-  if (!query) return false;
-  const q = query.toLowerCase().trim();
-  const patterns = [
-    /^(halo|hai|hello|hi|hei|helo)/,
-    /^selamat\s+(pagi|siang|sore|malam)/,
-    /^assalam/,
-    /^apa\s*kabar/,
-    /siapa\s+kamu/,
-    /kamu\s+siapa/,
-    /kamu\s+bisa\s+apa/,
-  ];
-  for (const p of patterns) {
-    if (p.test(q)) return true;
-  }
-  return false;
-}
-
 // ── Chat Completion ──────────────────────────────────────────────────────────
 
 /**
- * Get AI response dengan Hybrid RAG. System prompt + konteks dibangun di sini
- * (di frontend), lalu dikirim ke backend sebagai messages array biasa.
+ * Minta jawaban SELA dari backend. Klien tipis: hanya membersihkan transkrip,
+ * mendeteksi bahasa, lalu mengirim { userQuery, riwayat_obrolan, bahasa }.
+ * Seluruh RAG, routing, dan penyusunan prompt dikerjakan server (otak tunggal).
  * @param {Array} messageHistory - [{role, content}]
  * @param {string} lang - 'id' | 'en'
  * @returns {Promise<{ text: string, detectedLang: string }>}
@@ -2817,294 +1408,27 @@ export async function getChatCompletion(messageHistory, lang = "id") {
       : "";
   const preparedQuery = prepareTranscriptForRag(rawUserQuery);
   const userQuery = preparedQuery.cleanedText || rawUserQuery;
-  const retrievalState = await resolveRetrievalState(messageHistory, userQuery);
-  const {
-    topicState,
-    decomposedQueries,
-    queryContinuity,
-    conversationContextHint,
-    retrievalQuery,
-    canonicalRewrite,
-    matches,
-    finalMatches,
-    topicHints,
-    intent,
-    responsePlan,
-    ragScore,
-    contextStr,
-    mediaResults,
-    answerability,
-    confidenceRouting,
-    clarificationHint,
-  } = retrievalState;
 
   // Auto-detect bahasa dari query user — override lang kalau deteksi yakin
   const autoLang = detectLang(userQuery);
   const effectiveLang = autoLang || lang;
-  if (autoLang && autoLang !== lang) {
-    console.log(`[SELA Lang] Auto-detect: "${autoLang}" (prop: "${lang}")`);
-  }
-  console.log("RAG Retrieval State:", {
-    query: userQuery,
-    retrievalQuery,
-    canonicalRewrite,
-    responsePlan,
-    queryContinuity,
-    answerability: answerability.level,
-    route: confidenceRouting.route,
-    transcriptMarker: preparedQuery.marker,
-    intent,
-    topicHints,
-    topicState,
-    conversationContextHint,
-    matches: matches.map((r) => ({
-      id: r.item.id,
-      score: Number(r.score.toFixed(2)),
-      fuseScore: r.fuseScore,
-    })),
-  });
 
-  if (matches.length === 0 && finalMatches.length > 0) {
-    console.log(
-      "RAG Fallback activated with topic-based matches:",
-      finalMatches.map((r) => r.item.id),
-    );
-  }
-
-  if (finalMatches.length === 0) {
-    console.log("RAG no relevant context found for query:", userQuery);
-  }
-
-  if (answerability.level === "none" || answerability.level === "weak") {
-    logRetrievalFailure({
-      userQuery,
-      rawUserQuery,
-      retrievalQuery,
-      canonicalRewrite,
-      topicState,
-      decomposedQueries,
-      answerability,
-      confidenceRouting,
-      transcriptMarker: preparedQuery.marker,
-      topMatches: finalMatches.map((match) => ({
-        id: match.item.id,
-        title: match.item.title,
-        score: Number((match.score || 0).toFixed(2)),
-      })),
-    });
-  }
-
-  // 2. System prompt bilingual + konteks RAG
-  const today = new Date().toLocaleDateString("id-ID", {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-  const todayEN = new Date().toLocaleDateString("en-US", {
-    weekday: "long",
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-
-  // Web search real-time untuk pertanyaan yang membutuhkan info terkini
-  let webSearchContext = "";
-  if (await needsWebSearch(userQuery)) {
-    try {
-      console.log("[SELA Web Search] Pertanyaan membutuhkan web search real-time");
-      const webResult = await doWebSearch(userQuery);
-      if (webResult && webResult.context) {
-        webSearchContext = webResult.context;
-      }
-    } catch (err) {
-      console.error("[SELA Web Search] Error:", err);
-    }
-  }
-
-  // Pengenalan nama user: cek apakah user menyebutkan namanya
-  let userMemoryContext = "";
-  try {
-    const userName = extractUserName(userQuery);
-    if (userName) {
-      saveUserName(userName);
-      console.log(`[SELA Memory] Nama user disimpan: ${userName}`);
-    }
-    const memory = getUserMemory();
-    if (memory) {
-      userMemoryContext = memory;
-    }
-    // Jika user belum dikenal dan ini sepertinya awal percakapan, tambahkan instruksi
-    if (!getUserName() && isGreetingOrIdentity(userQuery)) {
-      userMemoryContext += "\n\nINSTRUKSI: User belum mengenalkan dirinya. Setelah menjawab, tanyakan namanya dengan ramah dan natural, misal: 'Ngomong-ngomong, boleh kenalan? Nama kamu siapa?' atau 'Sebelumnya, SELA belum tahu namamu. Boleh SELA panggil apa?'";
-    }
-  } catch (err) {
-    console.error("[SELA Memory] Error:", err);
-  }
-
-  const systemPromptID = `Kamu adalah SELA, wujud Customer Service virtual Universitas Catur Insan Cendekia (UCIC) yang berkarakter lembut, karismatik, berwibawa, dan memancarkan aura cerdas.
-Hari ini adalah ${today}.
-Gaya bicaramu tenang, hangat, elegan, dan profesional. Kamu adalah "Wajah Digital" UCIC.
-Kamu boleh menggunakan partikel bahasa lisan seperti 'nih', 'sih', 'dong', atau 'ya', namun penggunaannya HARUS sangat tepat, natural secara tata bahasa, dan tidak berlebihan agar wibawamu tetap terjaga. Penempatannya harus dilihat dari kata sebelumnya apakah cocok atau tidak.
-Jawabanmu HARUS singkat, ramah, dan langsung ke inti seperti customer service. Hindari pembuka panjang, promosi, dan penjelasan tambahan yang tidak ditanya. Untuk daftar, langkah, atau perbandingan, gunakan nomor pendek (1, 2, 3), bukan bullet lingkaran. Untuk fakta tunggal, jawab dalam 1 kalimat.
-
-[VARIASI JAWABAN - SANGAT PENTING]:
-Setiap jawabanmu HARUS bervariasi. Jangan pernah mengulang kalimat pembuka atau penutup yang sama persis seperti jawaban sebelumnya. Variasikan pembukaan, pilihan kata, dan susunan kalimat. Contoh variasi pembuka: "Tentu, ini infonya...", "Jadi begini...", "Untuk yang itu...", "Menarik pertanyaannya! Begini...", "Baik, terkait hal itu...". Jangan pernah menyalin teks yang sama dua kali dalam satu jawaban. Jika informasi sudah disebut, JANGAN ulangi lagi di jawaban yang sama.
-
-[KEMAMPUAN CURHAT & SOLUSI]:
-Kamu juga bisa diajak curhat oleh mahasiswa. Jika user mengungkapkan kebingungan, kecemasan, atau keraguan (misal bingung memilih jurusan/fakultas, takut tidak diterima, ragu dengan masa depan), kamu BISA dan BOLEH:
-- Mendengarkan dengan empati dan merespons sebagai teman yang peduli
-- Memberikan solusi, saran, atau perspektif yang membangun
-- Menanyakan minat atau kelebihan user untuk membantu mempersempit pilihan
-- Menceritakan informasi prodi UCIC yang mungkin relevan dengan minatnya
-Tetap jaga wibawa dan profesionalisme, tapi tunjukkan kehangatan dan kepedulian.
-
-[TUGAS UTAMAMU]:
-Kamu bertugas menjawab pertanyaan seputar kampus UCIC (seperti Pendaftaran, Akademik, Fasilitas, dan Informasi Kampus lainnya). Namun kamu JUGA bisa menjawab sapaan, pertanyaan umum, dan diajak curhat dengan ramah dan hidup seperti manusia.
-
-[ATURAN MENJAWAB]:
-1. Jika pertanyaan BERHUBUNGAN dengan UCIC:
-   - Jawab menggunakan DARI [KONTEKS KAMPUS] di bawah ini sebagai FAKTA MUTLAK.
-   - Jika [KONTEKS KAMPUS] memuat informasi yang ditanyakan, WAJIB jawab berdasarkan konteks tersebut. Jangan mengatakan belum punya informasi kalau jawabannya ada di konteks.
-   - Jika [KONTEKS KAMPUS] tidak kosong, kamu DILARANG menjawab "maaf belum punya informasi", "hubungi kampus", atau penolakan sejenis sebelum memakai informasi yang tersedia.
-   - Riwayat chat BUKAN sumber fakta. Jika riwayat chat berbeda dengan [KONTEKS KAMPUS], abaikan riwayat chat dan ikuti [KONTEKS KAMPUS].
-   - Untuk pertanyaan langsung seperti "siapa", "dimana", "berapa", "kapan", atau "apa", jawab langsung dari kalimat paling relevan di [KONTEKS KAMPUS].
-   - Jangan menyalin semua konteks. Ambil hanya informasi yang menjawab pertanyaan user.
-   - Jika pertanyaan user masih samar seperti "yang itu", "terus gimana", atau "berapa yang tadi", gunakan konteks percakapan terakhir dan jawab bagian yang paling mungkin dimaksud user dengan tetap hati-hati.
-   - Ingatan SELA hanya berlaku dalam sesi chat aktif. Gunakan riwayat hanya untuk memahami rujukan, bukan sebagai sumber fakta dan bukan sebagai memori permanen.
-   - Jika [KONTEKS PERCAKAPAN UNTUK RUJUKAN] menyebut rujukan program studi dan user bertanya "bedanya", "perbedaannya", atau "itu apa bedanya", bandingkan HANYA program studi yang dirujuk itu. Jangan melebar ke semua jurusan UCIC.
-   - Jika konteks yang ada hanya menjawab sebagian, berikan jawaban parsial yang membantu. Jangan langsung menolak kalau masih ada bagian yang bisa dijawab dari konteks.
-   - Jika transcript user tampak mengulang frasa yang sama, ANGGAP itu artefak suara. Jangan menegur, jangan berkomentar bahwa user mengulang, dan jangan mengatakan akan menjelaskan sekali saja. Cukup jawab inti pertanyaannya dengan normal.
-   - Jika [KONTEKS KAMPUS] kosong atau benar-benar tidak memuat informasinya, tolak dengan jujur dan berwibawa: "Mohon maaf, SELA belum punya informasi sedetail itu saat ini. Mungkin Anda bisa menanyakannya langsung ke bagian informasi kampus." Jangan mengarang info.
-
-2. Jika pertanyaan TIDAK BERHUBUNGAN dengan UCIC (Topik umum, tokoh dunia, cuaca, hiburan, dll):
-   - Jika itu sapaan seperti "siapa kamu" atau "halo", jawab dengan ramah dan bervariasi. Perkenalkan dirimu sebagai SELA, lalu arahkan percakapan ke UCIC secara natural.
-   - Jika user curhat atau bingung memilih jurusan/fakultas, BERTINDAKLAH sebagai teman yang peduli. Berikan solusi dan saran yang membangun. Kamu BOLEH menjawab pertanyaan curhat.
-   - Jika pertanyaan membutuhkan informasi real-time (seperti "siapa presiden sekarang" atau "walikota Cirebon"), dan [KONTEKS WEB SEARCH] tersedia, gunakan konteks tersebut untuk menjawab.
-   - Jika pertanyaan benar-benar di luar ranah kampus dan bukan curhat/sapaan, jawab dengan singkat dan ramah, lalu arahkan kembali ke UCIC. Jangan menolak keras, tapi arahkan dengan elegan.
-   - Contoh pengalihan elegan: "Itu pertanyaan menarik! Kalau soal kampus UCIC, SELA bisa bantu banyak nih. Ada yang ingin ditanyakan tentang pendaftaran atau jurusan?"
-
-3. ANTI-NOISE (ABAIKAN OBROLAN ACAK):
-   - Jika kalimat dari user sangat pendek, tidak memiliki makna yang jelas, atau terdengar seperti potongan obrolan orang yang sedang lewat (contoh: "eh", "iya", "halo", "oh gitu", "lagi apa", "makan yuk"), JANGAN dijawab.
-   - Kamu HANYA boleh membalas dengan SATU KATA ini: [IGNORE_NOISE]
-   - Jangan tambahkan teks apa pun selain [IGNORE_NOISE] jika mendeteksi obrolan acak.
-
-[KONTEKS KAMPUS]:
-${contextStr || "Kosong"}
-
-${webSearchContext ? `[KONTEKS WEB SEARCH (real-time)]:\n${webSearchContext}\n\n` : ""}[KONTEKS PERCAKAPAN UNTUK RUJUKAN]:
-${conversationContextHint || "Tidak ada. Pertanyaan terbaru berdiri sendiri."}
-
-${userMemoryContext ? `[MEMORI USER]:\n${userMemoryContext}\n\n` : ""}[ATURAN KEDALAMAN JAWABAN]:
-${buildResponsePlanPrompt(responsePlan, "id")}
-
-[ARAH KLARIFIKASI]:
-${clarificationHint || "Kosong"}
-
-[ROUTING KEPERCAYAAN]:
-${confidenceRouting.instruction}
-
-[GAYA JAWABAN BERDASARKAN INTENT]:
-${buildIntentResponseGuide(intent)}
-
-[PERTANYAAN LANJUTAN]:
-Setelah menjawab pertanyaan SEPUTAR UCIC, berikan maksimal 2 saran pertanyaan lanjutan yang pendek dan relevan.
-Saran ini HARUS DITULIS DARI SUDUT PANDANG USER (seolah-olah user yang sedang bertanya), BUKAN AI yang bertanya kepada user.
-Gunakan format di AKHIR jawaban: [Pertanyaan 1?] | [Pertanyaan 2?]
-Contoh: "Pendaftaran dibuka bulan Maret. [Bagaimana cara mendaftar ke UCIC?] | [Apa saja syarat pendaftarannya?]"
-JIKA kamu MENOLAK menjawab karena di luar topik kampus, kamu TIDAK PERLU menambahkan pertanyaan lanjutan.`;
-
-  const systemPromptEN = `You are SELA, the virtual receptionist for Universitas Catur Insan Cendekia (UCIC) who embodies a gentle, charismatic, authoritative, and deeply intelligent persona.
-Today is ${todayEN}.
-Your speaking style is calm, warm, elegant, and highly professional. You are the "Digital Face" of UCIC.
-Your answers MUST be concise, friendly, and direct like a customer service representative. Avoid long openings, promotion-like wording, and extra details the user did not ask for. For lists, steps, or comparisons, use short numbered lines (1, 2, 3), not bullet points. For a single fact, answer in one sentence.
-You MUST ALWAYS answer the user in ENGLISH.
-
-[ANSWER VARIATION - VERY IMPORTANT]:
-Every answer MUST vary. Never repeat the exact same opening or closing sentence as the previous answer. Vary your phrasing, word choice, and sentence structure. Never duplicate the same text twice within one answer.
-
-[EMPATHY & LIFE ADVICE]:
-You can also be a listening ear for students. If the user expresses confusion, anxiety, or doubt (e.g., unsure about choosing a major, afraid of not being accepted, uncertain about the future), you CAN and SHOULD:
-- Listen with empathy and respond as a caring friend
-- Provide constructive solutions, advice, or perspective
-- Ask about the user's interests or strengths to help narrow choices
-- Share relevant UCIC program information
-Maintain professionalism but show warmth and care.
-
-[YOUR MAIN TASK]:
-You serve questions about the UCIC campus (Admissions, Academics, Facilities, etc.). But you ALSO can answer greetings, general questions, and be a listening ear with a human-like, lively personality.
-
-[ANSWERING RULES]:
-1. If the question is RELATED to UCIC:
-   - Answer using the [CAMPUS CONTEXT] below as ABSOLUTE FACT.
-   - If the [CAMPUS CONTEXT] contains the requested information, you MUST answer from that context. Do not say the information is unavailable when it exists in the context.
-   - If [CAMPUS CONTEXT] is not empty, you are FORBIDDEN from saying the information is unavailable, telling the user to check with campus staff, or refusing before using the available context.
-   - Chat history is NOT a fact source. If chat history conflicts with [CAMPUS CONTEXT], ignore chat history and follow [CAMPUS CONTEXT].
-   - For direct questions like "who", "where", "how much", "when", or "what", answer directly from the most relevant sentence in [CAMPUS CONTEXT].
-   - Do not copy all context. Use only the information needed to answer the user's question.
-   - If the user's wording is vague, such as "that one", "then how", or "how much for that", use the recent conversation context and answer the most likely intended topic carefully.
-   - SELA's memory only applies within the active chat session. Use history only to resolve references, not as a fact source or permanent memory.
-   - If [CONVERSATION CONTEXT FOR REFERENCE] names referenced study programs and the user asks for the difference, compare ONLY those referenced programs. Do not broaden the answer to all UCIC majors.
-   - If the context only answers part of the request, still provide the helpful partial answer instead of declining immediately.
-   - If the transcript appears to repeat the same phrase, treat that as a voice artifact. Do not scold the user, do not comment on repetition, and do not say you will explain it only once. Just answer normally.
-   - If the [CAMPUS CONTEXT] is empty or truly does not contain the specific info, answer honestly and elegantly: "I apologize, but SELA does not have detailed information on that just yet. You might want to check with the campus staff." Do not make up answers.
-
-2. If the question is NOT RELATED to UCIC (General topics, world figures, weather, entertainment, etc.):
-   - If it's a greeting like "who are you" or "hello", answer warmly and with variety. Introduce yourself as SELA, then naturally steer to UCIC.
-   - If the user is venting or unsure about choosing a major, ACT as a caring friend. Give constructive advice. You CAN answer emotional/venting questions.
-   - If the question requires real-time info (e.g., "who is the president now"), and [WEB SEARCH CONTEXT] is available, use it to answer.
-   - If truly outside campus scope and not a greeting/venting, answer briefly and warmly, then redirect to UCIC. Don't refuse harshly.
-   - Example: "That's an interesting question! When it comes to UCIC campus, SELA can help a lot. Is there anything about admissions or programs you'd like to know?"
-
-3. ANTI-NOISE (IGNORE RANDOM CHATTER):
-   - If the user's sentence is very short, meaningless, or sounds like fragmented background chatter of passersby (e.g., "uh", "yeah", "hello", "oh really", "what's up", "let's eat"), DO NOT answer it.
-   - You MUST ONLY reply with this EXACT WORD: [IGNORE_NOISE]
-   - Do not add any other text besides [IGNORE_NOISE] if you detect random chatter.
-
-[CAMPUS CONTEXT]:
-${contextStr || "Empty"}
-
-${webSearchContext ? `[WEB SEARCH CONTEXT (real-time)]:\n${webSearchContext}\n\n` : ""}[CONVERSATION CONTEXT FOR REFERENCE]:
-${conversationContextHint || "None. The latest question is standalone."}
-
-${userMemoryContext ? `[USER MEMORY]:\n${userMemoryContext}\n\n` : ""}[RESPONSE DEPTH RULE]:
-${buildResponsePlanPrompt(responsePlan, "en")}
-
-[CLARIFICATION DIRECTION]:
-${clarificationHint || "Empty"}
-
-[CONFIDENCE ROUTING]:
-${confidenceRouting.instruction}
-
-[INTENT RESPONSE STYLE]:
-${buildIntentResponseGuide(intent)}
-
-[FOLLOW-UP QUESTIONS]:
-After answering a UCIC-RELATED question, add up to 2 short relevant follow-up questions at the END that the USER CAN ASK NEXT.
-These suggestions MUST BE WRITTEN FROM THE USER'S PERSPECTIVE (as if the user is asking), NOT as the AI asking the user.
-Use the format: [Question 1?] | [Question 2?]
-Example: "Registration opens in March. [How do I apply to UCIC?] | [What are the admission requirements?]"
-IF you DECLINE to answer because the topic is unrelated to the campus, DO NOT add follow-up questions.`;
-
-  const messages = [
-    {
-      role: "system",
-      content: effectiveLang === "en" ? systemPromptEN : systemPromptID,
-    },
-    {
-      role: "user",
-      content: userQuery,
-    },
-  ];
+  // ── Backend adalah OTAK TUNGGAL ─────────────────────────────────────────
+  // Kirim pertanyaan mentah + riwayat saja. Seluruh RAG (leksikal BM25 +
+  // semantik bge-m3), routing niat, web search, dan penyusunan prompt
+  // dikerjakan server. Konteks TIDAK lagi dibangun di sini agar tidak ada dua
+  // mesin retrieval yang bertabrakan (dulu Fuse.js di sini vs RAG backend).
+  const riwayat = messageHistory
+    .slice(0, -1)
+    .map((m) => ({ role: m.role, content: m.content }));
 
   const res = await fetch("/api/chat", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      messages,
-      lang: effectiveLang,
       userQuery,
-      ragScore,
+      riwayat_obrolan: riwayat,
+      bahasa: effectiveLang,
       transcriptDebug: {
         rawUserQuery,
         cleanedUserQuery: userQuery,
@@ -3116,7 +1440,8 @@ IF you DECLINE to answer because the topic is unrelated to the campus, DO NOT ad
 
   if (!res.ok)
     throw new Error("Maaf, otak SELA lagi loading nih. Coba tanya lagi ya.");
-  const { text } = await res.json();
+  const data = await res.json();
+  const text = data.text ?? data.teks ?? "";
 
   // Cek IGNORE_NOISE sebelum parsing, agar tidak muncul sebagai suggestion
   if (text?.trim().includes("[IGNORE_NOISE]")) {
@@ -3128,32 +1453,19 @@ IF you DECLINE to answer because the topic is unrelated to the campus, DO NOT ad
     };
   }
 
-  // Parse follow-up suggestions from response
+  // Saran lanjutan sudah dikirim backend dalam format [Tanya?] | [Tanya?]
   const { text: cleanText, suggestions } = parseSuggestions(text || "");
-  const datasetFallbackAnswer = buildDatasetAnswerFromMatches(
-    finalMatches,
-    effectiveLang,
-    responsePlan,
-  );
-  const shouldUseDatasetFallback =
-    datasetFallbackAnswer &&
-    finalMatches.length > 0 &&
-    looksLikeUnavailableAnswer(cleanText);
-  const displayText =
-    (shouldUseDatasetFallback ? datasetFallbackAnswer : cleanText) ||
-    "Maaf, SELA agak bingung. Bisa diulang?";
-  const spokenText = buildSpokenText(
-    displayText,
-    responsePlan,
-    effectiveLang,
-    finalMatches,
-  );
+  const displayText = cleanText || "Maaf, SELA agak bingung. Bisa diulang?";
+  const spokenText = buildSpokenText(displayText, null, effectiveLang, []);
 
   return {
     text: displayText,
     spokenText,
-    suggestions: shouldUseDatasetFallback ? [] : suggestions,
-    media: mediaResults,
+    suggestions,
+    media: Array.isArray(data.media) ? data.media : [],
+    // Gerakan avatar dipilih backend sesuai sifat jawaban (Greeting, Goodbye,
+    // Confused, Nodding, Shaking Head) agar animasi 3D sinkron dengan respons.
+    gerakan: data.gerakan || null,
     detectedLang: effectiveLang,
   };
 }
@@ -3334,18 +1646,18 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
   const selesai = () => {
     if (masihSesiAktif() && onEnd) onEnd();
   };
-  const akhiriKegagalanOmni = () => {
+  const akhiriKegagalanTts = () => {
     if (!masihSesiAktif() || fallbackDimulai) return;
     fallbackDimulai = true;
-    console.warn("[SELA TTS] Audio OmniVoice gagal diputar; tidak mengganti suara SELA dengan engine lain.");
+    console.warn("[SELA TTS] Audio Piper gagal diputar; tidak mengganti suara SELA dengan engine lain.");
     selesai();
   };
 
-  // Hanya gunakan audio OmniVoice agar karakter suara SELA konsisten.
+  // Hanya gunakan audio Piper agar karakter suara SELA konsisten.
   try {
     const controller = new AbortController();
-    // OmniVoice pada CPU dapat memerlukan lebih dari 15 detik untuk jawaban
-    // baru. Timeout lama mencegah audio dibatalkan tepat sebelum siap.
+    // Sintesis Piper pada CPU bisa butuh waktu untuk kalimat panjang.
+    // Timeout lama mencegah audio dibatalkan tepat sebelum siap.
     const timeoutId = setTimeout(() => controller.abort(), 120000);
 
     const respons = await fetch("/api/sintesis", {
@@ -3359,7 +1671,7 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
     if (respons.ok) {
       const dataSintesis = await respons.json();
       if (dataSintesis.audio_base64) {
-        console.log(`[SELA TTS] Memainkan suara OmniVoice Voice Design (${dataSintesis.engine || 'omnivoice'})`);
+        console.log(`[SELA TTS] Memainkan suara Piper (${dataSintesis.engine || 'piper'})`);
         
         // Konversi base64 ke Blob URL untuk performa audio dan lipsync optimal
         const binaryString = atob(dataSintesis.audio_base64);
@@ -3387,10 +1699,10 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
         };
 
         audio.onerror = (galatAudio) => {
-          console.warn("[SELA TTS] Kendala pemutaran audio OmniVoice:", galatAudio);
+          console.warn("[SELA TTS] Kendala pemutaran audio Piper:", galatAudio);
           URL.revokeObjectURL(audioUrl);
           if (masihSesiAktif()) pemutarAudioAktif = null;
-          akhiriKegagalanOmni();
+          akhiriKegagalanTts();
         };
 
         try {
@@ -3400,7 +1712,7 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
           console.warn("[SELA TTS] audio.play() gagal diputar (kebijakan browser):", playErr);
           URL.revokeObjectURL(audioUrl);
           if (masihSesiAktif()) pemutarAudioAktif = null;
-          akhiriKegagalanOmni();
+          akhiriKegagalanTts();
           return;
         }
       }
@@ -3409,7 +1721,7 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
     console.warn("[SELA TTS] Endpoint sintesis backend error:", galatKoneksi?.message);
   }
 
-  akhiriKegagalanOmni();
+  akhiriKegagalanTts();
 }
 
 // ── Time-based Greeting ──────────────────────────────────────────────────────

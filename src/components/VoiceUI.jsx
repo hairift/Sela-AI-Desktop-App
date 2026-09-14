@@ -200,6 +200,11 @@ export default function VoiceUI({
   const [value, setValue] = useState("");
   const [focused, setFocused] = useState(false);
   const [avatarState, setAvatarState] = useState("idle");
+  // Gerakan satu-kali (one-shot) yang dikirim backend sesuai sifat jawaban:
+  // Greeting, Goodbye, Confused, Nodding, Shaking Head. Nilai null = Idle.
+  // ``kunci`` di-increment tiap gerakan baru agar animasi yang sama tetap
+  // diputar ulang walaupun namanya tidak berubah.
+  const [gerakan, setGerakan] = useState(null);
   const [micDenied, setMicDenied] = useState(false);
   const [micTidakAktif, setMicTidakAktif] = useState(false); // true jika tidak ada mic hardware
   const [activated, setActivated] = useState(true); // Aktif langsung di aplikasi desktop
@@ -247,6 +252,7 @@ export default function VoiceUI({
   const bargeInMulaiRef = useRef(0);
   const suaraKuatSejakRef = useRef(null);
   const avatarStateRef = useRef(avatarState);
+  const gerakanKunciRef = useRef(0); // penghitung unik untuk tiap gerakan one-shot
 
   // Face detection refs
   const audioUnlockedRef = useRef(false); // true setelah tap pertama, tidak pernah reset
@@ -339,6 +345,13 @@ export default function VoiceUI({
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     setIsAtBottom(true);
+  };
+
+  // Picu satu gerakan one-shot pada avatar. ``nama`` harus persis sama dengan
+  // nama animasi di public/models/sela.glb (lihat tentukan_gerakan di server).
+  const jalankanGerakan = (nama) => {
+    if (!nama) return;
+    setGerakan({ nama, kunci: ++gerakanKunciRef.current });
   };
 
   const speakWithAvatar = (text, speechLang = lang, onDone = null) => {
@@ -971,6 +984,10 @@ export default function VoiceUI({
       if (onReceive) onReceive(response);
       markSessionInteraction();
 
+      // 2b. Jalankan gerakan avatar sesuai sifat jawaban dari backend
+      // (Greeting / Goodbye / Confused / Nodding / Shaking Head / null).
+      jalankanGerakan(response.gerakan);
+
       // 3. Sintesis suara cepat (< 80ms) + Wawa Lipsync
       const spokenText = response.spokenText || response.text;
       setLatestSpokenText(spokenText);
@@ -1105,6 +1122,9 @@ export default function VoiceUI({
 
     if (onReceive) onReceive(msg);
 
+    // Salam perpisahan selalu diiringi animasi Goodbye
+    jalankanGerakan("Goodbye");
+
     // Fallback jika TTS onEnd tidak terpanggil (Chrome bug)
     const farewellFallback = setTimeout(() => {
       archiveConversationSession({
@@ -1175,6 +1195,7 @@ export default function VoiceUI({
       const askEN = "Would you like to speak in Indonesian or English?";
       const combined = `${greetID}\n\n${greetEN}\n\n${askID}\n\n${askEN}`;
       if (onReceive) onReceive(combined);
+      jalankanGerakan("Greeting");
       setAwaitingLangSelect(false);
       speakSequenceWithAvatar(
         [
@@ -1208,6 +1229,7 @@ export default function VoiceUI({
     const timeBasedGreeting = getTimeBasedGreeting(chosen);
     onSend(langLabel);
     if (onReceive) onReceive(timeBasedGreeting);
+    jalankanGerakan("Greeting");
     setLatestSpokenText(timeBasedGreeting);
     speakWithAvatar(
       timeBasedGreeting,
@@ -1242,7 +1264,7 @@ export default function VoiceUI({
       {/* 3D Avatar full screen background */}
       <div className="absolute inset-0 pointer-events-none z-0">
         <div className="pointer-events-auto w-full h-full">
-          <AvatarPlaceholder state={avatarState} theme={theme} />
+          <AvatarPlaceholder state={avatarState} theme={theme} gerakan={gerakan} />
         </div>
       </div>
 

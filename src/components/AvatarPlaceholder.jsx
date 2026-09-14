@@ -1,4 +1,4 @@
-import { Suspense, useMemo, useRef, useEffect, Component } from 'react'
+import { Suspense, useMemo, useRef, useEffect, useState, Component } from 'react'
 import { Canvas, useFrame } from '@react-three/fiber'
 import { ContactShadows, Html, PerspectiveCamera, useGLTF, useAnimations, Environment } from '@react-three/drei'
 import * as THREE from 'three'
@@ -73,6 +73,10 @@ const WAVE_HEIGHTS = [20, 36, 48, 30, 44, 26, 40, 32, 24]
 const WAVE_COLORS = ['bg-blue-300', 'bg-blue-400', 'bg-blue-500', 'bg-indigo-400', 'bg-blue-400', 'bg-blue-300', 'bg-indigo-500', 'bg-blue-400', 'bg-blue-300']
 const WAVE_ANIMS = ['animate-wave-1', 'animate-wave-3', 'animate-wave-2', 'animate-wave-4', 'animate-wave-1', 'animate-wave-5', 'animate-wave-2', 'animate-wave-3', 'animate-wave-1']
 
+// Nama morph target berbeda antar-versi model. Model v05 memakai `a, i, u, e, o,
+// blink.l, blink.r, blink.all`; model sebelumnya memakai `aa, ih, u, e, o,
+// EyeBlinkLeft, EyeBlinkRight`. Daftar alias menampung keduanya, dan
+// `normalizeMorphName` membuang titik/garis bawah sehingga `blink.l` == `blink_l`.
 const MORPH_ALIASES = {
   visemeSil: ['viseme_sil', 'visemesil', 'sil', 'silence', 'mouthclose', 'mouth_close', 'mouthrest', 'mouth_rest', 'neutral'],
   visemeAa: ['viseme_aa', 'visemeaa', 'aa', 'a'],
@@ -80,8 +84,10 @@ const MORPH_ALIASES = {
   visemeU: ['viseme_u', 'visemeu', 'u', 'ou'],
   visemeE: ['viseme_e', 'visemee', 'e', 'eh'],
   visemeO: ['viseme_o', 'visemeo', 'o', 'oh'],
-  eyeBlinkLeft: ['eyeblinkleft', 'eye_blink_left', 'blinkleft', 'blink_l', 'eyeclosedleft', 'eye_close_left'],
-  eyeBlinkRight: ['eyeblinkright', 'eye_blink_right', 'blinkright', 'blink_r', 'eyeclosedright', 'eye_close_right'],
+  // `blinkall` ditempatkan paling akhir sebagai cadangan: hanya terpakai bila
+  // model tidak punya morph kedip per-mata.
+  eyeBlinkLeft: ['eyeblinkleft', 'eye_blink_left', 'blinkleft', 'blink_l', 'eyeclosedleft', 'eye_close_left', 'blinkall', 'blink_all'],
+  eyeBlinkRight: ['eyeblinkright', 'eye_blink_right', 'blinkright', 'blink_r', 'eyeclosedright', 'eye_close_right', 'blinkall', 'blink_all'],
   eyeWideLeft: ['eyewideleft', 'eye_wide_left', 'wideleft', 'eyeopenwideleft'],
   eyeWideRight: ['eyewideright', 'eye_wide_right', 'wideright', 'eyeopenwideright'],
   browInnerUp: ['browinnerup', 'brow_inner_up'],
@@ -91,9 +97,31 @@ const MORPH_ALIASES = {
   browDownRight: ['browdownright', 'brow_down_right'],
 }
 
-const MODEL_SCALE = 5.0
-const MODEL_BASE_Y = -4.65
-const SHADOW_Y = -4.0
+// Tinggi tampil avatar dalam satuan dunia. Dipatok konstan (tidak mengikuti
+// geometri model) agar ukuran di layar tetap sama walau model 3D diganti.
+const TINGGI_AVATAR = 4.55
+
+// ── Framing vertikal ────────────────────────────────────────────────────────
+// Kamera di [0, 0.8, 5.5] dengan fov vertikal 32 derajat hanya melihat rentang
+// y = -0,78 s/d 2,38 (tinggi 3,15). Menyetel kaki di y = -4,65 membuat seluruh
+// badan berada di bawah viewport: hanya 15% teratas (ubun-ubun) yang tampak.
+// Karena itu titik acuan dipindah ke PUNCAK kepala, bukan ke kaki.
+// Puncak dipasang sedikit di bawah tepi atas rentang (2,38) supaya seluruh
+// wajah — termasuk mulut yang digerakkan lipsync — dan badan ikut terlihat
+// (±65% tinggi avatar: kepala sampai pinggul).
+const PUNCAK_AVATAR_Y = 2.2
+// Ketinggian kaki avatar (titik terendah model) di panggung.
+const DASAR_AVATAR_Y = PUNCAK_AVATAR_Y - TINGGI_AVATAR
+// Bidang bayangan kontak diletakkan di alas kaki avatar.
+const SHADOW_Y = DASAR_AVATAR_Y
+
+// Gerakan sekali-jalan yang dipicu oleh sifat jawaban AI.
+const ANIMASI_SEKALI = new Set(['Greeting', 'Goodbye', 'Confused', 'Nodding', 'Shaking Head'])
+
+// Animasi yang TIDAK boleh diputar: `Talking_%temp` menganimasikan bobot morph
+// mulut (`weights`), sehingga akan bertabrakan dengan lipsync Wawa yang
+// mengendalikan mulut secara manual pada setiap frame.
+const ANIMASI_DILARANG = new Set(['Talking_%temp'])
 
 function normalizeMorphName(name = '') {
   return name.toLowerCase().replace(/[^a-z0-9]/g, '')
@@ -155,7 +183,7 @@ function AvatarFallback() {
   )
 }
 
-function SelaModel({ state }) {
+function SelaModel({ state, gerakan }) {
   const groupRef = useRef(null)
   const blinkRef = useRef({
     elapsed: 0,
@@ -163,22 +191,77 @@ function SelaModel({ state }) {
     start: 0,
     nextAt: 1.2 + Math.random() * 2.8,
   })
-  const { scene, animations } = useGLTF('/models/SELA_BARU.glb')
+  const { scene, animations } = useGLTF('/models/sela.glb')
   const { actions } = useAnimations(animations, groupRef)
 
+  // Gerakan sekali-jalan yang sedang berjalan (null = tidak ada).
+  const [gerakanJalan, setGerakanJalan] = useState(null)
+  const animasiAktifRef = useRef(null)
+
+  // ── Skala & posisi dihitung dari model yang benar-benar dimuat ────────────
+  // Tinggi geometri model berbeda antar-versi (model v05 ~1,48x model lama),
+  // jadi konstanta tetap akan salah dan avatar tampak kelewat besar/kecil.
+  // Dengan menormalkan tinggi, avatar selalu pas di frame berapa pun modelnya.
+  const { skala, posisiY } = useMemo(() => {
+    const kotak = new THREE.Box3().setFromObject(scene)
+    const tinggi = kotak.max.y - kotak.min.y
+    if (!Number.isFinite(tinggi) || tinggi <= 0.0001) {
+      return { skala: 1, posisiY: DASAR_AVATAR_Y }
+    }
+    const skalaHitung = TINGGI_AVATAR / tinggi
+    // Titik terendah model (kaki) dipatok ke DASAR_AVATAR_Y.
+    return { skala: skalaHitung, posisiY: DASAR_AVATAR_Y - kotak.min.y * skalaHitung }
+  }, [scene])
+
+  // Animasi latar mengikuti status percakapan.
+  const animasiLatar =
+    state === 'thinking' ? 'Thinking' : state === 'speaking' ? 'Talking' : 'Idle'
+
+  // 1. Prop `gerakan` berubah -> mulai putar gerakan sekali-jalan.
+  useEffect(() => {
+    const nama = gerakan?.nama
+    if (!nama || !ANIMASI_SEKALI.has(nama)) return
+    setGerakanJalan({ nama, kunci: gerakan.kunci ?? nama })
+  }, [gerakan])
+
+  // 2. Putar gerakan sekali-jalan, lalu lepas kendali setelah durasinya habis.
+  useEffect(() => {
+    if (!actions || !gerakanJalan) return
+    const aksi = actions[gerakanJalan.nama]
+    if (!aksi) {
+      setGerakanJalan(null)
+      return
+    }
+
+    aksi.setLoop(THREE.LoopOnce, 1)
+    aksi.clampWhenFinished = true
+    aksi.reset().fadeIn(0.2).play()
+    Object.entries(actions).forEach(([nama, lain]) => {
+      if (nama !== gerakanJalan.nama && !ANIMASI_DILARANG.has(nama)) lain?.fadeOut(0.2)
+    })
+    animasiAktifRef.current = gerakanJalan.nama
+
+    const durasiMs = Math.max(300, (aksi.getClip()?.duration || 1) * 1000)
+    const timer = setTimeout(() => setGerakanJalan(null), durasiMs)
+    return () => clearTimeout(timer)
+  }, [actions, gerakanJalan])
+
+  // 3. Animasi latar (Idle / Talking / Thinking) berjalan bergantian.
   useEffect(() => {
     if (!actions) return
+    if (gerakanJalan) return // gerakan sekali-jalan masih menang
+    const aksi = actions[animasiLatar] || actions['Idle'] || Object.values(actions)[0]
+    if (!aksi) return
+    if (aksi.isRunning() && animasiAktifRef.current === animasiLatar) return
 
-    // Jalankan animasi Idle alami secara terus-menerus (tangan rileks di samping)
-    // Gerakan mulut saat bicara 100% dikendalikan oleh Wawa Lipsync di useFrame
-    const idleAction = actions['Idle'] || Object.values(actions)[0]
-    if (idleAction && !idleAction.isRunning()) {
-      Object.values(actions).forEach(act => {
-        if (act !== idleAction) act?.fadeOut(0.3)
-      })
-      idleAction.reset().fadeIn(0.4).play()
-    }
-  }, [actions])
+    aksi.setLoop(THREE.LoopRepeat, Infinity)
+    aksi.clampWhenFinished = false
+    aksi.reset().fadeIn(0.35).play()
+    Object.entries(actions).forEach(([nama, lain]) => {
+      if (nama !== animasiLatar && !ANIMASI_DILARANG.has(nama)) lain?.fadeOut(0.35)
+    })
+    animasiAktifRef.current = animasiLatar
+  }, [actions, animasiLatar, gerakanJalan])
 
   const bindings = useMemo(() => {
     const nextBindings = []
@@ -197,7 +280,7 @@ function SelaModel({ state }) {
 
     group.rotation.y = Math.sin(t * 0.5) * 0.08
     group.rotation.x = Math.sin(t * 0.9) * 0.02
-    group.position.y = MODEL_BASE_Y + Math.sin(t * 1.6) * 0.03
+    group.position.y = posisiY + Math.sin(t * 1.6) * 0.03
 
     const blink = blinkRef.current
     blink.elapsed += delta
@@ -359,13 +442,13 @@ function SelaModel({ state }) {
   })
 
   return (
-    <group ref={groupRef} scale={MODEL_SCALE} position={[0, MODEL_BASE_Y, 0]}>
+    <group ref={groupRef} scale={skala} position={[0, posisiY, 0]}>
       <primitive object={scene} />
     </group>
   )
 }
 
-function SelaAvatar3D({ state, theme }) {
+function SelaAvatar3D({ state, theme, gerakan }) {
   const isDark = theme === 'dark'
 
   return (
@@ -422,7 +505,7 @@ function SelaAvatar3D({ state, theme }) {
       <Suspense fallback={<AvatarFallback />}>
         {/* Environment map dengan intensitas proporsional untuk refleksi halus */}
         <Environment preset="city" environmentIntensity={isDark ? 0.50 : 0.60} />
-        <SelaModel state={state} />
+        <SelaModel state={state} gerakan={gerakan} />
         <ContactShadows
           position={[0, SHADOW_Y, 0]}
           opacity={isDark ? 0.4 : 0.25}
@@ -437,7 +520,16 @@ function SelaAvatar3D({ state, theme }) {
   )
 }
 
-export default function AvatarPlaceholder({ state = 'idle', theme = 'light' }) {
+/**
+ * Avatar 3D SELA.
+ *
+ * @param {string} state - 'idle' | 'listening' | 'thinking' | 'speaking'
+ * @param {string} theme - 'light' | 'dark'
+ * @param {{nama: string, kunci: number}|null} gerakan - gerakan sekali-jalan yang
+ *   dipicu sifat jawaban AI (Greeting/Goodbye/Confused/Nodding/Shaking Head).
+ *   `kunci` membuat gerakan yang sama tetap diputar ulang pada jawaban berikutnya.
+ */
+export default function AvatarPlaceholder({ state = 'idle', theme = 'light', gerakan = null }) {
   const cfg = STATE_CONFIG[state] ?? STATE_CONFIG.idle
   const isSpeaking = state === 'speaking'
 
@@ -456,7 +548,7 @@ export default function AvatarPlaceholder({ state = 'idle', theme = 'light' }) {
 
       <div className="absolute inset-0 z-10 w-full h-full pointer-events-auto">
         <PembatasGalatAvatar>
-          <SelaAvatar3D state={state} theme={theme} />
+          <SelaAvatar3D state={state} theme={theme} gerakan={gerakan} />
         </PembatasGalatAvatar>
       </div>
 
@@ -476,5 +568,5 @@ export default function AvatarPlaceholder({ state = 'idle', theme = 'light' }) {
 }
 
 try {
-  useGLTF.preload('/models/SELA_BARU.glb')
+  useGLTF.preload('/models/sela.glb')
 } catch (_) {}

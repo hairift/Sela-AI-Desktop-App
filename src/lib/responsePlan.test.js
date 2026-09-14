@@ -75,7 +75,7 @@ test("prioritizeResponseMatches pins aggregate jurusan entries first", () => {
   );
 });
 
-test("buildSpokenText speaks the answer's actual core rather than a fixed template", () => {
+test("buildSpokenText reads the full answer, not a fixed template", () => {
   const plan = buildResponsePlan("ucic ada jurusan apa aja", {
     intent: "jurusan",
   });
@@ -102,11 +102,15 @@ Daftar lengkap setiap program studi saya tampilkan di layar agar lebih mudah dib
 
   const spoken = buildSpokenText(longAnswer, plan, "id", matches);
 
+  // Seluruh paragraf jawaban harus ikut dibacakan, bukan hanya 2 kalimat awal.
   assert.match(spoken, /UCIC memiliki 3 fakultas/i);
-  assert.doesNotMatch(spoken, /tampilkan di layar/i);
+  assert.match(spoken, /Fakultas Teknologi Informasi mencakup/i);
+  assert.match(spoken, /Fakultas Ekonomi dan Bisnis mencakup/i);
+  assert.match(spoken, /Fakultas Pendidikan dan Sains memiliki/i);
+  assert.match(spoken, /tampilkan di layar/i);
 });
 
-test("buildSpokenText preserves a useful spoken summary for detailed lists", () => {
+test("buildSpokenText keeps every item of a detailed list", () => {
   const plan = buildResponsePlan("kalau saya suka komputer masuk jurusan apa ya", {
     intent: "jurusan",
   });
@@ -117,12 +121,13 @@ Sistem Informasi: jurusan ini fokus pada pengelolaan sistem informasi dan aplika
 
   const spoken = buildSpokenText(shortAnswer, plan, "id", []);
 
-  assert.match(spoken, /Teknik Informatika/i);
   assert.match(spoken, /Jika Anda suka komputer/i);
-  assert.doesNotMatch(spoken, /pengelolaan sistem informasi dan aplikasi/i);
+  assert.match(spoken, /Teknik Informatika/i);
+  // Uraian tiap item tidak boleh lagi dipotong.
+  assert.match(spoken, /pengelolaan sistem informasi dan aplikasi/i);
 });
 
-test("buildSpokenText summarizes multi-paragraph answers without on-screen filler", () => {
+test("buildSpokenText speaks multi-paragraph answers in full", () => {
   const plan = buildResponsePlan("kalau saya suka komputer masuk jurusan apa ya", {
     intent: "jurusan",
   });
@@ -134,9 +139,28 @@ Sistem Informasi lebih cocok jika Anda suka kombinasi komputer, data, dan proses
 
   const spoken = buildSpokenText(detailedAnswer, plan, "id", []);
 
-  assert.notEqual(spoken, detailedAnswer);
-  assert.doesNotMatch(spoken, /layar/i);
-  assert.match(spoken, /Teknik Informatika atau Sistem Informasi/i);
+  // Semua paragraf digabung apa adanya — tidak ada yang dibuang.
+  assert.equal(
+    spoken,
+    "Jika Anda suka komputer, maka jurusan yang paling cocok di UCIC adalah Teknik Informatika atau Sistem Informasi. Teknik Informatika lebih cocok jika Anda suka pemrograman, software, dan pengembangan teknologi. Sistem Informasi lebih cocok jika Anda suka kombinasi komputer, data, dan proses bisnis.",
+  );
+});
+
+test("buildSpokenText does not truncate long answers at the old 260-char cap", () => {
+  // Regresi: dulu TTS berhenti setelah 2 kalimat / 260 karakter. Kalimat dibuat
+  // berbeda-beda agar tidak dibuang oleh de-duplikasi.
+  const sentences = Array.from(
+    { length: 12 },
+    (_, i) => `Kalimat nomor ${i + 1} berisi keterangan tambahan yang panjang.`,
+  );
+  const longAnswer = `${sentences.join(" ")} Kalimat terakhir yang wajib ikut terdengar sampai habis.`;
+
+  const spoken = buildSpokenText(longAnswer, null, "id", []);
+
+  assert.ok(spoken.length > 260, `spoken length ${spoken.length} harus > 260`);
+  assert.match(spoken, /Kalimat nomor 1 berisi/i);
+  assert.match(spoken, /Kalimat nomor 12 berisi/i);
+  assert.match(spoken, /Kalimat terakhir yang wajib ikut terdengar sampai habis\.$/);
 });
 
 test("buildSpokenText replaces raw URLs with a natural spoken cue", () => {

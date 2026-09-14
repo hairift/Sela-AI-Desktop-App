@@ -33,42 +33,6 @@ function includesAny(normalized, phrases = []) {
   return phrases.some((phrase) => normalized.includes(phrase));
 }
 
-function truncateSentence(text = "", maxLength = 160) {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim();
-  if (!normalized) return "";
-  if (normalized.length <= maxLength) return normalized;
-
-  const clipped = normalized.slice(0, maxLength);
-  const sentenceEnd = Math.max(
-    clipped.lastIndexOf("."),
-    clipped.lastIndexOf("?"),
-    clipped.lastIndexOf("!"),
-  );
-  if (sentenceEnd > 80) return clipped.slice(0, sentenceEnd + 1).trim();
-  return `${clipped.replace(/\s+\S*$/, "").trim()}.`;
-}
-
-function countReadableParagraphs(text = "") {
-  return String(text || "")
-    .split(/\n\s*\n/)
-    .map((paragraph) => paragraph.trim())
-    .filter(Boolean).length;
-}
-
-function extractLeadSentence(text = "", maxLength = 150) {
-  let flattened = String(text || "")
-    .replace(/^Baik,\s*berikut\s*informasi\s*resmi\s*dari\s*Universitas\s*Catur\s*Insan\s*Cendekia\s*\(UCIC\):\s*/i, "")
-    .replace(/\[(.*?)\]/g, " ")
-    .replace(/(?:^|\n)\s*\d+\.\s*/g, " ")
-    .replace(/(?:^|\n)\s*-\s*/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-
-  if (!flattened) return "";
-  const firstSentence = flattened.match(/^.*?[.!?](?=\s|$)/)?.[0] || flattened;
-  return truncateSentence(firstSentence, maxLength);
-}
-
 function extractJurusanCounts(matches = []) {
   const facultyNames = new Set();
   const programNames = new Set();
@@ -369,39 +333,37 @@ export function buildSpokenText(
   lang = "id",
   matches = [],
 ) {
-  const plan = responsePlan || buildResponsePlan();
   const cleanedText = String(displayText || "").trim();
   if (!cleanedText) return "";
 
-  // Audio harus tetap berasal dari jawaban yang tampil, bukan template per
-  // intent. Ambil inti 2--3 gagasan sehingga terdengar natural, informatif,
-  // dan tidak membacakan URL/markdown secara harfiah.
+  // TTS harus membacakan SELURUH jawaban yang tampil. Sebelumnya fungsi ini
+  // hanya mengambil 2 kalimat pertama lalu memotongnya di 260 karakter (sisa
+  // warisan mesin OmniVoice yang lambat), sehingga SELA kerap terdengar
+  // berhenti di tengah jawaban. Piper kini sanggup membaca teks panjang dengan
+  // cepat (~300 karakter/detik), jadi tidak ada lagi alasan memotong isi.
+  // Satu-satunya penyesuaian yang dipertahankan: URL tidak dieja huruf per
+  // huruf, dan penanda markdown (**, #, `) dibuang agar suara tetap natural.
   const withoutLinks = cleanedText
     .replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/gi, "$1. Linknya bisa kamu akses di sini.")
     .replace(/https?:\/\/\S+/gi, "Linknya bisa kamu akses di sini.")
     .replace(/[*_`#>]/g, "");
+
   const units = withoutLinks
     .split(/\n+|(?<=[.!?])\s+/)
     .map((unit) => unit.replace(/^\s*(?:[-*]|\d+[.)])\s*/, "").replace(/\s+/g, " ").trim())
     .filter(Boolean);
+
   const selected = [];
   const seen = new Set();
   for (const unit of units) {
     const key = normalizePlanText(unit);
     if (!key || seen.has(key)) continue;
     seen.add(key);
-    // Untuk daftar, nama item lebih enak didengar daripada uraian panjang
-    // setiap item. Kalimat pembuka tetap dipertahankan sebagai konteks.
-    const spokenUnit =
-      plan.displayMode === "list_detail" && unit.includes(":")
-        ? `${unit.split(":")[0].trim()}.`
-        : unit;
-    selected.push(spokenUnit);
-    if (selected.length >= (plan.displayMode === "brief" ? 2 : 2)) break;
+    selected.push(unit);
   }
 
-  let spoken = selected.join(" ") || extractLeadSentence(withoutLinks, 320);
-  // Batas moderat menjaga OmniVoice CPU responsif tanpa mengorbankan inti.
-  if (spoken.length > 260) spoken = truncateSentence(spoken, 260);
-  return spoken;
+  // Semua kalimat digabung dan dibacakan penuh (tanpa batas jumlah kalimat
+  // maupun panjang karakter). Jika hasil pembersihan kosong, jatuh ke teks
+  // yang sudah dinormalisasi apa adanya agar tidak ada yang terlewat.
+  return selected.join(" ").trim() || withoutLinks.replace(/\s+/g, " ").trim();
 }
