@@ -3,8 +3,9 @@
  * Bertanggung jawab meluncurkan, memantau, dan mematikan server AI Python lokal secara aman.
  */
 
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 const http = require('http');
 
 class PengelolaProsesAi {
@@ -12,7 +13,72 @@ class PengelolaProsesAi {
     this.prosesPython = null;
     this.portServerAi = 8008;
     this.statusSiap = false;
-    this.upayaKoneksiMaksimal = 30;
+    // Cold start bisa lama: llama-server perlu memuat model ~4,9 GB ke memori.
+    // 120 percobaan x 1 detik = 120 detik batas tunggu.
+    this.upayaKoneksiMaksimal = 120;
+    this.jalurAkarProyek = null;
+    this.pythonTerpilih = null; // { cmd, args } interpreter yang benar-benar punya dependensi
+  }
+
+  /**
+   * Mencari interpreter Python yang benar-benar memiliki dependensi SELA
+   * (fastapi + uvicorn). Penting: `python` di PATH sering menunjuk versi lain
+   * yang belum terpasang paketnya, sehingga server gagal dijalankan.
+   * Urutan: SELA_PYTHON -> venv proyek -> py -3.12 (Windows) -> py -> python -> python3
+   * @returns {{cmd: string, args: string[]}|null}
+   */
+  temukanPython() {
+    if (this.pythonTerpilih) return this.pythonTerpilih;
+
+    const akar = this.jalurAkarProyek || process.cwd();
+    const namaExe = process.platform === 'win32' ? 'python.exe' : 'python';
+    const kandidat = [];
+
+    // 1. Override eksplisit
+    if (process.env.SELA_PYTHON) {
+      kandidat.push({ cmd: process.env.SELA_PYTHON, args: [] });
+    }
+
+    // 2. Virtualenv di dalam proyek (paling dapat diandalkan bila ada)
+    const subVenv = process.platform === 'win32'
+      ? ['Scripts', namaExe]
+      : ['bin', 'python'];
+    for (const dasar of [path.join(akar, 'ai-engine', '.venv'), path.join(akar, '.venv')]) {
+      const kandidatVenv = path.join(dasar, ...subVenv);
+      if (fs.existsSync(kandidatVenv)) kandidat.push({ cmd: kandidatVenv, args: [] });
+    }
+
+    // 3. Peluncur `py` Windows dengan versi yang dipakai proyek
+    if (process.platform === 'win32') {
+      kandidat.push({ cmd: 'py', args: ['-3.12'] });
+      kandidat.push({ cmd: 'py', args: ['-3'] });
+      kandidat.push({ cmd: 'py', args: [] });
+    }
+
+    // 4. Nama generik
+    kandidat.push({ cmd: 'python', args: [] });
+    kandidat.push({ cmd: 'python3', args: [] });
+
+    for (const k of kandidat) {
+      try {
+        const uji = spawnSync(k.cmd, [...k.args, '-c', 'import fastapi, uvicorn'], {
+          encoding: 'utf8',
+          timeout: 25000,
+          windowsHide: true,
+        });
+        if (uji.status === 0) {
+          console.log(`[Pengelola AI] Interpreter Python dipakai: ${k.cmd} ${k.args.join(' ')}`.trim());
+          this.pythonTerpilih = k;
+          return k;
+        }
+      } catch (_) {
+        // lanjut ke kandidat berikutnya
+      }
+    }
+
+    console.warn('[Pengelola AI] Tidak menemukan Python dengan fastapi+uvicorn. ' +
+      'Pasang dependensi (pip install -r ai-engine/requirements.txt) atau set SELA_PYTHON.');
+    return null;
   }
 
   /**
@@ -21,6 +87,7 @@ class PengelolaProsesAi {
    * @returns {Promise<boolean>}
    */
   async jalankanMesinAi(jalurAkarProyek) {
+    this.jalurAkarProyek = jalurAkarProyek;
     const jalurSkripServer = path.join(jalurAkarProyek, 'ai-engine', 'server.py');
     const direktoriKerjaAi = path.join(jalurAkarProyek, 'ai-engine');
 
@@ -32,12 +99,20 @@ class PengelolaProsesAi {
       return true;
     }
 
+    // 2. Pastikan interpreter Python punya dependensi (fastapi + uvicorn)
+    const python = this.temukanPython();
+    if (!python) {
+      console.error('[Pengelola AI] Server AI tidak dapat dijalankan: interpreter Python tidak siap.');
+      this.statusSiap = false;
+      return false;
+    }
+
     console.log('[Pengelola AI] Memulai mesin AI offline lokal...');
-    console.log(`[Pengelola AI] Menjalankan: python ${jalurSkripServer}`);
+    console.log(`[Pengelola AI] Menjalankan: ${python.cmd} ${python.args.join(' ')} ${jalurSkripServer}`.trim());
 
     try {
       // Menjalankan proses Python server
-      this.prosesPython = spawn('python', [jalurSkripServer], {
+      this.prosesPython = spawn(python.cmd, [...python.args, jalurSkripServer], {
         cwd: direktoriKerjaAi,
         env: {
           ...process.env,
@@ -70,8 +145,20 @@ class PengelolaProsesAi {
         this.statusSiap = false;
       });
 
-      // Menunggu hingga server siap menerima koneksi HTTP/WebSocket
-      const siap = await this.tungguKesiapanServer();
+      // Menunggu hingga server siap menerima koneksi HTTP/WebSocket.
+      // Bila proses berhenti lebih awal (mis. dependensi kurang), jangan tunggu 30 detik penuh.
+      const siap = await Promise.race([
+        this.tungguKesiapanServer(),
+        new Promise((resolve) => {
+          this.prosesPython.once('close', (kodeKeluar) => {
+            if (!this.statusSiap) {
+              console.error(`[Pengelola AI] Proses AI berhenti lebih awal (kode ${kodeKeluar}). ` +
+                'Periksa pesan error di atas (biasanya dependensi Python belum terpasang).');
+              resolve(false);
+            }
+          });
+        }),
+      ]);
       this.statusSiap = siap;
       return siap;
     } catch (kesalahan) {
@@ -108,7 +195,9 @@ class PengelolaProsesAi {
 
       const periksaKesehatan = () => {
         percobaan += 1;
-        const permintaan = http.get(`http://localhost:${this.portServerAi}/kesehatan`, (respons) => {
+        // Pakai 127.0.0.1 (bukan "localhost") agar tidak bergantung pada
+        // resolusi IPv6/IPv4; server uvicorn mengikat alamat IPv4.
+        const permintaan = http.get(`http://127.0.0.1:${this.portServerAi}/kesehatan`, (respons) => {
           if (respons.statusCode === 200) {
             console.log('[Pengelola AI] Server AI lokal berhasil terhubung dan siap digunakan!');
             resolve(true);
@@ -122,6 +211,10 @@ class PengelolaProsesAi {
 
         permintaan.on('error', () => {
           if (percobaan < this.upayaKoneksiMaksimal) {
+            // Beri tahu pengguna setiap 10 detik agar tidak terkesan menggantung
+            if (percobaan % 10 === 0) {
+              console.log(`[Pengelola AI] Menunggu server AI siap... (${percobaan} detik)`);
+            }
             setTimeout(periksaKesehatan, 1000);
           } else {
             console.warn('[Pengelola AI] Server AI belum merespons setelah upaya maksimal.');

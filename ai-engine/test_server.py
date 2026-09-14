@@ -1,422 +1,564 @@
 """
-SELA AI Desktop - Pengujian Komprehensif Seluruh Modul AI Offline
-===================================================================
-1. Uji Kesehatan Server & Komponen AI (/kesehatan)
-2. Uji RAG Goldens & Intent Percakapan (Sapaan, Identitas, Prodi, Biaya, Multi-Turn)
-3. Uji Anti-QR Ganda (Deduplikasi tautan pada respon obrolan)
-4. Uji Sintesis Suara TTS (OmniVoice Voice Design Female, timing, disk cache)
-5. Uji Pengenalan Suara ASR (Whisper transkripsi audio ucapan & uji hening)
-6. Uji Web Search Real-Time
-7. Uji Pengenal Nama User
-8. Uji Intent Curhat
-9. Uji Auto-Correct ASR
-10. Uji MCP Server Status
-11. Uji Bersihkan Duplikasi Teks
-12. Uji Non-Kampus Solusi Hidup
+SELA AI Desktop - Uji Asap (Smoke Test) Arsitektur Baru
+=======================================================
+Menguji setiap lapisan tanpa perlu menjalankan server penuh:
+
+1. Chunker jendela kalimat (512/80)
+2. Embedder (bge-m3 atau hashing cadangan)
+3. Vector store (FAISS atau NumPy)
+4. Retriever leksikal BM25 + gerbang cakupan IDF
+5. RAG engine + ambang anti-halusinasi
+6. Evaluasi goldens (src/data/rag_goldens.json)
+7. Campus tool (intent + pencarian)
+8. Curhat tool (empatik)
+9. Web search (deteksi kebutuhan)
+10. TTS Piper (sintesis pendek)
+11. STT (gerbang energi untuk audio pendek/hening)
+12. VAD (SPEECH_START / SPEECH_END)
+13. Prompt library (tujuh prompt)
+14. Routing ranah (kampus / umum / real-time)
+15. Server FastAPI (opsional, set SELA_UJI_SERVER=1)
+16. Pengunduh model (truncate berkas rusak / resume / verifikasi)
+
+Jalankan:  python ai-engine/test_server.py
 """
 
-import os
+from __future__ import annotations
+
 import io
-import time
 import json
-import base64
-import wave
+import os
 import struct
+import sys
+import wave
 
-from fastapi.testclient import TestClient
-from server import aplikasi_server
+_AKAR = os.path.dirname(os.path.abspath(__file__))
+if _AKAR not in sys.path:
+    sys.path.insert(0, _AKAR)
 
-
-klien = TestClient(aplikasi_server)
-
-
-def uji_kesehatan():
-    print("\n" + "=" * 60)
-    print("1. PENGUJIAN STATUS KESEHATAN SERVER (/kesehatan)")
-    print("=" * 60)
-    resp = klien.get("/kesehatan")
-    assert resp.status_code == 200, f"Status code bukan 200: {resp.status_code}"
-    data = resp.json()
-    print(f"Status: {data.get('status')}")
-    print(f"Total Dokumen RAG: {data.get('total_dokumen_rag')}")
-    print(f"Whisper Tersedia: {data.get('model_whisper_tersedia')} ({data.get('model_whisper_aktif')})")
-    print(f"TTS Engine: {data.get('tts_engine')}")
-    print(f"Sampel Suara Kloning: {data.get('sampel_suara_kloning')} berkas")
-    assert data.get("status") == "sehat"
-    assert data.get("total_dokumen_rag", 0) > 100
-    assert data.get("tts_siap") is True
-    print("-> [LULUS] Status kesehatan server prima!")
+LULUS = 0
+GAGAL = 0
 
 
-def uji_rag_goldens():
-    print("\n" + "=" * 60)
-    print("2. PENGUJIAN RAG GOLDENS & INTENT PERCAKAPAN")
-    print("=" * 60)
+def _cek(nama: str, kondisi: bool, detail: str = "") -> None:
+    global LULUS, GAGAL
+    if kondisi:
+        LULUS += 1
+        print(f"  [LULUS] {nama} {detail}")
+    else:
+        GAGAL += 1
+        print(f"  [GAGAL] {nama} {detail}")
 
-    kasus_uji = [
-        {
-            "nama": "Sapaan Ramah (Bukan Prodi Olahraga)",
-            "query": "halo",
-            "riwayat": [],
-            "kata_kunci_wajib": ["halo", "selamat datang", "ucic", "sela"],
-            "kata_kunci_dilarang": ["olahraga", "perpustakaan"],
-        },
-        {
-            "nama": "Identitas & Profil SELA",
-            "query": "siapa kamu",
-            "riwayat": [],
-            "kata_kunci_wajib": ["sela", "asisten virtual", "ucic"],
-            "kata_kunci_dilarang": ["perpustakaan ucic adalah fasilitas"],
-        },
-        {
-            "nama": "Fakultas dan Program Studi",
-            "query": "Fakultas apa saja yang ada di UCIC?",
-            "riwayat": [],
-            "kata_kunci_wajib": ["fti", "feb", "fps"],
-            "kata_kunci_dilarang": [],
-        },
-        {
-            "nama": "Biaya Kuliah Teknik Informatika",
-            "query": "Berapa biaya kuliah S1 Teknik Informatika?",
-            "riwayat": [],
-            "kata_kunci_wajib": ["teknik informatika", "reguler", "semester"],
-            "kata_kunci_dilarang": [],
-        },
-        {
-            "nama": "Multi-Turn Context Linking (Nyambung)",
-            "query": "Lalu syarat pendaftarannya apa?",
-            "riwayat": [
-                {"role": "user", "text": "Berapa biaya kuliah S1 Teknik Informatika?"},
-                {"role": "assistant", "text": "Biaya S1 Teknik Informatika reguler 3 bulan Rp2.820.000..."},
-            ],
-            "kata_kunci_wajib": ["pendaftaran", "pmb", "ijazah"],
-            "kata_kunci_dilarang": [],
-        },
-    ]
 
-    for k in kasus_uji:
-        t0 = time.time()
-        resp = klien.post(
-            "/api/chat",
-            json={
-                "userQuery": k["query"],
-                "riwayat_obrolan": k["riwayat"],
-                "bahasa": "id",
-            },
+def _jalur_goldens() -> str:
+    return os.path.abspath(os.path.join(_AKAR, "..", "src", "data", "rag_goldens.json"))
+
+
+def _jalur_model_glb() -> str:
+    return os.path.abspath(os.path.join(_AKAR, "..", "public", "models", "sela.glb"))
+
+
+def _nama_animasi_glb(jalur: str) -> set[str]:
+    """
+    Baca daftar nama animasi langsung dari chunk JSON di dalam berkas .glb.
+
+    Dipakai untuk memastikan setiap gerakan yang bisa dipilih `tentukan_gerakan`
+    benar-benar ada sebagai klip di model. Tanpa pemeriksaan ini, mengganti model
+    3D bisa membuat animasi mati senyap (nama klip tidak cocok) tanpa galat apa pun.
+    """
+    if not os.path.exists(jalur):
+        return set()
+    with open(jalur, "rb") as berkas:
+        if berkas.read(4) != b"glTF":
+            return set()
+        berkas.read(8)  # versi + panjang total berkas
+        while True:
+            kepala = berkas.read(8)
+            if len(kepala) < 8:
+                return set()
+            panjang, tipe = struct.unpack("<II", kepala)
+            data = berkas.read(panjang)
+            # Tipe chunk JSON = 'JSON' dibaca little-endian.
+            if tipe == 0x4E4F534A:
+                dokumen = json.loads(data.decode("utf-8"))
+                return {
+                    animasi.get("name", "")
+                    for animasi in dokumen.get("animations", [])
+                }
+            if tipe == 0x004E4942:  # 'BIN\0' -> JSON sudah terlewat
+                return set()
+
+
+def uji_chunker() -> None:
+    print("\n[1] Chunker jendela kalimat")
+    from rag import SentenceWindowChunker
+
+    c = SentenceWindowChunker(chunk_size=512, overlap=80)
+    teks = "Ini kalimat contoh untuk pengujian. " * 120
+    potongan = c.potong(teks)
+    _cek("menghasilkan potongan", len(potongan) > 1, f"({len(potongan)} potongan)")
+    _cek("panjang <= chunk_size", all(len(p.split()) <= 512 for p in potongan))
+    dok = {"id": "x", "title": "Judul", "category": "profil", "keywords": ["a"], "content": teks}
+    chunk = c.bangun_chunk(dok)
+    _cek("bangun_chunk membawa metadata", chunk and chunk[0].judul == "Judul")
+
+
+def uji_embedder() -> None:
+    print("\n[2] Embedder")
+    from rag import dapatkan_embedder
+
+    emb = dapatkan_embedder()
+    print(f"       metode: {emb.metode} ({emb.dimensi} dimensi)")
+    v = emb.encode(["biaya kuliah", "harga ukt"])
+    _cek("vektor berbentuk (2, dim)", getattr(v, "shape", (0,))[0] == 2)
+    import numpy as np
+
+    a = emb.encode("biaya kuliah teknik informatika")
+    b = emb.encode("harga ukt prodi informatika")
+    c = emb.encode("jadwal pertandingan sepak bola")
+    _cek("kemiripan semantik wajar", float(np.dot(a, b)) >= float(np.dot(a, c)))
+
+
+def uji_vector_store() -> None:
+    print("\n[3] Vector store")
+    import numpy as np
+
+    from rag import VectorStore
+
+    vs = VectorStore(dimensi=4)
+    vs.tambah(np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype="float32"), [{"judul": "A"}, {"judul": "B"}])
+    hasil = vs.cari(np.array([0.9, 0.1, 0, 0], dtype="float32"), top_k=1)
+    _cek("pencarian mengembalikan hasil", bool(hasil), f"({vs.metode})")
+    _cek("peringkat teratas benar", hasil and hasil[0][1]["judul"] == "A")
+
+    # ── Persistensi & konsistensi indeks ─────────────────────────────────────
+    # Bug yang pernah terjadi: `simpan()` jalur FAISS membiarkan `vectors.npy`
+    # lama (dimensi berbeda) tertinggal, dan `muat()` tidak memeriksa kecocokan
+    # dimensi maupun jumlah vektor vs metadata — sehingga jalur semantik bisa
+    # mati senyap atau melempar IndexError. Tes ini mengunci perilaku yang benar.
+    import json
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="uji_vs_")
+    try:
+        def _numpy_store(dim: int) -> "VectorStore":
+            """Store yang sejak awal berjalan di jalur NumPy (faiss tidak ada)."""
+            s = VectorStore(dimensi=dim, direktori=tmp)
+            s._faiss = None
+            s._index = None
+            s.metode = "numpy"
+            return s
+
+        def _tulis_meta(dim: int, n: int) -> None:
+            with open(os.path.join(tmp, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(
+                    {"dimensi": dim, "metode": "numpy",
+                     "metadatas": [{"id": f"d{i}"} for i in range(n)]},
+                    f,
+                )
+
+        a = _numpy_store(8)
+        a.tambah(np.random.rand(5, 8).astype("float32"), [{"id": f"d{i}"} for i in range(5)])
+        a.simpan()
+        _cek(
+            "simpan jalur NumPy hanya menulis vectors.npy",
+            sorted(os.listdir(tmp)) == ["meta.json", "vectors.npy"],
+            f"({sorted(os.listdir(tmp))})",
         )
-        dt = time.time() - t0
-        assert resp.status_code == 200, f"Chat gagal: {resp.status_code}"
-        data = resp.json()
-        teks = data.get("text", "").lower()
 
-        print(f"\n[UJI]: {k['nama']} ({dt:.2f}s)")
-        print(f"Query: '{k['query']}'")
-        print(f"Jawaban: {data.get('text', '')[:120]}...")
-
-        for w in k["kata_kunci_wajib"]:
-            assert w in teks, f"Kata kunci wajib '{w}' tidak ditemukan dalam: {teks}"
-
-        for d in k["kata_kunci_dilarang"]:
-            assert d not in teks, f"Kata kunci terlarang '{d}' muncul dalam: {teks}"
-
-        # Uji pencegahan URL ganda pada teks
-        urls = [u for u in data.get("text", "").split() if u.startswith("http")]
-        if urls:
-            assert len(urls) == len(set(urls)), f"Ditemukan duplikasi URL mentah dalam teks: {urls}"
-
-        print(f"-> [LULUS] Respon valid & bebas halusinasi!")
-
-
-def uji_tts_sintesis():
-    print("\n" + "=" * 60)
-    print("3. PENGUJIAN SINTESIS SUARA TTS (OmniVoice Voice Design)")
-    print("=" * 60)
-
-    kalimat_uji = [
-        ("Halo! Selamat datang di Universitas Catur Insan Cendekia Cirebon.", "id"),
-    ]
-
-    for teks, lang in kalimat_uji:
-        # Panggilan pertama (generasi neural)
-        t0 = time.time()
-        resp = klien.post(
-            "/api/sintesis",
-            json={"teks_kalimat": teks, "bahasa": lang},
+        b = VectorStore(dimensi=8, direktori=tmp)
+        b.tambah(np.random.rand(5, 8).astype("float32"), [{"id": f"d{i}"} for i in range(5)])
+        b.simpan()
+        _cek(
+            "simpan jalur FAISS membuang vectors.npy lama",
+            sorted(os.listdir(tmp)) == ["index.faiss", "meta.json"],
+            f"({sorted(os.listdir(tmp))})",
         )
-        dt = time.time() - t0
-        assert resp.status_code == 200
-        data = resp.json()
-        b64 = data.get("audio_base64", "")
-        engine = data.get("engine", "")
-        print(f"[{dt:.2f}s] Generasi ({engine}): '{teks[:35]}...' -> {len(b64)} chars b64")
-        assert len(b64) > 1000, "Audio base64 kosong atau terlalu kecil"
 
-        # Panggilan kedua (harus instan via disk/memory cache)
-        t1 = time.time()
-        resp_cache = klien.post(
-            "/api/sintesis",
-            json={"teks_kalimat": teks, "bahasa": lang},
-        )
-        dt_cache = time.time() - t1
-        data_cache = resp_cache.json()
-        print(f"[{dt_cache:.4f}s] Cache Hit ({data_cache.get('engine')}): '{teks[:35]}...'")
-        assert dt_cache < 0.1, "Cache hit harus di bawah 100ms"
+        c = _numpy_store(8)
+        os.remove(os.path.join(tmp, "index.faiss"))
+        np.save(os.path.join(tmp, "vectors.npy"), np.random.rand(5, 8).astype("float32"))
+        _tulis_meta(1024, 5)
+        _cek("muat menolak dimensi tak cocok", c.muat() is False)
+        _tulis_meta(8, 3)
+        _cek("muat menolak jumlah vektor != metadata", c.muat() is False)
+        _tulis_meta(8, 5)
+        _cek("muat menerima indeks yang konsisten", c.muat() is True)
 
-    print("-> [LULUS] Seluruh sintesis audio valid dan caching bekerja instan!")
+        d = _numpy_store(8)
+        d._vektor = np.random.rand(5, 8).astype("float32")
+        d.metadatas = [{"id": "hanya-satu"}]
+        try:
+            n = len(d.cari(np.random.rand(8).astype("float32"), top_k=3))
+            _cek("cari() aman saat jumlah tak sinkron", n == 1, f"(n={n})")
+        except Exception as galat:
+            _cek("cari() aman saat jumlah tak sinkron", False, f"({type(galat).__name__})")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
-def uji_asr_transkripsi():
-    print("\n" + "=" * 60)
-    print("4. PENGUJIAN PENGENAL SUARA ASR (Whisper Offline)")
-    print("=" * 60)
+def uji_lexical() -> None:
+    print("\n[4] Retriever leksikal BM25")
+    from rag.lexical import LexicalIndex
 
-    # 1. Transkripsi berkas WAV asli pengguna
-    jalur_sampel = os.path.join(
-        os.path.dirname(__file__), "voice_samples", "001-id.wav"
+    with open(os.path.join(_AKAR, "..", "src", "data", "ucic_dataset.json"), encoding="utf-8") as f:
+        dok = json.load(f)
+    idx = LexicalIndex(dok)
+    print(f"       {idx.info()}")
+    _cek("indeks terbangun", idx.n > 0)
+
+    kandidat = idx.cari("Siapa dosen lain di FTI yang mengajar mata kuliah Algoritma?", top_k=3)
+    top_ids = [k["dokumen"]["id"] for k in kandidat]
+    _cek("kueri dosen+algoritma -> dosen_fti peringkat 1", bool(top_ids) and top_ids[0] == "dosen_fti", f"({top_ids})")
+
+    kandidat2 = idx.cari("berapa biaya kuliah teknik informatika", top_k=3)
+    top_ids2 = [k["dokumen"]["id"] for k in kandidat2]
+    _cek(
+        "kueri biaya TI -> dokumen biaya TI peringkat 1",
+        bool(top_ids2) and top_ids2[0] == "biaya_teknik_informatika_2026",
+        f"({top_ids2})",
     )
-    if os.path.exists(jalur_sampel):
-        with open(jalur_sampel, "rb") as f:
-            konten_wav = f.read()
 
-        t0 = time.time()
-        resp = klien.post(
-            "/api/transcribe",
-            files={"file": ("sample.wav", io.BytesIO(konten_wav), "audio/wav")},
-            data={"lang": "id"},
-        )
-        dt = time.time() - t0
-        assert resp.status_code == 200
-        data = resp.json()
-        teks_hasil = data.get("text", "")
-        print(f"[{dt:.2f}s] Transkripsi 001-id.wav: '{teks_hasil}'")
-        assert "selamat datang" in teks_hasil.lower() or "asisten" in teks_hasil.lower()
-        print("-> [LULUS] Transkripsi audio asli pengguna akurat!")
+    _cek("kueri di luar kampus ditolak", idx.cari("resep rendang padang", top_k=3) == [])
+    _cek("kueri tokoh luar kampus ditolak", idx.cari("siapa presiden indonesia sekarang", top_k=3) == [])
 
-    # 2. Uji audio hening (VAD harus menolak, tidak halusinasi)
-    buf_hening = io.BytesIO()
-    with wave.open(buf_hening, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(16000)
-        wf.writeframes(struct.pack("<" + "h" * 16000, *([0] * 16000)))
-    buf_hening.seek(0)
+    # Varian PENDEK wajib ikut diuji. Sebelumnya hanya versi panjang di atas yang
+    # diuji, dan versi panjang itu lolos hanya karena satu kecocokan kebetulan
+    # masih di bawah ambang cakupan (1 dari 3 istilah). Pada versi pendek (2
+    # istilah), satu kecocokan kebetulan bernilai cakupan 0,50 sehingga lolos —
+    # mis. "resep rendang" -> koreksi salah ketik 'resep'->'reset' & 'rendang'->
+    # 'renang' yang kebetulan ada di dua dokumen berbeda. Gerbang kini juga
+    # menuntut >= 2 istilah berbeda cocok di SATU dokumen (_MIN_COCOK_DISTINCT).
+    _cek("kueri PENDEK di luar kampus ditolak", idx.cari("resep rendang", top_k=3) == [])
+    _cek("kueri PENDEK tokoh luar kampus ditolak", idx.cari("siapa presiden indonesia", top_k=3) == [])
+    _cek("kueri harian di luar kampus ditolak", idx.cari("cuaca hari ini", top_k=3) == [])
 
-    resp_hening = klien.post(
-        "/api/transcribe",
-        files={"file": ("hening.wav", buf_hening, "audio/wav")},
-        data={"lang": "id"},
+
+def uji_rag() -> None:
+    print("\n[5] RAG engine")
+    from rag import RagEngine
+
+    rag = RagEngine()
+    print(f"       {rag.total_dokumen} dokumen, embedder={rag.embedder.metode}, semantik={rag._semantik_aktif()}")
+    _cek("dokumen termuat", rag.total_dokumen > 0)
+
+    _, dok, ada = rag.bangun_konteks("berapa biaya kuliah teknik informatika")
+    _cek("menemukan dokumen relevan", ada and len(dok) > 0, f"(top: {dok[0]['judul'] if dok else '-'})")
+
+    _, dok_algo, ada_algo = rag.bangun_konteks("Siapa dosen lain di FTI yang mengajar mata kuliah Algoritma?")
+    _cek(
+        "kueri algoritma tidak nyasar ke biaya kuliah",
+        ada_algo and dok_algo and "biaya" not in dok_algo[0]["id"].lower(),
+        f"(top: {dok_algo[0]['id'] if dok_algo else '-'})",
     )
-    assert resp_hening.status_code == 200
-    data_hening = resp_hening.json()
-    print(f"Uji Hening VAD: teks='{data_hening.get('text')}' | sukses={data_hening.get('sukses')}")
-    assert data_hening.get("text") == "", "Audio hening tidak boleh menghasilkan teks halusinasi"
-    print("-> [LULUS] Gerbang energi & VAD menolak hening tanpa halusinasi!")
+
+    _, dok2, ada2 = rag.bangun_konteks("resep rendang padang asli minang")
+    _cek("menolak topik di luar kampus (anti-halusinasi)", not ada2 or len(dok2) == 0)
 
 
-def uji_web_search():
-    """Uji Web Search Real-Time."""
-    print("\n" + "=" * 60)
-    print("5. PENGUJIAN WEB SEARCH REAL-TIME")
-    print("=" * 60)
-    from pencari_web import PencariWeb
-    pencari = PencariWeb()
+def uji_goldens() -> None:
+    print("\n[6] Evaluasi goldens (rag_goldens.json)")
+    from rag import RagEngine
 
-    # Uji deteksi pertanyaan real-time
-    uji_deteksi = [
-        ("Siapa presiden Indonesia sekarang?", True),
-        ("Siapa walikota Cirebon?", True),
-        ("Berapa biaya kuliah UCIC?", False),
-        ("Berita terbaru seputar Cirebon", True),
-    ]
-    for query, expected in uji_deteksi:
-        hasil = pencari.apakah_perlu_web_search(query)
-        assert hasil == expected, f"Deteksi web search salah untuk '{query}': {hasil} != {expected}"
-        print(f"  '{query}' -> perlu_search={hasil} [OK]")
-    print("-> [LULUS] Deteksi pertanyaan real-time akurat!")
+    jalur = _jalur_goldens()
+    if not os.path.exists(jalur):
+        _cek("berkas goldens ada", False, f"({jalur})")
+        return
+    with open(jalur, encoding="utf-8") as f:
+        goldens = json.load(f)
 
-
-def uji_pengenal_user():
-    """Uji Pengenal Nama User."""
-    print("\n" + "=" * 60)
-    print("6. PENGUJIAN PENGENAL NAMA USER")
-    print("=" * 60)
-    from pengenal_user import PengenalUser
-    pu = PengenalUser()
-    pu.reset()  # Reset untuk testing
-
-    # Awalnya belum dikenal
-    assert not pu.apakah_dikenal()
-    print(f"  Status awal: tidak dikenal [OK]")
-
-    # Ekstraksi nama dari berbagai pola
-    tes_nama = [
-        ("Halo, nama saya Andi", "Andi"),
-        ("panggil aku Rina", "Rina"),
-        ("namaku Sari", "Sari"),
-        ("perkenalkan, saya Joko", "Joko"),
-    ]
-    for pesan, expected_nama in tes_nama:
-        nama = pu.ekstrak_nama_dari_pesan(pesan)
-        assert nama == expected_nama, f"Ekstraksi nama salah: '{pesan}' -> {nama} != {expected_nama}"
-        print(f"  '{pesan}' -> '{nama}' [OK]")
-
-    # Simpan nama
-    pu.simpan_nama("Andi")
-    assert pu.apakah_dikenal()
-    assert pu.nama_user == "Andi"
-    print(f"  Nama disimpan: {pu.nama_user} [OK]")
-
-    # Konteks user
-    konteks = pu.dapatkan_konteks_user()
-    assert "Andi" in konteks
-    print(f"  Konteks user: '{konteks[:60]}...' [OK]")
-
-    # Deteksi kebutuhan tanya nama (saat user belum dikenal)
-    pu.reset()
-    assert pu.deteksi_kebutuhan_nama("halo")
-    assert not pu.deteksi_kebutuhan_nama("berapa biaya kuliah")
-    # Saat user sudah dikenal, tidak perlu tanya nama lagi
-    pu.simpan_nama("Andi")
-    assert not pu.deteksi_kebutuhan_nama("halo")
-    print(f"  Deteksi kebutuhan nama: OK [OK]")
-
-    pu.reset()
-    print("-> [LULUS] Pengenal nama user berfungsi sempurna!")
-
-
-def uji_curhat_intent():
-    """Uji Deteksi Intent Curhat."""
-    print("\n" + "=" * 60)
-    print("7. PENGUJIAN DETEKSI INTENT CURHAT")
-    print("=" * 60)
-    from mesin_rag import MesinRagOffline
-    rag = MesinRagOffline()
-
-    tes_curhat = [
-        "saya bingung memilih jurusan",
-        "aku ragu bisa diterima di UCIC",
-        "orang tua saya tidak setuju saya kuliah",
-        "saya lagi stres nih",
-        "lagi sedih banget",
-        "mau nyerah",
-    ]
-    for query in tes_curhat:
-        intent_data = rag.deteksi_intent_percakapan(query)
-        assert intent_data is not None, f"Curhat tidak terdeteksi: '{query}'"
-        assert intent_data["intent"] == "curhat", f"Intent bukan curhat: {intent_data['intent']}"
-        jawaban = intent_data["jawaban"].lower()
-        assert "sela" in jawaban or "dengar" in jawaban or "empati" in jawaban or "jangan" in jawaban or "di sini" in jawaban
-        print(f"  '{query}' -> intent={intent_data['intent']} [OK]")
-
-    print("-> [LULUS] Deteksi intent curhat berfungsi!")
-
-
-def uji_auto_correct_asr():
-    """Uji Auto-Correct ASR."""
-    print("\n" + "=" * 60)
-    print("8. PENGUJIAN AUTO-CORRECT ASR")
-    print("=" * 60)
-    from koreksi_asr import KoreksiAsr
-    koreksi = KoreksiAsr()
-
-    tes_koreksi = [
-        ("halo halo sela", "Halo SELA"),
-        ("gmn cara daftar maba", "Gimana cara daftar mahasiswa baru"),
-        ("brapa uktinya", "Berapa ukt"),
-        ("biyaya kuliah", "Biaya kuliah"),
-        ("informatka di ucic", "Informatika di UCIC"),
-    ]
-    for teks_asli, expected_prefix in tes_koreksi:
-        hasil = koreksi.koreksi_teks(teks_asli)
-        print(f"  ASL: '{teks_asli}'")
-        print(f"  KRS: '{hasil}'")
-        # Cek minimal ada koreksi yang dilakukan
-        assert hasil != teks_asli or teks_asli.lower() == hasil.lower(), \
-            f"Tidak ada koreksi untuk: '{teks_asli}'"
-
-    print("-> [LULUS] Auto-correct ASR berfungsi!")
-
-
-def uji_mcp_status():
-    """Uji Status MCP Server."""
-    print("\n" + "=" * 60)
-    print("9. PENGUJIAN MCP SERVER STATUS")
-    print("=" * 60)
-    resp = klien.get("/api/mcp/status")
-    assert resp.status_code == 200
-    data = resp.json()
-    print(f"  Endpoint A: {data.get('endpoint_a_aktif')}")
-    print(f"  Endpoint B: {data.get('endpoint_b_aktif')}")
-    print(f"  Menjalankan: {data.get('menjalankan')}")
-    print(f"  Pesan masuk: {data.get('jumlah_pesan_masuk')}")
-    assert "endpoint_a_aktif" in data
-    assert "endpoint_b_aktif" in data
-    assert "menjalankan" in data
-    print("-> [LULUS] MCP server status dapat diakses!")
-
-
-def uji_duplikasi_teks():
-    """Uji pembersihan duplikasi teks."""
-    print("\n" + "=" * 60)
-    print("10. PENGUJIAN BERSIHKAN DUPLIKASI TEKS")
-    print("=" * 60)
-    from server import _bersihkan_duplikasi_teks
-
-    tes_duplikasi = [
-        ("Halo. Halo. Selamat datang.", "Halo. Selamat datang."),
-        ("Info pertama. Info pertama. Info kedua.", "Info pertama. Info kedua."),
-        ("Biaya kuliah 3 juta. Biaya kuliah 3 juta.", "Biaya kuliah 3 juta."),
-    ]
-    for teks_input, expected in tes_duplikasi:
-        hasil = _bersihkan_duplikasi_teks(teks_input)
-        # Cek tidak ada kalimat berulang
-        print(f"  Input: '{teks_input}'")
-        print(f"  Output: '{hasil}'")
-        # Verifikasi tidak ada pengulangan
-        assert hasil != teks_input, f"Duplikasi tidak dibersihkan: '{teks_input}' -> '{hasil}'"
-
-    print("-> [LULUS] Pembersihan duplikasi teks berfungsi!")
-
-
-def uji_non_kampus_hidup():
-    """Uji deteksi intent non-kampus solusi hidup."""
-    print("\n" + "=" * 60)
-    print("11. PENGUJIAN INTENT NON-KAMPUS SOLUSI HIDUP")
-    print("=" * 60)
-    from mesin_rag import MesinRagOffline
-    rag = MesinRagOffline()
-
-    tes_solusi = [
-        "gimana cara belajar efektif?",
-        "tips agar rajin belajar",
-        "gimana cara fokus kuliah",
-    ]
-    for query in tes_solusi:
-        intent_data = rag.deteksi_intent_percakapan(query)
-        if intent_data:
-            print(f"  '{query}' -> intent={intent_data['intent']} [OK]")
-            assert intent_data["intent"] in ("solusi_hidup", "curhat"), \
-                f"Intent tidak sesuai: {intent_data['intent']}"
+    rag = RagEngine()
+    lulus = 0
+    gagal_ids = []
+    for g in goldens:
+        kueri = g.get("query", "")
+        diharapkan = set(g.get("expected_ids") or [])
+        _, dok, _ = rag.bangun_konteks(kueri)
+        terambil = [d["id"] for d in dok]
+        if diharapkan & set(terambil):
+            lulus += 1
         else:
-            print(f"  '{query}' -> None (tidak terdeteksi) [SKIP]")
+            gagal_ids.append((g.get("id"), kueri, terambil[:3]))
 
-    print("-> [LULUS] Intent non-kampus solusi hidup berfungsi!")
+    rasio = lulus / len(goldens) if goldens else 0.0
+    print(f"       goldens lulus: {lulus}/{len(goldens)} ({rasio * 100:.1f}%)")
+    for gid, kueri, terambil in gagal_ids[:8]:
+        print(f"         - {gid}: '{kueri}' -> {terambil}")
+    _cek("rasio goldens >= 85%", rasio >= 0.85, f"({rasio * 100:.1f}%)")
+
+
+def uji_campus_tool() -> None:
+    print("\n[7] Campus tool")
+    from tools import dapatkan_campus_tool
+
+    alat = dapatkan_campus_tool()
+    _cek("deteksi sapaan", (alat.deteksi_intent("halo") or {}).get("intent") == "sapaan")
+    _cek("deteksi identitas", (alat.deteksi_intent("siapa kamu") or {}).get("intent") == "identitas")
+    _cek("deteksi terima kasih", (alat.deteksi_intent("makasih ya") or {}).get("intent") == "terima_kasih")
+    _, dok, ada = alat.cari("beasiswa")
+    _cek("pencarian kampus berjalan", ada, f"({[d['judul'] for d in dok][:1]})")
+
+
+def uji_curhat_tool() -> None:
+    print("\n[8] Curhat tool")
+    from tools import dapatkan_curhat_tool
+
+    alat = dapatkan_curhat_tool()
+    _cek("deteksi curhat", (alat.deteksi("aku takut gak diterima kuliah") or {}).get("intent") == "curhat")
+    _cek("deteksi tips", (alat.deteksi("gimana cara biar fokus belajar") or {}).get("intent") == "tips")
+    _cek("respons empatik non-kosong", len(alat.jawab("aku bingung milih jurusan")) > 20)
+
+
+def uji_web_search() -> None:
+    print("\n[9] Web search")
+    from tools import dapatkan_web_search
+
+    alat = dapatkan_web_search()
+    print(f"       mesin: {alat.info()['mesin']}")
+    _cek("deteksi real-time", alat.perlu_web_search("siapa presiden indonesia sekarang"))
+    _cek("bukan real-time untuk topik kampus", not alat.perlu_web_search("berapa biaya kuliah ucic"))
+
+
+def uji_tts() -> None:
+    print("\n[10] TTS Piper")
+    from core import dapatkan_tts
+
+    tts = dapatkan_tts()
+    _cek("mesin TTS siap", tts.apakah_siap, f"({tts.nama_model_aktif})")
+    if tts.apakah_siap:
+        data = tts.sintesis_wav_bytes("Halo, saya SELA.", "id")
+        _cek("sintesis menghasilkan WAV", bool(data) and data[:4] == b"RIFF", f"({len(data or b'')} byte)")
+        _cek("singleton stabil", dapatkan_tts() is tts)
+
+
+def uji_stt() -> None:
+    print("\n[11] STT (gerbang energi, tanpa file tmp)")
+    from core import dapatkan_stt
+
+    stt = dapatkan_stt()
+    print(f"       model: {stt.nama_model_aktif or '-'} ({stt.perangkat_aktif or '-'})")
+    hasil_pendek = stt.transkripsikan_bytes(b"123")
+    _cek("audio terlalu pendek ditolak", hasil_pendek.get("teks") == "")
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(16000)
+        w.writeframes(b"\x00\x00" * 16000)
+    hasil_hening = stt.transkripsikan_bytes(buf.getvalue())
+    _cek("audio hening ditolak", hasil_hening.get("teks") == "", f"({hasil_hening.get('pesan')})")
+
+
+def uji_vad() -> None:
+    print("\n[12] VAD")
+    import numpy as np
+
+    from core import dapatkan_vad
+    from core.vad_engine import UKURAN_BINGKAI
+
+    v = dapatkan_vad()
+    v.reset()
+    print(f"       metode: {v.metode_aktif}")
+    hening = np.zeros(UKURAN_BINGKAI, dtype=np.int16).tobytes()
+    bicara = (np.sin(np.linspace(0, 6.28 * 60, UKURAN_BINGKAI)) * 12000).astype(np.int16).tobytes()
+    peristiwa = [v.proses_bingkai(bicara) for _ in range(6)]
+    _cek("mendeteksi SPEECH_START", "SPEECH_START" in peristiwa)
+    akhir = [v.proses_bingkai(hening) for _ in range(30)]
+    _cek("mendeteksi SPEECH_END", "SPEECH_END" in akhir)
+
+
+def uji_prompts() -> None:
+    print("\n[13] Prompt library")
+    from prompts import (
+        ATURAN_ANTI_NOISE,
+        ATURAN_PERTANYAAN_LANJUTAN,
+        CAMPUS_RAG_ANTI_HALU,
+        CURHAT_PROMPT,
+        GREETING_VARIATIF,
+        LUAR_TOPIK_PROMPT,
+        MASTER_PERSONA,
+        ROUTER_PROMPT,
+        WEB_SEARCH_PROMPT,
+        pesan_sistem_kampus,
+        pesan_sistem_umum,
+    )
+
+    _cek("MASTER_PERSONA ada", len(MASTER_PERSONA) > 100)
+    _cek("ROUTER_PROMPT ada", "{pesan}" in ROUTER_PROMPT)
+    _cek("CAMPUS_RAG_ANTI_HALU ada", "{konteks}" in CAMPUS_RAG_ANTI_HALU)
+    _cek("WEB_SEARCH_PROMPT ada", "{konteks_web}" in WEB_SEARCH_PROMPT)
+    _cek("CURHAT_PROMPT ada", "{pertanyaan}" in CURHAT_PROMPT)
+    _cek("LUAR_TOPIK_PROMPT ada", "{pertanyaan}" in LUAR_TOPIK_PROMPT)
+    _cek("GREETING_VARIATIF punya >=4 slot", len(GREETING_VARIATIF) >= 4)
+    _cek("ATURAN_ANTI_NOISE menyebut IGNORE_NOISE", "[IGNORE_NOISE]" in ATURAN_ANTI_NOISE)
+    _cek("ATURAN_PERTANYAAN_LANJUTAN ada", "[Pertanyaan" in ATURAN_PERTANYAAN_LANJUTAN)
+    _cek("pesan_sistem_kampus terformat", "DOKUMEN RESMI" in pesan_sistem_kampus("KONTEKS", "tanya"))
+    _cek("pesan_sistem_umum terformat", "LUAR KAMPUS" in pesan_sistem_umum("tanya"))
+
+
+def uji_routing() -> None:
+    print("\n[14] Routing ranah (kampus / umum / real-time)")
+    import server
+
+    _cek("deteksi topik kampus", server.apakah_topik_kampus("berapa biaya kuliah TI"))
+    _cek("bukan topik kampus", not server.apakah_topik_kampus("resep rendang padang"))
+
+    r_kampus = server.susun_rencana("berapa biaya kuliah teknik informatika", [], "id")
+    _cek("rute kampus benar", r_kampus["jalur"] == "kampus", f"({r_kampus['jalur']})")
+
+    r_umum = server.susun_rencana("cara membuat rendang padang", [], "id")
+    _cek("rute umum benar", r_umum["jalur"] == "umum", f"({r_umum['jalur']})")
+
+    r_kosong = server.susun_rencana("apakah ada jurusan kedokteran di UCIC", [], "id")
+    _cek("rute kampus_kosong untuk topik kampus tak tercatat", r_kosong["jalur"] in ("kampus_kosong", "kampus"), f"({r_kosong['jalur']})")
+
+    # ── Gerakan avatar: setiap nama yang bisa dipilih harus ada di model 3D ──
+    # Semua cabang tentukan_gerakan disapu, lalu hasilnya dicek terhadap klip
+    # yang benar-benar ada di public/models/sela.glb. Tanpa ini, mengganti model
+    # bisa mematikan animasi secara senyap (nama klip tidak cocok, tanpa galat).
+    kombinasi = [
+        ("intent", i)
+        for i in ("sapaan", "identitas", "terima_kasih", "penutup", None, "lain")
+    ] + [(j, None) for j in ("kampus_kosong", "umum", "kampus", "web", "curhat")]
+    dipilih = {server.tentukan_gerakan(j, i) for j, i in kombinasi}
+    _cek("tentukan_gerakan selalu mengembalikan nama", "" not in dipilih, f"({sorted(dipilih)})")
+
+    nama_glb = _nama_animasi_glb(_jalur_model_glb())
+    _cek("sela.glb terbaca", bool(nama_glb), f"({len(nama_glb)} animasi)")
+    hilang = sorted(dipilih - nama_glb)
+    _cek(
+        "semua gerakan ada di sela.glb",
+        not hilang,
+        f"(hilang: {hilang})" if hilang else f"({sorted(dipilih)})",
+    )
+
+
+def uji_server() -> None:
+    print("\n[15] Server FastAPI (TestClient)")
+    try:
+        from fastapi.testclient import TestClient
+
+        import server
+
+        klien = TestClient(server.aplikasi_server)
+        resp = klien.get("/kesehatan")
+        _cek("GET /kesehatan", resp.status_code == 200, f"({resp.json().get('status')})")
+        data = resp.json()
+        _cek("RAG terindeks", data.get("total_dokumen_rag", 0) > 0)
+        _cek("retriever leksikal aktif", data.get("retriever_leksikal") == "bm25-lexical")
+        _cek("TTS siap", data.get("tts_siap") is True)
+        _cek("LLM terdeteksi", "model_llm_tersedia" in data)
+
+        resp_chat = klien.post("/api/chat", json={"userQuery": "halo", "riwayat_obrolan": []})
+        _cek("POST /api/chat", resp_chat.status_code == 200 and bool(resp_chat.json().get("text")))
+
+        # Kontrak frontend: /api/chat wajib menyertakan `gerakan` agar animasi 3D
+        # bisa dipicu. Nilainya harus salah satu klip yang ada di model.
+        gerakan_chat = resp_chat.json().get("gerakan")
+        _cek(
+            "POST /api/chat menyertakan gerakan valid",
+            gerakan_chat in {"Greeting", "Goodbye", "Confused", "Nodding", "Shaking Head"},
+            f"({gerakan_chat})",
+        )
+
+        resp_umum = klien.post("/api/chat", json={"userQuery": "cara membuat rendang padang", "riwayat_obrolan": []})
+        body_umum = resp_umum.json()
+        _cek("POST /api/chat off-campus dijawab", resp_umum.status_code == 200 and bool(body_umum.get("text")), f"(jalur={body_umum.get('jalur')})")
+
+        resp_tts = klien.post("/api/sintesis", json={"teks_kalimat": "Halo", "bahasa": "id"})
+        _cek("POST /api/sintesis", resp_tts.status_code == 200)
+    except Exception as galat:  # pragma: no cover
+        _cek("server dapat diuji", False, f"({galat})")
+
+
+def uji_unduh_model() -> None:
+    print("\n[16] Pengunduh model (truncate berkas rusak / resume / verifikasi)")
+    import functools
+    import http.server
+    import socketserver
+    import tempfile
+    import threading
+
+    import persiapan_model
+
+    # Gerbang keutuhan isi diuji terpisah (uji_embedder); di sini logika unduh.
+    asli = persiapan_model._berkas_model_utuh
+    persiapan_model._berkas_model_utuh = lambda jalur: True
+
+    class PenanganSenyap(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):  # senyapkan log akses saat diuji
+            pass
+
+    peladen = None
+    try:
+        akar = tempfile.mkdtemp(prefix="sela_unduh_")
+        sumber = os.path.join(akar, "srv")
+        os.makedirs(sumber)
+        muatan = os.urandom(2 * 1024 * 1024)
+        with open(os.path.join(sumber, "model.bin"), "wb") as berkas:
+            berkas.write(muatan)
+
+        penangan = functools.partial(PenanganSenyap, directory=sumber)
+        peladen = socketserver.TCPServer(("127.0.0.1", 0), penangan)
+        threading.Thread(target=peladen.serve_forever, daemon=True).start()
+        url = f"http://127.0.0.1:{peladen.server_address[1]}/model.bin"
+
+        # Berkas lokal KELEWAT BESAR (sisa unduhan paralel) -> wajib di-truncate.
+        # Regresi: dulu dibuka mode "ab" sehingga unduhan baru DITAMBAHKAN ke
+        # berkas lama dan hasilnya makin rusak (berkas jadi ~2x ukuran).
+        tujuan = os.path.join(akar, "model.bin")
+        with open(tujuan, "wb") as berkas:
+            berkas.write(b"X" * (5 * 1024 * 1024))
+        persiapan_model._unduh_satu(url, tujuan)
+        with open(tujuan, "rb") as berkas:
+            isi = berkas.read()
+        _cek(
+            "berkas kelewat besar di-truncate, bukan ditambahkan",
+            isi == muatan,
+            f"({len(isi)} byte, harap {len(muatan)})",
+        )
+
+        # Berkas sudah lengkap -> dilewati tanpa unduh ulang.
+        persiapan_model._unduh_satu(url, tujuan)
+        _cek("berkas lengkap dilewati", os.path.getsize(tujuan) == len(muatan))
+    finally:
+        persiapan_model._berkas_model_utuh = asli
+        if peladen is not None:
+            peladen.shutdown()
+            peladen.server_close()
+
+
+def main() -> int:
+    print("=" * 64)
+    print(" [SELA AI Desktop] Uji Asap Arsitektur Baru")
+    print("=" * 64)
+    uji_chunker()
+    uji_embedder()
+    uji_vector_store()
+    uji_lexical()
+    uji_rag()
+    uji_goldens()
+    uji_campus_tool()
+    uji_curhat_tool()
+    uji_web_search()
+    uji_tts()
+    uji_stt()
+    uji_vad()
+    uji_prompts()
+    uji_unduh_model()
+    if os.environ.get("SELA_UJI_SERVER") == "1":
+        uji_routing()
+        uji_server()
+    else:
+        print("\n[14/15] Routing & Server FastAPI dilewati (set SELA_UJI_SERVER=1 untuk menguji).")
+
+    print("\n" + "=" * 64)
+    print(f" HASIL: {LULUS} lulus, {GAGAL} gagal")
+    print("=" * 64)
+    return 1 if GAGAL else 0
 
 
 if __name__ == "__main__":
-    t_mulai = time.time()
-    uji_kesehatan()
-    uji_rag_goldens()
-    uji_tts_sintesis()
-    uji_asr_transkripsi()
-    uji_web_search()
-    uji_pengenal_user()
-    uji_curhat_intent()
-    uji_auto_correct_asr()
-    uji_mcp_status()
-    uji_duplikasi_teks()
-    uji_non_kampus_hidup()
-    total_waktu = time.time() - t_mulai
-    print("\n" + "=" * 60)
-    print(f"SELURUH PENGUJIAN SELESAI & LULUS 100% DALAM {total_waktu:.2f} DETIK!")
-    print("=" * 60)
+    sys.exit(main())

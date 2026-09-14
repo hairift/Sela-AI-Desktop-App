@@ -18,9 +18,21 @@ if [ ! -d "node_modules" ]; then
     npm install
 fi
 
-# 2. Jalankan Mesin AI Offline
+# 2. Pilih interpreter Python yang benar-benar punya dependensi SELA (fastapi + uvicorn)
+if python3 -c "import fastapi, uvicorn" 2>/dev/null; then
+    PYEXE=python3
+elif python -c "import fastapi, uvicorn" 2>/dev/null; then
+    PYEXE=python
+else
+    PYEXE=python3
+    echo "[SELA Desktop] PERINGATAN: fastapi/uvicorn belum terpasang."
+    echo "                Jalankan: pip install -r ai-engine/requirements.txt"
+fi
+echo "[SELA Desktop] Interpreter Python: $PYEXE"
+
+# 3. Jalankan Mesin AI Offline
 echo "[SELA Desktop] Menjalankan Mesin AI Offline (Port 8008)..."
-python3 ai-engine/server.py &
+"$PYEXE" ai-engine/server.py &
 PID_AI=$!
 
 cleanup() {

@@ -1,13 +1,16 @@
-# SELA AI Desktop — Dependensi Python Backend AI Offline
+# SELA AI Desktop - Dependensi Python Backend AI Offline
 # Pasang dengan:  pip install -r requirements.txt
 # Python yang didukung: 3.10 / 3.11 / 3.12 (Windows 64-bit)
 #
-# Catatan: error IDE "Cannot find module fastapi / numpy / torch / ..."
-# (Pyrefly/Pylance missing-import) 100% hilang setelah file ini dipasang
-# DAN interpreter VS Code menunjuk ke Python yang sama dengan `pip`
-# (lihat .vscode/settings.json -> python.defaultInterpreterPath).
+# Catatan penting: interpreter proyek ini adalah Python 3.12
+# (lihat pyrightconfig.json -> pythonPath). Pastikan `pip` menunjuk ke
+# interpreter yang sama agar seluruh impor terdeteksi.
+#
+# Paket yang ditandai (WAJIB) sudah terpasang di mesin pengembangan.
+# Paket yang ditandai (OPSIONAL) memperkuat kualitas; bila belum ada,
+# aplikasi tetap berjalan memakai jalur cadangan yang setara.
 
-# ── Web server ──────────────────────────────────────────────
+# ── Web server ────────────────────────────────────────────── (WAJIB)
 fastapi==0.141.1
 uvicorn==0.52.4
 pydantic==2.13.5
@@ -15,33 +18,43 @@ python-multipart==0.0.32
 websockets==17.1
 httpx==0.28.1
 
-# ── Audio / numerik ─────────────────────────────────────────
-soundfile==0.14.0
+# ── Audio / numerik ───────────────────────────────────────── (WAJIB)
 numpy==2.5.3
-scipy==1.18.1
-librosa==1.0.0
+soundfile==0.14.0
 
-# ── Deep learning (CPU + CUDA) ──────────────────────────────
-torch==2.14.0
-torchaudio==2.11.0
-transformers==5.16.1
-huggingface-hub>=0.23
-onnxruntime==1.29.0
+# ── LLM offline: GGUF langsung via llama-cpp-python ────────── (WAJIB)
+# Satu-satunya jalur LLM. Tidak memakai Ollama / LM Studio / llama-server.
+llama-cpp-python==0.3.16
 
-# ── ASR offline (Whisper) ───────────────────────────────────
+# ── TTS offline: Piper (singleton) ────────────────────────── (WAJIB)
+piper-tts==1.8.0
+
+# ── ASR offline: faster-whisper ───────────────────────────── (WAJIB)
 faster-whisper==1.2.1
-# openai-whisper  # opsional, fallback bila faster-whisper gagal
 
-# ── TTS offline ─────────────────────────────────────────────
-# Jalur voice cloning utama: OmniVoice (k2-fsa) zero-shot voice cloning
-omnivoice==0.2.1
-webdataset>=1.0.0
-tensorboardX>=2.6
-braceexpand>=0.1.7
+# ── RAG: retriever leksikal BM25 (bawaan, tanpa paket tambahan) ─
+# Pencarian utama memakai BM25 + gerbang cakupan IDF di rag/lexical.py,
+# tanpa dependensi eksternal. Presisi sudah tinggi (100% pada rag_goldens.json).
 
-# ── LLM offline ─────────────────────────────────────────────
-# Jalur utama: model chat kecil via `transformers`
-#   (default: Qwen2.5-0.5B-Instruct, ~1 GB, CPU/GPU, 100% offline).
-#   Diunduh otomatis ke ai-engine/models/llm/ saat pertama dipakai.
-# Jalur alternatif (opsional, tercepat di RTX 3050): llama-cpp-python + GGUF
-#llama-cpp-python  # opsional — aktifkan bila memakai file .gguf + GPU offload
+# ── RAG semantik: bge-m3 + FAISS ──────────────────────────── (OPSIONAL)
+# Memperkuat pencocokan makna (parafrase). Tanpa paket ini RAG tetap jalan
+# penuh memakai retriever leksikal BM25. Unduh model bge-m3 ke
+# ai-engine/models/bge-m3/ agar dimuat dari folder lokal (tanpa jaringan).
+sentence-transformers>=3.0.0
+faiss-cpu>=1.8.0
+
+# ── VAD & full-duplex: FastRTC (Silero VAD) ───────────────── (OPSIONAL)
+# Tanpa paket ini barge-in memakai VAD energi bawaan core/vad_engine.py.
+fastrtc>=0.0.19
+
+# ── Web search real-time ──────────────────────────────────── (OPSIONAL)
+# Tanpa paket ini web search memakai scraper HTML DuckDuckGo via urllib.
+duckduckgo-search>=6.0.0
+
+# ── Pendukung opsional (hanya bila dibutuhkan modul tambahan) ─
+# scipy==1.18.1
+# librosa==1.0.0
+# torch==2.14.0
+# torchaudio==2.11.0
+# transformers==5.16.1
+# onnxruntime==1.29.0

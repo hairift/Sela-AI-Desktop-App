@@ -1,0 +1,41 @@
+"""Paket prompt SELA AI - semua system prompt terpusat di sela_prompts.py."""
+
+from .sela_prompts import (  # noqa: F401
+    ATURAN_ANTI_NOISE,
+    ATURAN_PERTANYAAN_LANJUTAN,
+    CAMPUS_RAG_ANTI_HALU,
+    CURHAT_PROMPT,
+    GREETING_VARIATIF,
+    GREETING_VARIATIF_EN,
+    KONTAK_FALLBACK,
+    LUAR_TOPIK_PROMPT,
+    MASTER_PERSONA,
+    ROUTER_PROMPT,
+    WEB_SEARCH_PROMPT,
+    instruksi_tanya_nama,
+    pesan_sistem_curhat,
+    pesan_sistem_kampus,
+    pesan_sistem_umum,
+    pesan_sistem_web,
+    sapaan_variatif,
+)
+
+__all__ = [
+    "MASTER_PERSONA",
+    "ROUTER_PROMPT",
+    "CAMPUS_RAG_ANTI_HALU",
+    "WEB_SEARCH_PROMPT",
+    "CURHAT_PROMPT",
+    "LUAR_TOPIK_PROMPT",
+    "GREETING_VARIATIF",
+    "GREETING_VARIATIF_EN",
+    "ATURAN_ANTI_NOISE",
+    "ATURAN_PERTANYAAN_LANJUTAN",
+    "KONTAK_FALLBACK",
+    "pesan_sistem_kampus",
+    "pesan_sistem_web",
+    "pesan_sistem_curhat",
+    "pesan_sistem_umum",
+    "sapaan_variatif",
+    "instruksi_tanya_nama",
+]
