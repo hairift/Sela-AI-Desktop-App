@@ -1640,4 +1640,88 @@ Uji asap **171 lulus / 0 gagal**, goldens **20/20** (tidak ada kode produksi yan
 hanya README dan berkas ini). `SELA_ASR_HENING1`/`SELA_ASR_HENING2` yang sebelumnya hanya
 tercatat di sini kini masuk tabel variabel lingkungan `README.md`.
 
+## 31. Latensi ujung-ke-ujung, dan penjaga untuk PEMICU pemanasan
+
+### 31.1 Latensi yang benar-benar dirasakan pengguna
+A/B pemanasan di §28 diukur pada `llama-server` mentah. Pipa lengkapnya belum pernah
+diukur setelah pemanasan dipasang, jadi kali ini klien WebSocket sungguhan menyambung ke
+`/ws/dupleks` dan mencatat waktunya dari pesan `tanya` dikirim (yaitu saat pengguna
+selesai bertanya) sampai potongan teks pertama, potongan audio pertama, dan `selesai`.
+
+| Giliran | Teks pertama | **Audio pertama** | Selesai | Kalimat |
+| --- | --- | --- | --- | --- |
+| 1 — dingin, riwayat kosong | 2.206 ms | **3.621 ms** | 8.591 ms | 7 |
+| 2 — riwayat kosong | 1.429 ms | **2.011 ms** | 9.892 ms | 12 |
+| 3 — dengan riwayat | 1.682 ms | **2.639 ms** | 4.730 ms | 5 |
+
+Jawaban ketiganya benar dan mengalir (`potongan_audio` = jumlah kalimat, tanpa
+`status_tts_gagal`). Angka pentingnya adalah **audio pertama ±2 detik** pada kondisi
+hangat, bukan total jawaban: setelah suara mulai, sisa jawaban masih didekode di latar
+belakang sementara pengguna sudah mendengar kalimat pertama. Total 9,9 detik pada giliran
+2 tidak terasa sebagai 9,9 detik diam — 12 kalimat itu mengalir berurutan.
+
+Giliran 1 tetap paling lambat (3,6 detik) karena ia menanggung sisa prefill bagian
+dinamis dan pemanasan mesin, meski awalannya sudah ada di cache.
+
+### 31.2 Pemanasan startup terbukti bekerja — dibuktikan langsung, bukan disimpulkan
+Saat mengukur §31.1, baris log `Awalan prompt dipanaskan` **tidak muncul**, dan giliran 1
+memang lebih lambat dari giliran 2 — dua petunjuk yang sama-sama menuduh pemanasan tidak
+berjalan. Ternyata tuduhan itu salah, dan cara memeriksanya perlu dicatat:
+
+- Prompt pemanasan penuh: **1.535 token**.
+- Dikirim ulang setelah startup: hanya **15 token** yang dinilai ulang.
+- Permintaan kontrol (identik, kedua kali): **15 token** juga.
+- Dengan `python -u`, baris log pemanasan **muncul**.
+
+Jadi awalannya benar-benar ada di KV cache. Yang hilang hanyalah **barisnya di log**.
+
+### 31.3 Kenapa baris log-nya hilang (jebakan yang mudah menipu)
+`server.py` dijalankan dengan `stdout` dialihkan ke berkas. Python **menyangga (block
+buffer)** aliran itu, sedangkan proses diakhiri dengan `terminate()` — yang membunuh tanpa
+menjalankan `atexit` dan tanpa membilas buffer. Akibatnya semua `print()` setelah
+pembilasan terakhir hilang, sementara `print()` awal (yang kebetulan sudah terbilas) tetap
+terlihat. **Baris log yang tidak ada bukan bukti bahwa kodenya tidak jalan** — untuk
+kasus seperti ini jalankan dengan `-u` atau buktikan lewat pengukuran langsung.
+
+Satu lagi: `terminate()` pada proses Python **tidak** mematikan `llama-server` anaknya
+(tidak ada `atexit` yang berjalan), dan penyalaan berikutnya akan **memakai ulang** server
+lama itu lewat pemeriksaan kesehatan — jadi periksa proses sisa sebelum mempercayai hasil
+pengukuran.
+
+### 31.4 Audit kontrak ulang: jalur server yang tidak pernah dipakai klien
+Kontrak `/ws/dupleks` dibandingkan ulang setelah §24.6. Server mengirim `mulai_menjawab`,
+`potongan_teks`, `potongan_audio`, `status_tts_gagal`, `selesai`, `interupsi_berhasil`, dan
+`barge_in`. Klien menangani empat di antaranya; tiga sisanya tidak, dan itu **bukan**
+regresi:
+
+- `mulai_menjawab` membawa `gerakan`, `jalur`, `emosi`, `dokumen_rujukan` — tidak dipakai
+  klien, tetapi `gerakan` juga dikirim ulang di `selesai`, jadi tidak ada yang hilang.
+- `interupsi_berhasil` tidak akan pernah terbaca: klien mengirim `interupsi` lalu langsung
+  menutup socket-nya.
+- `barge_in` hanya dipicu bila klien mengirim bingkai `audio_frame` ke `/ws/dupleks`, dan
+  klien yang ada **tidak** melakukannya — ia mengirim PCM mentah ke `/ws/asr-stream` dan
+  melakukan barge-in sendiri di sisi klien (monitor mic + `cancel()`). Jadi jalur barge-in
+  sisi server itu tidak pernah dieksekusi aplikasi yang dikirim.
+
+Dicatat supaya tidak ada yang menyimpulkan barge-in berasal dari server, lalu "memperbaiki"
+sesuatu yang memang tidak dipakai.
+
+### 31.5 Penjaga baru: uji PEMICU, bukan hanya mesinnya
+Seluruh pemeriksaan pemanasan di §28 memanggil metode mesin langsung
+(`llm.hangatkan_awalan`). Artinya semuanya tetap lulus walaupun baris yang **menjalankan**
+utas pemanasan hilang dari `server.py` — padahal tanpa baris itu pemanasan tidak pernah
+berjalan di aplikasi sungguhan dan pertanyaan pertama kembali lambat tanpa satu pun tes
+gagal. Berkas ini memang pernah kehilangan satu baris seperti itu tanpa galat (lihat §29).
+
+Bagian [21] kini menambah dua pemeriksaan: pola pemicu
+(`threading.Thread(...target=_hangatkan_awalan_llm`) wajib masih ada di `server.py`, dan
+fungsi startup-nya wajib bisa dipanggil tanpa galat. Penjaganya dibuktikan **berpengaruh**
+— dengan salinan sementara yang barisnya dihapus, pemeriksaan itu gagal.
+
+### 31.6 Verifikasi
+Uji asap **173 lulus / 0 gagal** (naik dari 171; dua pemeriksaan baru di bagian [21]),
+goldens **20/20**. Tidak ada kode produksi yang berubah pada bagian ini — hanya
+`test_server.py` (dua pemeriksaan + docstring), README, dan berkas ini.
+
+
 

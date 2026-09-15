@@ -23,7 +23,8 @@ Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 18. Penjaga keutuhan bobot (safetensors terpotong & zip rusak)
 19. WebSocket realtime (ASR streaming + jawaban bersuara per kalimat)
 20. Barge-in (interupsi eksplisit + deteksi ucapan VAD) lewat socket nyata
-21. Pemanasan awalan LLM (KV cache llama-server -> token pertama lebih cepat)
+21. Pemanasan awalan LLM (KV cache llama-server -> token pertama lebih cepat),
+    termasuk penjaga bahwa `server.py` benar-benar MENJALANKAN pemanasan itu
 22. Tes frontend node:test (dilewati bila Node tidak ada di PATH)
 
 Jalankan:  python ai-engine/test_server.py
@@ -1321,6 +1322,32 @@ def uji_pemanasan_llm() -> None:
         penuh > 0 and 0 < dinilai < penuh,
         f"({dinilai} dinilai dari {penuh} token system)",
     )
+
+    # 4. PEMICU-nya, bukan hanya mesinnya. Seluruh pemeriksaan di atas memanggil
+    #    metode mesin langsung (`llm.hangatkan_awalan`), jadi semuanya tetap
+    #    lulus walaupun baris yang MENJALANKAN utas pemanasan hilang dari
+    #    `server.py` -- padahal tanpa baris itu pemanasan tidak pernah berjalan
+    #    saat aplikasi sungguhan dipakai, dan pertanyaan pertama kembali lambat
+    #    tanpa satu pun tes gagal. Berkas ini memang pernah kehilangan satu
+    #    baris seperti itu tanpa galat, jadi pemicunya dijaga eksplisit.
+    import re
+
+    with open(server.__file__, encoding="utf-8") as berkas:
+        sumber_server = berkas.read()
+    _cek(
+        "server.py benar-benar menjalankan utas pemanasan awalan",
+        bool(re.search(
+            r"threading\.Thread\(\s*target=_hangatkan_awalan_llm", sumber_server)),
+    )
+    try:
+        server._hangatkan_awalan_llm()
+        _cek("fungsi pemanasan startup dapat dipanggil tanpa galat", True)
+    except Exception as galat:
+        _cek(
+            "fungsi pemanasan startup dapat dipanggil tanpa galat",
+            False,
+            f"({galat})",
+        )
 
 
 def uji_frontend() -> None:

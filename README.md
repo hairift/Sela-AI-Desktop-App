@@ -109,6 +109,14 @@ pertanyaan **pertama** selalu paling lambat. Karena itu server memanaskan awalan
 prompt di latar belakang begitu mesin siap: waktu ke token pertama pertanyaan
 kampus pertama turun dari **2.147 ms menjadi 987 ms (-54%)**.
 
+Diukur ujung-ke-ujung lewat `/ws/dupleks`, dari pertanyaan terkirim sampai suara pertama:
+**±2,0 detik** pada giliran hangat dan ±2,6 detik bila ada riwayat obrolan. Giliran pertama
+masih ±3,6 detik karena menanggung sisa prefill bagian dinamis. Yang menentukan pengalaman
+adalah angka suara pertama itu, bukan total jawaban: setelah suara mulai, sisa jawaban
+masih didekode di latar belakang sementara pengguna sudah mendengar kalimat pertama. Total
+jawaban bisa 5-10 detik karena model kadang menulis lebih panjang daripada yang diminta
+persona (satu kali terukur 12 kalimat), tetapi kalimat-kalimat itu mengalir berurutan.
+
 Angka di atas adalah kondisi terbaik. Kecepatan mesin berubah-ubah cukup besar
 (decode pernah terukur 39 token/detik, pernah juga 7-12 token/detik tanpa perubahan
 kode), jadi sesekali ada giliran yang jauh lebih lambat. Konteks `-c 4096` sendiri
