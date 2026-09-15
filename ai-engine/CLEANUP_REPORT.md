@@ -1509,3 +1509,57 @@ Uji asap **169 lulus / 0 gagal** (naik dari 163; 6 pemeriksaan baru untuk pemana
 awalan), dijalankan **tiga kali berturut-turut** dan ketiganya 169/0 — jalur ASR
 yang sebelumnya gagal sesekali kini stabil.
 
+---
+
+## 29. Dua temuan susulan: istilah mesin lama yang lolos, dan tes frontend yang tidak pernah jalan
+
+### 29.1 Sapuan sebelumnya melewatkan "Voice Cloning"
+Pola sapuan di bagian 25 adalah `piper|whisper|bge-m3|OmniVoice|fuse.js`. Pola itu
+**tidak memuat istilah "Voice Cloning" / "Audio Cloned"** — padahal keduanya juga
+warisan OmniVoice (kemampuan kloning suara yang tidak dimiliki Supertonic 3). Akibatnya
+tiga tempat di kode AKTIF masih menyesatkan:
+
+| Berkas | Sebelum | Sesudah |
+|---|---|---|
+| `src/lib/ai.js` (header) | dua header bertumpuk: "Text-to-Speech" + "Text-to-Speech & Voice Cloning Offline" | satu header: "Text-to-Speech (Supertonic 3, offline dari backend)" |
+| `src/lib/ai.js` (`stopSpeaking`) | "(Audio Cloned & Web Speech)" | "(audio backend & Web Speech)" |
+| `src/lib/ai.js` (`speakText`) | "audio hasil Voice Cloning offline dari backend" | "audio WAV dari backend TTS offline (Supertonic 3)" |
+
+Yang sengaja **dipertahankan**: `speechSynthesis` / Web Speech (masih benar-benar dipakai
+untuk membatalkan suara Web Speech) dan komentar OmniVoice di `src/lib/responsePlan.js`
+(menjelaskan ALASAN sebuah aturan ada — lihat bagian 25).
+
+> Pelajaran: **pola sapuan harus memuat NAMA KEMAMPUAN, bukan hanya nama mesin.** "Voice
+> Cloning" adalah fitur OmniVoice, bukan namanya, sehingga lolos dari daftar kata meski
+> sapuannya sudah dijalankan dua kali.
+
+### 29.2 `src/lib/responsePlan.test.js` tidak pernah dijalankan siapa pun
+Berkas tes frontend itu sudah lama ada (10 tes, memakai `node:test` bawaan Node sehingga
+tidak butuh dependensi tambahan), tetapi:
+
+- `package.json` tidak punya skrip `test`;
+- tidak ada `.github/workflows` maupun CI lain;
+- `test_server.py` tidak memanggilnya.
+
+Artinya invarian terpenting di berkas itu — **TTS membacakan teks PENUH, tanpa
+pemotongan** (persyaratan eksplisit pengguna) — tidak terjaga sama sekali. Tesnya sendiri
+lulus **10/10** saat dijalankan manual; yang hilang hanyalah pemicunya.
+
+Perbaikan:
+
+- `package.json`: tambah `"test": "node --test"`.
+- `test_server.py` bagian **[22]**: menjalankan `node --test` dari akar proyek lalu menilai
+  keluaran `# pass` / `# fail`. Bila Node tidak ada di PATH, bagian ini **dilewati dengan
+  jelas** (bukan dianggap gagal) supaya uji asap tetap bisa dijalankan di mesin yang hanya
+  menyiapkan sisi backend.
+
+> Catatan versi: `node --test <dir>` **tidak** memindai direktori (Node 22 memperlakukannya
+> sebagai modul dan gagal `MODULE_NOT_FOUND`), sedangkan pola glob `src/**/*.test.js` gagal
+> di Node 20 (`Could not find ...`). `node --test` **tanpa argumen** bekerja di keduanya,
+> jadi itu yang dipakai.
+
+### 29.3 Verifikasi
+Uji asap **171 lulus / 0 gagal** (naik dari 169; 2 pemeriksaan baru untuk bagian [22]),
+goldens tetap **20/20**. Bundel `dist/` dibangun ulang (hash tidak berubah karena yang
+diubah hanya komentar, yang memang dibuang saat minifikasi).
+

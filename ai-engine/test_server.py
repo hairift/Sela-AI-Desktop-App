@@ -24,6 +24,7 @@ Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 19. WebSocket realtime (ASR streaming + jawaban bersuara per kalimat)
 20. Barge-in (interupsi eksplisit + deteksi ucapan VAD) lewat socket nyata
 21. Pemanasan awalan LLM (KV cache llama-server -> token pertama lebih cepat)
+22. Tes frontend node:test (dilewati bila Node tidak ada di PATH)
 
 Jalankan:  python ai-engine/test_server.py
 """
@@ -1322,6 +1323,55 @@ def uji_pemanasan_llm() -> None:
     )
 
 
+def uji_frontend() -> None:
+    """
+    Jalankan tes frontend (`node:test`) dari uji asap Python.
+
+    `src/lib/responsePlan.test.js` sudah lama ada tetapi TIDAK pernah dipanggil
+    apa pun: tidak ada skrip npm `test` maupun CI, sehingga invarian
+    terpentingnya -- TTS membacakan teks PENUH, tanpa pemotongan -- sebenarnya
+    tidak terjaga sama sekali.
+
+    Bila Node tidak ada di PATH, bagian ini DILEWATI dengan jelas dan bukan
+    dianggap gagal, supaya uji asap tetap bisa dijalankan di mesin yang hanya
+    menyiapkan sisi backend.
+    """
+    print("\n[22] Tes frontend (node:test)")
+    import re as _re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        print("     (Node tidak ditemukan di PATH; tes frontend dilewati)")
+        return
+
+    akar_proyek = os.path.abspath(os.path.join(_AKAR, ".."))
+    try:
+        hasil = subprocess.run(
+            [node, "--test"],
+            cwd=akar_proyek,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except Exception as galat:  # pragma: no cover
+        _cek("tes frontend dapat dijalankan", False, f"({galat})")
+        return
+
+    keluaran = (hasil.stdout or "") + (hasil.stderr or "")
+    lulus = _re.search(r"^# pass (\d+)", keluaran, _re.MULTILINE)
+    gagal = _re.search(r"^# fail (\d+)", keluaran, _re.MULTILINE)
+    jumlah_lulus = int(lulus.group(1)) if lulus else 0
+    jumlah_gagal = int(gagal.group(1)) if gagal else 0
+    _cek(
+        "tes frontend (responsePlan) benar-benar berjalan",
+        jumlah_lulus > 0,
+        f"({jumlah_lulus} lulus, {jumlah_gagal} gagal)",
+    )
+    _cek("semua tes frontend lulus", jumlah_gagal == 0 and jumlah_lulus > 0)
+
+
 def main() -> int:
     print("=" * 64)
     print(" [SELA AI Desktop] Uji Asap Arsitektur Baru")
@@ -1350,6 +1400,7 @@ def main() -> int:
     # Pemanasan awalan hanya berguna bila prompt pemanasan benar-benar berbagi
     # awalan dengan prompt asli, jadi invarian itu ikut diuji di sini.
     uji_pemanasan_llm()
+    uji_frontend()
     if os.environ.get("SELA_UJI_SERVER") == "1":
         uji_routing()
         uji_server()

@@ -1742,16 +1742,14 @@ export function rapikanJawabanServer(teksMentah, lang = "id", gerakan = null) {
   };
 }
 
-// ── Text-to-Speech ───────────────────────────────────────────────────────────
-
-// ── Text-to-Speech & Voice Cloning Offline ──────────────────────────────────
+// ── Text-to-Speech (Supertonic 3, offline dari backend) ──────────────────────
 
 // Variabel referensi pemutar audio aktif untuk interupsi instan (barge-in)
 let pemutarAudioAktif = null;
 let sesiPemutaranAktif = 0;
 
 /**
- * Menghentikan seluruh pemutaran suara yang sedang berjalan (Audio Cloned & Web Speech)
+ * Menghentikan seluruh pemutaran suara yang sedang berjalan (audio backend & Web Speech)
  */
 export function stopSpeaking() {
   sesiPemutaranAktif += 1;
@@ -1896,7 +1894,7 @@ export function streamChatAndVoice({
 
 
 /**
- * Memainkan suara respon SELA menggunakan audio hasil Voice Cloning offline dari backend
+ * Memainkan suara respon SELA memakai audio WAV dari backend TTS offline (Supertonic 3)
  * @param {string} text Teks yang akan diucapkan
  * @param {function} onStart Callback saat audio mulai bersuara (mengubah avatar ke 'speaking')
  * @param {function} onEnd Callback saat audio selesai (mengubah avatar kembali ke 'idle')

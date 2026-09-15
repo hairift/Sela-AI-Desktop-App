@@ -23,6 +23,27 @@ atau
 .\launch_desktop.ps1
 ```
 
+## Menguji
+
+Satu perintah untuk seluruh uji asap (backend + frontend):
+
+```powershell
+$env:SELA_UJI_SERVER=1; py -3.12 ai-engine/test_server.py
+```
+
+- Bagian 1-13 dan 16-22 selalu jalan; bagian 14-15 (endpoint HTTP) hanya ikut bila
+  `SELA_UJI_SERVER=1`.
+- Bagian 22 menjalankan tes frontend `node:test`; bagian itu **dilewati dengan jelas**
+  bila Node tidak ada di PATH, bukan dianggap gagal.
+- Tes frontend juga bisa dijalankan sendiri: `npm test`.
+
+Bila mengubah berkas di `src/`, bangun ulang `dist/` — `server.py` menyajikan folder itu,
+jadi tanpa langkah ini aplikasi akan menyajikan antarmuka lama:
+
+```bash
+npm run build
+```
+
 ## Mesin AI
 | Bagian | Mesin | Keterangan |
 | --- | --- | --- |
