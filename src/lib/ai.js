@@ -1391,8 +1391,243 @@ export async function transcribeAudio(audioBlob, lang = "id") {
   return text;
 }
 
-// ── Chat Completion ──────────────────────────────────────────────────────────
+// ── ASR Streaming Real-Time (kata per kata) ──────────────────────────────────
 
+const SAMPLE_RATE_ASR = 16000;
+const UKURAN_BLOK_ASR = 4096;
+
+/**
+ * Ubah Float32 [-1,1] pada laju sampel apa pun menjadi PCM 16-bit mono 16 kHz.
+ * AudioContext browser tidak selalu menghormati permintaan sampleRate, jadi
+ * resampling linier dilakukan sendiri. Sisa sampel yang belum cukup satu
+ * sampel keluaran disimpan agar tidak ada diskontinuitas antar blok.
+ */
+function buatPengubahPcm(lajuSumber) {
+  const rasio = lajuSumber / SAMPLE_RATE_ASR;
+  let sisa = new Float32Array(0);
+  return (masukan) => {
+    const gabung = new Float32Array(sisa.length + masukan.length);
+    gabung.set(sisa);
+    gabung.set(masukan, sisa.length);
+    const jumlah = Math.floor(gabung.length / rasio);
+    if (jumlah < 1) {
+      sisa = gabung;
+      return null;
+    }
+    const keluar = new Int16Array(jumlah);
+    for (let i = 0; i < jumlah; i++) {
+      const pos = i * rasio;
+      const i0 = Math.floor(pos);
+      const i1 = Math.min(i0 + 1, gabung.length - 1);
+      const frac = pos - i0;
+      const v = gabung[i0] * (1 - frac) + gabung[i1] * frac;
+      keluar[i] = Math.max(-1, Math.min(1, v)) * 32767;
+    }
+    sisa = gabung.slice(Math.floor(jumlah * rasio));
+    return keluar;
+  };
+}
+
+/**
+ * ASR streaming real-time: mikrofon → teks KATA PER KATA saat pengguna bicara.
+ *
+ * Berbeda dari `transcribeAudio` (unggah blob, tunggu rekaman selesai), fungsi
+ * ini mengalirkan PCM 16 kHz ke WebSocket `/ws/asr-stream` sehingga teks muncul
+ * selagi diucapkan. Server (sherpa-onnx) juga mendeteksi kapan pengguna berhenti
+ * bicara, lalu mengirim `final` — itulah momen SELA mulai menjawab.
+ *
+ * @param {object} opsi
+ * @param {(teks:string)=>void} [opsi.onSiap]   sesi siap (socket + mic aktif)
+ * @param {(teks:string)=>void} [opsi.onParsial] teks sementara (bertambah kata)
+ * @param {(teks:string)=>void} [opsi.onFinal]   teks final (pengguna berhenti)
+ * @param {(err:Error)=>void}   [opsi.onGalat]
+ * @param {string} [opsi.bahasa]
+ * @param {MediaStream} [opsi.stream] mikrofon yang sudah dibuka (opsional)
+ * @returns {{selesai:Function, hentikan:Function, batal:Function, aktif:Function}}
+ */
+export function mulaiAsrStreaming({
+  onSiap,
+  onParsial,
+  onFinal,
+  onGalat,
+  bahasa = "id",
+  stream = null,
+} = {}) {
+  const isSecure = typeof window !== "undefined" && window.location.protocol === "https:";
+  const host =
+    typeof window !== "undefined" &&
+    window.location.host &&
+    !window.location.protocol.startsWith("file")
+      ? window.location.host
+      : "127.0.0.1:8008";
+  const wsUrl = `${isSecure ? "wss:" : "ws:"}//${host}/ws/asr-stream`;
+
+  let socket = null;
+  let ctx = null;
+  let node = null;
+  let sumber = null;
+  let aliran = stream;
+  let milikSendiri = !stream;
+  let berhenti = false;
+  let ditutup = false;
+  let sudahFinal = false;
+
+  const bersihkan = () => {
+    if (ditutup) return;
+    ditutup = true;
+    try {
+      node?.disconnect();
+    } catch (_) {} // eslint-disable-line no-empty
+    try {
+      sumber?.disconnect();
+    } catch (_) {} // eslint-disable-line no-empty
+    try {
+      if (ctx && ctx.state !== "closed") ctx.close().catch(() => {});
+    } catch (_) {} // eslint-disable-line no-empty
+    if (milikSendiri) {
+      try {
+        aliran?.getTracks().forEach((t) => t.stop());
+      } catch (_) {} // eslint-disable-line no-empty
+    }
+    aliran = null;
+    try {
+      if (socket && socket.readyState === WebSocket.OPEN) socket.close();
+    } catch (_) {} // eslint-disable-line no-empty
+    socket = null;
+  };
+
+  const kirimPesan = (objek) => {
+    try {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(objek));
+        return true;
+      }
+    } catch (_) {} // eslint-disable-line no-empty
+    return false;
+  };
+
+  const pasangMikrofon = async () => {
+    if (!aliran) {
+      aliran = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: { ideal: true },
+          noiseSuppression: { ideal: true },
+          autoGainControl: { ideal: true },
+          channelCount: { ideal: 1 },
+        },
+      });
+    }
+    const Laju = window.AudioContext || window.webkitAudioContext;
+    // Minta 16 kHz langsung; bila ditolak browser, resampler di bawah menutupinya.
+    try {
+      ctx = new Laju({ sampleRate: SAMPLE_RATE_ASR });
+    } catch (_) {
+      ctx = new Laju();
+    }
+    if (ctx.state === "suspended") {
+      try {
+        await ctx.resume();
+      } catch (_) {} // eslint-disable-line no-empty
+    }
+    sumber = ctx.createMediaStreamSource(aliran);
+    node = ctx.createScriptProcessor(UKURAN_BLOK_ASR, 1, 1);
+    const ubah = buatPengubahPcm(ctx.sampleRate);
+    node.onaudioprocess = (ev) => {
+      if (berhenti || sudahFinal) return;
+      if (!socket || socket.readyState !== WebSocket.OPEN) return;
+      const pcm = ubah(ev.inputBuffer.getChannelData(0));
+      if (pcm && pcm.length) socket.send(pcm.buffer);
+    };
+    // ScriptProcessor hanya berjalan bila terhubung ke tujuan. Gain 0 dipakai
+    // supaya suara mikrofon TIDAK ikut keluar lewat speaker (tidak ada gema).
+    const senyap = ctx.createGain();
+    senyap.gain.value = 0;
+    sumber.connect(node);
+    node.connect(senyap);
+    senyap.connect(ctx.destination);
+    if (onSiap) onSiap();
+  };
+
+  const mulai = async () => {
+    try {
+      socket = new WebSocket(wsUrl);
+    } catch (err) {
+      if (onGalat) onGalat(err);
+      return false;
+    }
+    socket.binaryType = "arraybuffer";
+
+    socket.onopen = () => kirimPesan({ tipe: "mulai", bahasa });
+
+    socket.onmessage = (event) => {
+      let data;
+      try {
+        data = JSON.parse(event.data);
+      } catch (_) {
+        return; // eslint-disable-line no-empty
+      }
+      if (data.tipe === "siap") {
+        pasangMikrofon().catch((err) => {
+          if (onGalat) onGalat(err);
+          bersihkan();
+        });
+      } else if (data.tipe === "parsial") {
+        if (onParsial) onParsial(data.teks || "");
+      } else if (data.tipe === "final") {
+        if (sudahFinal) return;
+        sudahFinal = true;
+        if (onFinal) onFinal(data.teks || "");
+        bersihkan();
+      } else if (data.tipe === "galat") {
+        if (onGalat) onGalat(new Error(data.pesan || "ASR streaming gagal"));
+        bersihkan();
+      }
+    };
+
+    socket.onerror = () => {
+      if (onGalat) onGalat(new Error("Koneksi ASR streaming terputus"));
+    };
+    socket.onclose = () => {
+      bersihkan();
+    };
+    return true;
+  };
+
+  /** Minta teks final lalu tutup (dipakai saat tombol mikrofon ditekan lagi). */
+  const hentikan = () => {
+    if (sudahFinal || ditutup) {
+      bersihkan();
+      return;
+    }
+    berhenti = true;
+    if (!kirimPesan({ tipe: "selesai" })) {
+      if (onFinal) onFinal("");
+      bersihkan();
+      return;
+    }
+    // Jaring pengaman bila server tidak sempat menjawab.
+    setTimeout(() => {
+      if (!sudahFinal) {
+        sudahFinal = true;
+        if (onFinal) onFinal("");
+        bersihkan();
+      }
+    }, 1500);
+  };
+
+  /** Buang sesi berjalan tanpa memakai hasilnya. */
+  const batal = () => {
+    berhenti = true;
+    kirimPesan({ tipe: "batal" });
+    bersihkan();
+  };
+
+  const aktif = () => !ditutup && !sudahFinal;
+
+  return { mulai, hentikan, batal, aktif };
+}
+
+// ── Chat Completion ──────────────────────────────────────────────────────────
 /**
  * Minta jawaban SELA dari backend. Klien tipis: hanya membersihkan transkrip,
  * mendeteksi bahasa, lalu mengirim { userQuery, riwayat_obrolan, bahasa }.
@@ -1415,7 +1650,7 @@ export async function getChatCompletion(messageHistory, lang = "id") {
 
   // ── Backend adalah OTAK TUNGGAL ─────────────────────────────────────────
   // Kirim pertanyaan mentah + riwayat saja. Seluruh RAG (leksikal BM25 +
-  // semantik bge-m3), routing niat, web search, dan penyusunan prompt
+  // semantik multilingual-e5-small), routing niat, web search, dan penyusunan prompt
   // dikerjakan server. Konteks TIDAK lagi dibangun di sini agar tidak ada dua
   // mesin retrieval yang bertabrakan (dulu Fuse.js di sini vs RAG backend).
   const riwayat = messageHistory
@@ -1467,6 +1702,43 @@ export async function getChatCompletion(messageHistory, lang = "id") {
     // Confused, Nodding, Shaking Head) agar animasi 3D sinkron dengan respons.
     gerakan: data.gerakan || null,
     detectedLang: effectiveLang,
+  };
+}
+
+/**
+ * Rapikan teks jawaban mentah dari WebSocket streaming menjadi bentuk yang sama
+ * dengan hasil `getChatCompletion` (teks tampil, teks suara, saran lanjutan).
+ *
+ * Dipakai jalur real-time: server mengirim satu teks penuh di akhir aliran,
+ * jadi pembersihannya disamakan persis dengan jalur REST agar tampilan dan
+ * suara tidak berbeda antara kedua jalur.
+ *
+ * @param {string} teksMentah
+ * @param {string} lang
+ * @param {string|null} gerakan
+ */
+export function rapikanJawabanServer(teksMentah, lang = "id", gerakan = null) {
+  const mentah = teksMentah || "";
+  if (mentah.trim().includes("[IGNORE_NOISE]")) {
+    return {
+      text: "[IGNORE_NOISE]",
+      spokenText: "",
+      suggestions: [],
+      media: [],
+      gerakan: null,
+      detectedLang: lang,
+    };
+  }
+  const { text: cleanText, suggestions } = parseSuggestions(mentah);
+  const displayText = cleanText || "Maaf, SELA agak bingung. Bisa diulang?";
+  const spokenText = buildSpokenText(displayText, null, lang, []);
+  return {
+    text: displayText,
+    spokenText,
+    suggestions,
+    media: [],
+    gerakan: gerakan || null,
+    detectedLang: lang,
   };
 }
 
@@ -1649,14 +1921,14 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
   const akhiriKegagalanTts = () => {
     if (!masihSesiAktif() || fallbackDimulai) return;
     fallbackDimulai = true;
-    console.warn("[SELA TTS] Audio Piper gagal diputar; tidak mengganti suara SELA dengan engine lain.");
+    console.warn("[SELA TTS] Audio Supertonic 3 gagal diputar; tidak mengganti suara SELA dengan engine lain.");
     selesai();
   };
 
-  // Hanya gunakan audio Piper agar karakter suara SELA konsisten.
+  // Hanya gunakan audio Supertonic 3 agar karakter suara SELA konsisten.
   try {
     const controller = new AbortController();
-    // Sintesis Piper pada CPU bisa butuh waktu untuk kalimat panjang.
+    // Sintesis Supertonic 3 pada CPU bisa butuh waktu untuk kalimat panjang.
     // Timeout lama mencegah audio dibatalkan tepat sebelum siap.
     const timeoutId = setTimeout(() => controller.abort(), 120000);
 
@@ -1699,7 +1971,7 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
         };
 
         audio.onerror = (galatAudio) => {
-          console.warn("[SELA TTS] Kendala pemutaran audio Piper:", galatAudio);
+          console.warn("[SELA TTS] Kendala pemutaran audio Supertonic 3:", galatAudio);
           URL.revokeObjectURL(audioUrl);
           if (masihSesiAktif()) pemutarAudioAktif = null;
           akhiriKegagalanTts();

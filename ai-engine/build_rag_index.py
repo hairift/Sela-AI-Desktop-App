@@ -3,7 +3,7 @@ SELA AI Desktop - Pembangun Indeks RAG Vektor
 =============================================
 Membaca dataset resmi UCIC (src/data/ucic_dataset.json atau ai-engine/data/*.json),
 memotongnya dengan chunker jendela kalimat (512 token, overlap 80), meng-embed
-dengan bge-m3, lalu menyimpan indeks FAISS ke:
+dengan multilingual-e5-small, lalu menyimpan indeks FAISS ke:
 
     ai-engine/rag/vector_store/faiss_index/
 
@@ -26,7 +26,7 @@ from rag import RagEngine  # noqa: E402
 
 def main() -> None:
     print("=" * 64)
-    print(" [SELA] Membangun indeks RAG vektor (FAISS + bge-m3)")
+    print(" [SELA] Membangun indeks RAG vektor (FAISS + multilingual-e5-small)")
     print("=" * 64)
     mulai = time.time()
     rag = RagEngine()

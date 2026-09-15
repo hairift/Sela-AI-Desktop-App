@@ -15,6 +15,9 @@ dist-ssr
 # Model & cache besar (diunduh ulang via script, jangan push ke GitHub)
 /models/
 ai-engine/models/
+# Indeks FAISS dihasilkan oleh ai-engine/build_rag_index.py (jalankan ulang bila
+# dataset berubah) -- jangan ikut dipush.
+ai-engine/rag/vector_store/faiss_index/
 ai-engine/cache_audio/
 ai-engine/voice_samples/*.wav
 ai-engine/data_user.json

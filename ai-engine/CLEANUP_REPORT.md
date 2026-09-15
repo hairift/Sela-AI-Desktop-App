@@ -916,3 +916,222 @@ Blok yang memuat baris daftar tidak pernah dipecah.
 - Saat menguji, port 8008 sudah dipakai server lama sehingga server uji gagal bind
   (`Errno 10048`). Server uji dijalankan di port lain (`PORT_SELA_AI=8123`) agar tidak
   mengganggu server milik pengguna. **Selalu pastikan hanya satu server per port.**
+
+---
+
+## 22. Penggantian tiga mesin inti: embedder, TTS, dan ASR (real-time penuh)
+
+Permintaan: ganti embedder bge-m3 → **multilingual-e5-small** (bge-m3 terlalu besar),
+ganti TTS → **Supertonic 3** (Piper dihapus total, hanya boleh ada SATU mesin suara),
+ganti ASR → **sherpa-onnx streaming zipformer** sehingga ucapan menjadi teks
+**kata per kata** (faster-whisper dihapus total), dan buat AI menjawab secepat mungkin.
+
+### 22.1 Ringkasan penggantian
+
+| Bagian | Sebelum | Sesudah | Alasan |
+| --- | --- | --- | --- |
+| Embedder RAG | BAAI/bge-m3 — 1024 dim, **2,27 GB** | `intfloat/multilingual-e5-small` — 384 dim, **470 MB** | Ukuran jauh lebih kecil; tugasnya hanya memperkuat RAG, mesin utama tetap BM25 |
+| TTS | Piper ONNX (`piper-tts`) | **Supertonic 3** ONNX (`supertonic`) | 31 bahasa termasuk `id`, punya 10 tag ekspresi, satu mesin saja |
+| ASR | faster-whisper (batch) | **sherpa-onnx streaming zipformer** | Whisper harus menunggu rekaman selesai; zipformer mengeluarkan teks saat diucapkan |
+| Dekode audio | PyAV via faster-whisper | **PyAV eksplisit** (`av>=12`) | Browser mengirim `audio/webm` (Opus) yang tidak bisa dibaca soundfile |
+
+Paket yang **dihapus**: `piper-tts`, `faster-whisper`.
+Paket yang **ditambah**: `supertonic>=1.3.1`, `sherpa-onnx>=1.13.8`, `onnxruntime>=1.19.0`, `av>=12.0.0`.
+
+### 22.2 Embedder: multilingual-e5-small + prefiks tugas E5
+
+- `NAMA_MODEL_EMBED = "intfloat/multilingual-e5-small"`, folder lokal
+  `ai-engine/models/multilingual-e5-small/`, dimensi cadangan 384.
+- **Prefiks tugas E5 wajib**: kueri diberi `"query: "`, dokumen diberi `"passage: "`.
+  Tanpa prefiks, kualitas pencocokan makna turun nyata. Ditambahkan
+  `Embedder._beri_prefiks()`, `encode(..., jenis="query"|"passage")`,
+  `encode_kueri()`, dan `encode_dokumen()`. Prefiks **tidak** dobel bila sudah ada.
+- `rag/engine.py`: dokumen diindeks dengan `jenis="passage"`, kueri dengan `jenis="query"`.
+- Indeks FAISS lama (1024 dim) otomatis dibangun ulang karena ada pemeriksaan kecocokan dimensi.
+
+### 22.3 TTS: Supertonic 3 (Piper dihapus total)
+
+- `core/tts_engine.py` ditulis ulang. API publik dipertahankan (`apakah_siap`,
+  `sintesis_wav_bytes`, `sintesis_base64_async`, `status_engine`, pola singleton) supaya
+  `server.py` dan frontend tidak perlu berubah kontraknya.
+- **Audio tetap 100% di memori**: gelombang float32 → PCM 16-bit → WAV lewat `io.BytesIO`
+  dan modul `wave`. Tidak ada berkas sementara.
+- `status_engine()` kini melaporkan `tts_siap`, `engine_aktif = "supertonic-3"`,
+  `suara`, `sample_rate`, `mode_emosi`, dan `tag_tersedia`. `Navbar.jsx` ikut disesuaikan
+  (sebelumnya membaca `piper_siap` / `piper-unavailable`).
+- **10 tag ekspresi resmi** didukung: `<angry> <sad> <laugh> <scream> <sigh> <surprise>
+  <breath> <cough> <yawn> <throatclear>`, plus padanan nama Indonesia
+  (`sedih` → `sad`, `kaget` → `surprise`, `ketawa` → `laugh`, dst).
+- **Trik komunitas diimplementasikan**: tag diulang **3×** di awal kalimat
+  (`<sad> <sad> <sad> teks...`) karena satu tag sering diabaikan model.
+- **Saklar bahasa `SELA_TTS_EMOSI`** — inilah bagian jujurnya. Tag paling konsisten pada
+  en/ja/ko; pada bahasa lain (termasuk Indonesia) model kadang mengabaikannya atau
+  **membacanya sebagai teks biasa**. Maka bawaannya:
+  - `auto` (bawaan) → tag hanya dipasang untuk `en` / `ja` / `ko`.
+  - `on` → tag selalu dipasang, termasuk Indonesia (memakai trik ulang 3×).
+  - `off` → tidak pernah dipasang.
+  Dengan begitu SELA tidak pernah mengucapkan kata "angry angry angry" secara tidak sengaja.
+- **Tag tidak pernah masuk ke balon obrolan**: `bersihkan_tag_emosi()` tersedia dan
+  `bersihkan_teks_tts()` memanggilnya lebih dulu.
+- Suara bisa diganti lewat `SELA_TTS_SUARA` (F1–F5, M1–M5; bawaan **F1**).
+- `server.py` menambah `tentukan_emosi(jalur, intent)`: curhat → `sad`,
+  data kampus tidak tersedia → `sigh`, di luar kampus → `surprise`,
+  terima kasih → `laugh`. Emosi ikut dikirim pada `/api/sintesis` dan `/ws/dupleks`.
+
+### 22.4 ASR: sherpa-onnx streaming zipformer
+
+- `core/stt_engine.py` ditulis ulang memakai `sherpa_onnx.OnlineRecognizer.from_transducer`.
+- **API streaming baru**: `buat_sesi()`, `terima_pcm(sesi, pcm)`, `apakah_akhir_ucapan(sesi)`,
+  `akhirkan(sesi)`. `transkripsikan_bytes()` tetap ada untuk `/api/transcribe` dan
+  sekarang berjalan di atas mekanisme streaming yang sama (audio disuapkan per 0,5 detik).
+- **Deteksi akhir ucapan (endpoint)** aktif: `rule1 = 2,0 s` (belum ada kata),
+  `rule2 = 1,2 s` (sudah ada kata), `rule3 = 20 s` (batas ucapan). Bisa diatur lewat
+  `SELA_ASR_HENING1`, `SELA_ASR_HENING2`, `SELA_ASR_MAKS_UCAPAN`.
+- `decoding_method="greedy_search"` dipilih karena paling cepat — penting untuk latensi.
+- Koreksi istilah kampus (`koreksi_asr.py`) tetap dipakai, begitu pula filter halusinasi
+  kata berulang.
+- Model: `sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10`
+  (encoder int8 296 MB, decoder 33 MB, joiner int8 8 MB, tokens.txt).
+
+### 22.5 Real-time penuh (end-to-end)
+
+**Pendengaran — `/ws/asr-stream` kini streaming sungguhan.** Protokol baru:
+klien mengirim bingkai biner PCM 16-bit mono 16 kHz, server membalas `parsial`
+(teks bertambah kata demi kata) dan `final` saat pengguna berhenti bicara. Setelah
+`final`, server otomatis menyiapkan sesi baru sehingga pengguna bisa langsung bicara lagi.
+
+**Frontend — `mulaiAsrStreaming()` di `src/lib/ai.js`.** Membuka `/ws/asr-stream`,
+menyalakan mikrofon, mengubah Float32 → PCM 16-bit mono 16 kHz (dengan resampler sendiri,
+karena browser tidak selalu menghormati permintaan `sampleRate`), lalu mengalirkannya.
+Gain node bernilai 0 dipakai agar suara mikrofon tidak keluar lewat speaker (tanpa gema).
+
+**`VoiceUI.jsx` — MediaRecorder dihapus dari jalur bicara.** Teks sementara langsung
+muncul di kotak input saat diucapkan; saat server menyatakan pengguna berhenti, teks final
+dikirim ke `handleSubmit` seperti biasa. VAD klien yang rumit (baseline, ambang adaptif,
+quick-commit) tidak lagi menentukan giliran bicara — penentuan giliran kini satu sumber di
+server. Sisa pemantauan mikrofon hanya untuk memberi tahu bila mikrofon tidak menangkap suara.
+
+**Jawaban — jalur cepat `/ws/dupleks` diaktifkan.** Sebelumnya `streamChatAndVoice` hanya
+diimpor dan tidak pernah dipanggil. Sekarang `handleAssistantInteraction` mencoba jalur
+streaming lebih dulu: server mengirim jawaban **per kalimat beserta audionya**, sehingga
+suara mulai berbunyi setelah kalimat pertama — bukan setelah seluruh jawaban selesai.
+Bila gagal, otomatis jatuh ke jalur REST lama tanpa error. Saklar:
+`localStorage.SELA_STREAMING_JAWABAN = "0"`.
+
+### 22.6 Penjaga keutuhan bobot diperketat (temuan saat pengerjaan)
+
+Saat menguji, terungkap bahwa pemeriksaan `.safetensors` **tidak mendeteksi unduhan
+terpotong**: header safetensors ada di AWAL berkas, sedangkan bobot tensor ada di AKHIR —
+jadi berkas yang berhenti di tengah tetap lolos pemeriksaan header, lalu server mencoba
+memuatnya dan menggantung/menggagal. Ini kelas bug yang sama dengan insiden bge-m3 (§19),
+hanya pada format berkas yang berbeda.
+
+Perbaikan: ukuran total yang diharapkan dihitung dari `data_offsets` di header
+(`8 + panjang header + offset data terbesar`) lalu dibandingkan dengan ukuran berkas
+sebenarnya. Diterapkan di **kedua** tempat yang wajib kembar: `rag/embedder.py::bobot_model_utuh()`
+dan `persiapan_model.py::_bobot_utuh()`. Dikunci tes bagian **[18]**.
+
+### 22.7 Verifikasi
+- **Uji backend:** 116 lulus / 0 gagal. Bagian baru: **[18] Penjaga keutuhan bobot** (7
+  pemeriksaan: safetensors utuh/terpotong/kosong, zip utuh/isi rusak/bukan zip/berkas hilang),
+  perluasan **[2] Embedder** (prefiks E5 tidak dobel, dimensi 384), perluasan **[10] TTS**
+  (10 tag resmi, alias Indonesia, pengulangan 3×, pembersihan tag, saklar bahasa), perluasan
+  **[11] STT** (mode streaming, `buat_sesi`/`terima_pcm`/`apakah_akhir_ucapan`/`akhirkan`),
+  dan perluasan **[14] Routing** (emosi hanya dari 10 tag resmi).
+- **Uji frontend:** bundel esbuild bersih tanpa peringatan.
+- **Tangkapan layar Electron** dari `dist/` hasil build.
+
+### 22.8 Catatan operasional
+- Model baru diunduh lewat `persiapan_model.py` (`--unduh-embedder`, `--unduh-asr`,
+  `--unduh-tts`, atau `--unduh-semua`).
+- **Supertonic 3 TIDAK diunduh lewat `auto_download` paketnya.** Paket itu memakai
+  `huggingface_hub` yang membuat berkas sementara lalu menghapusnya; pembersih berkas
+  lingkungan ini (`safe-delete`) memblokir penghapusan tersebut sehingga unduhan gagal
+  di tengah (terbukti: berhenti di 9/26 berkas). Unduhan langsung via `urllib`
+  (`--unduh-tts`) tidak menyentuh berkas sementara dan berhasil.
+- Setelah model lengkap, sisa folder sementara `ai-engine/models/.supertonic-3.tmp`
+  boleh dihapus; folder itu sudah tercakup `.gitignore`.
+- **Server harus di-restart** setelah perubahan mesin ini.
+
+---
+
+## 23. Verifikasi akhir & temuan lanjutan (2026-09-15)
+
+Bagian ini mencatat apa yang ditemukan dan diperbaiki **setelah** ketiga model selesai
+diunduh dan seluruh mesin diuji dengan model sungguhan (bukan cadangan).
+
+### 23.1 Bug: ASR selalu dilaporkan "belum lengkap"
+`persiapan_model.py::_asr_lengkap()` melewatkan **semua** isi `BERKAS_ASR` ke penjaga
+bobot, termasuk `tokens.txt`. Penjaga bobot hanya mengenali ekstensi `.onnx`, `.bin`,
+dan `.safetensors`; untuk ekstensi lain ia mengembalikan `False`. Akibatnya ASR selalu
+dilaporkan "BELUM LENGKAP" walaupun keempat berkasnya sudah ada dan sehat.
+
+Perbaikan: ditambahkan `BERKAS_ASR_BOBOT` (hanya berkas `.onnx`). `_asr_lengkap()` kini
+memeriksa **keberadaan** seluruh berkas, lalu memverifikasi **keutuhan** khusus berkas
+bobot. `tokens.txt` adalah kamus token, bukan bobot.
+
+### 23.2 Penjaga keutuhan ONNX (baru)
+Sebelumnya berkas `.onnx` hanya diperiksa dengan ambang ukuran (`> 1 MB`). Ini tidak
+memadai: ONNX adalah protobuf tanpa indeks di akhir berkas, sehingga unduhan yang
+terpotong tetapi masih besar akan lolos dan baru ketahuan saat model dimuat — persis
+kelas bug yang sudah dua kali terjadi (§19 bge-m3, §22.6 safetensors).
+
+Ditambahkan `_onnx_utuh()`: menelusuri field tingkat atas `ModelProto` (tag varint +
+panjang) memakai seek, **tanpa pernah membaca isi tensor**, lalu memastikan penelusuran
+berhenti TEPAT di akhir berkas. Biayanya di bawah 0,01 detik bahkan untuk berkas 283 MB.
+Diterapkan di kedua tempat kembar: `rag/embedder.py` dan `persiapan_model.py`.
+
+Hasil uji: 7 berkas ONNX nyata (3 ASR + 4 TTS) diterima; salinan terpotong 40 MB ditolak.
+
+### 23.3 Prefiks E5 dengan peran salah kini ditimpa
+`_beri_prefiks()` dulu membiarkan prefiks apa pun yang sudah ada, termasuk prefiks peran
+yang keliru (`passage: x` pada jalur kueri). Prefiks E5 menandai **peran** teks, jadi
+peran yang salah harus ditimpa — bukan dibiarkan, dan tentu bukan ditumpuk menjadi
+`query: passage: x`. Kini prefiks lama dibuang lebih dulu, lalu prefiks yang benar dipasang.
+
+### 23.4 Deprecation `sentence-transformers` 6.x
+`get_sentence_embedding_dimension()` memicu `FutureWarning` di versi 6.x. Diganti dengan
+pemanggilan adaptif: pakai `get_embedding_dimension()` bila ada, jika tidak jatuh ke nama
+lama. Uji asap kini bersih tanpa peringatan.
+
+### 23.5 Perbaikan tes bagian [18]
+Ambang ukuran sementara di tes diturunkan ke `100` byte, padahal berkas safetensors
+sintetisnya hanya ~88 byte. Akibatnya berkas **utuh** ditolak oleh gerbang ukuran
+sebelum logika keutuhan isi sempat berjalan — tes menguji hal yang salah, dan dua tes
+lain "lulus" karena alasan yang keliru. Ambang diubah ke `1` agar yang diuji benar-benar
+logika keutuhan isi. Ditambahkan juga 3 pemeriksaan ONNX (utuh diterima, terpotong
+ditolak, sampah ditolak).
+
+### 23.6 Penghapusan total mesin lama
+Sesuai permintaan ("cuma satu TTS", "whispernya dihapus totalnya"), seluruh sisa mesin
+lama dibuang setelah mesin baru terbukti jalan:
+
+| Yang dihapus | Ukuran | Alasan |
+|---|---|---|
+| `ai-engine/models/tts_piper/` | 121 MB | Piper digantikan Supertonic 3 |
+| `ai-engine/models/whisper/` | 3.150 MB | faster-whisper digantikan sherpa-onnx |
+| `ai-engine/models/bge-m3/` | 631 MB | digantikan multilingual-e5-small |
+| `ai-engine/models/.supertonic-3.tmp/` | 713 MB | sisa unduhan gagal via `huggingface_hub` |
+| paket `piper-tts` | — | mesin TTS lama |
+| paket `faster-whisper` | — | mesin ASR lama |
+| paket `ctranslate2` | 60 MB | mesin inferensi faster-whisper, tak lagi dipakai |
+
+Total ruang yang dibebaskan: **± 4,6 GB**. Setelah pembersihan, `ai-engine/models/` hanya
+berisi empat hal: GGUF LLM, `multilingual-e5-small`, `sherpa-streaming-zipformer`, dan
+`supertonic-3`. Paket `av` dan `onnxruntime` **sengaja dipertahankan** — keduanya dulu
+ikut terpasang sebagai dependensi faster-whisper, tetapi sekarang dipakai langsung oleh
+ASR (dekode WebM/Opus) dan TTS (ONNX Runtime).
+
+### 23.7 Hasil verifikasi akhir
+- `persiapan_model.py`: LLM, ASR, TTS, dan Embedder semuanya **[V] lengkap**. Hanya LoRA
+  UCIC (opsional) yang belum ada, dan itu tidak lagi dihitung sebagai model wajib.
+- `test_server.py`: **126 lulus / 0 gagal**, tanpa peringatan. Termasuk bagian [18] yang
+  diperluas dan bagian [14]/[15] yang butuh `SELA_UJI_SERVER=1`.
+- **Supertonic 3 nyata:** sintesis Bahasa Indonesia 4,53 detik audio hanya dalam ~1 detik
+  (lebih cepat dari realtime), 44.100 Hz mono, WAV sah.
+- **Saklar emosi terverifikasi:** mode `auto` (bawaan) tidak memasang tag untuk Bahasa
+  Indonesia; mode `on` memasang tag dengan pengulangan 3× dan menghasilkan audio yang
+  berbeda (4,53 s → 5,02 s sedih, 5,43 s ketawa).
+- **sherpa-onnx nyata:** model dimuat 4 detik, sesi streaming dibuat, `terima_pcm` /
+  `apakah_akhir_ucapan` / `akhirkan` berjalan tanpa galat.
+- **Frontend:** bundel esbuild bersih (4,2 MB JS, 3,6 KB CSS), tanpa peringatan.

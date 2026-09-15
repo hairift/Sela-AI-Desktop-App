@@ -4,7 +4,7 @@ SELA AI Desktop - Uji Asap (Smoke Test) Arsitektur Baru
 Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 
 1. Chunker jendela kalimat (512/80)
-2. Embedder (bge-m3 atau hashing cadangan)
+2. Embedder (multilingual-e5-small atau hashing cadangan) + prefiks tugas E5
 3. Vector store (FAISS atau NumPy)
 4. Retriever leksikal BM25 + gerbang cakupan IDF
 5. RAG engine + ambang anti-halusinasi
@@ -12,14 +12,15 @@ Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 7. Campus tool (intent + pencarian)
 8. Curhat tool (empatik)
 9. Web search (deteksi kebutuhan)
-10. TTS Piper (sintesis pendek)
-11. STT (gerbang energi untuk audio pendek/hening)
+10. TTS Supertonic 3 (sintesis pendek + 10 tag ekspresi)
+11. STT sherpa-onnx (gerbang energi + sesi streaming real-time)
 12. VAD (SPEECH_START / SPEECH_END)
 13. Prompt library (tujuh prompt)
 14. Routing ranah (kampus / umum / real-time)
 15. Server FastAPI (opsional, set SELA_UJI_SERVER=1)
 16. Pengunduh model (truncate berkas rusak / resume / verifikasi)
 17. Pembersih teks jawaban (pemisah paragraf & daftar tetap utuh)
+18. Penjaga keutuhan bobot (safetensors terpotong & zip rusak)
 
 Jalankan:  python ai-engine/test_server.py
 """
@@ -118,6 +119,40 @@ def uji_embedder() -> None:
     b = emb.encode("harga ukt prodi informatika")
     c = emb.encode("jadwal pertandingan sepak bola")
     _cek("kemiripan semantik wajar", float(np.dot(a, b)) >= float(np.dot(a, c)))
+
+    # ── Konvensi prefiks tugas E5 ────────────────────────────────────────────
+    # Model keluarga e5 WAJIB diberi awalan "query: " / "passage: ". Tanpa itu
+    # kualitas pencocokan makna turun. Prefiks juga tidak boleh dobel.
+    _cek(
+        "prefiks kueri E5 dipasang",
+        emb._beri_prefiks(["biaya kuliah"], "query") == ["query: biaya kuliah"],
+    )
+    _cek(
+        "prefiks dokumen E5 dipasang",
+        emb._beri_prefiks(["biaya kuliah"], "passage") == ["passage: biaya kuliah"],
+    )
+    _cek(
+        "prefiks tidak dobel",
+        emb._beri_prefiks(["query: biaya kuliah"], "query") == ["query: biaya kuliah"],
+    )
+    # Prefiks menandai PERAN teks. Prefiks peran yang salah harus ditimpa, bukan
+    # dibiarkan atau ditumpuk ("query: passage: x").
+    _cek(
+        "prefiks peran salah ditimpa dengan yang benar",
+        emb._beri_prefiks(["passage: x"], "query") == ["query: x"],
+    )
+    _cek(
+        "prefiks dokumen salah ditimpa saat passage",
+        emb._beri_prefiks(["query: x"], "passage") == ["passage: x"],
+    )
+    vk = emb.encode_kueri("berapa ukt")
+    vd = emb.encode_dokumen("berapa ukt")
+    _cek(
+        "encode_kueri & encode_dokumen berdimensi sama",
+        getattr(vk, "shape", (0,))[0] == emb.dimensi == getattr(vd, "shape", (0,))[0],
+    )
+    if emb.metode.startswith("sentence-transformers"):
+        _cek("e5-small aktif berdimensi 384", emb.dimensi == 384, f"({emb.dimensi})")
 
 
 def uji_vector_store() -> None:
@@ -322,23 +357,61 @@ def uji_web_search() -> None:
 
 
 def uji_tts() -> None:
-    print("\n[10] TTS Piper")
+    print("\n[10] TTS Supertonic 3")
     from core import dapatkan_tts
+    from core.tts_engine import (
+        TAG_RESMI,
+        apakah_tag_dipakai,
+        bersihkan_tag_emosi,
+        bersihkan_teks_tts,
+        mode_emosi,
+        normalisasi_emosi,
+        pasang_tag_emosi,
+    )
 
     tts = dapatkan_tts()
-    _cek("mesin TTS siap", tts.apakah_siap, f"({tts.nama_model_aktif})")
+    _cek("mesin TTS siap", tts.apakah_siap, f"({tts.nama_model_aktif.get('default')})")
+    _cek("hanya ada satu mesin TTS", tts.status_engine()["engine_aktif"].startswith("supertonic"))
     if tts.apakah_siap:
         data = tts.sintesis_wav_bytes("Halo, saya SELA.", "id")
         _cek("sintesis menghasilkan WAV", bool(data) and data[:4] == b"RIFF", f"({len(data or b'')} byte)")
         _cek("singleton stabil", dapatkan_tts() is tts)
 
+    # ── 10 tag ekspresi resmi ────────────────────────────────────────────────
+    _cek("10 tag ekspresi resmi", len(TAG_RESMI) == 10, f"({len(TAG_RESMI)})")
+    _cek("tag <angry> dikenal", normalisasi_emosi("angry") == "angry")
+    _cek("alias Indonesia 'sedih' -> sad", normalisasi_emosi("sedih") == "sad")
+    _cek("alias Indonesia 'kaget' -> surprise", normalisasi_emosi("kaget") == "surprise")
+    _cek("emosi tak dikenal diabaikan", normalisasi_emosi("bahagia sekali") is None)
+
+    # Trik komunitas: tag diulang 3x di awal kalimat agar dipatuhi model.
+    ber_tag = pasang_tag_emosi("Halo semua.", "sad")
+    _cek("tag diulang 3x di awal", ber_tag.count("<sad>") == 3, f"({ber_tag!r})")
+    _cek("teks tetap utuh setelah tag", ber_tag.endswith("Halo semua."))
+    _cek("tanpa emosi tidak ada tag", pasang_tag_emosi("Halo.", None) == "Halo.")
+
+    # Tag tidak boleh pernah ikut diucapkan sebagai kata biasa.
+    _cek("tag dibersihkan dari teks", "<sad>" not in bersihkan_tag_emosi("<sad> halo <angry>"))
+    _cek(
+        "pembersih TTS membuang tag + markdown",
+        bersihkan_teks_tts("<sigh> **Halo** dunia") == "Halo dunia",
+        f"({bersihkan_teks_tts('<sigh> **Halo** dunia')!r})",
+    )
+
+    # Saklar bahasa: bawaan "auto" hanya menyalakan tag di en/ja/ko.
+    _cek("mode emosi bawaan auto", mode_emosi() == "auto", f"({mode_emosi()})")
+    if mode_emosi() == "auto":
+        _cek("tag nonaktif untuk Bahasa Indonesia", not apakah_tag_dipakai("id"))
+        _cek("tag aktif untuk Bahasa Inggris", apakah_tag_dipakai("en"))
+
 
 def uji_stt() -> None:
-    print("\n[11] STT (gerbang energi, tanpa file tmp)")
+    print("\n[11] STT sherpa-onnx (gerbang energi + sesi streaming)")
     from core import dapatkan_stt
 
     stt = dapatkan_stt()
     print(f"       model: {stt.nama_model_aktif or '-'} ({stt.perangkat_aktif or '-'})")
+    _cek("STT melaporkan mode streaming", stt.info().get("streaming") is True)
     hasil_pendek = stt.transkripsikan_bytes(b"123")
     _cek("audio terlalu pendek ditolak", hasil_pendek.get("teks") == "")
 
@@ -350,6 +423,24 @@ def uji_stt() -> None:
         w.writeframes(b"\x00\x00" * 16000)
     hasil_hening = stt.transkripsikan_bytes(buf.getvalue())
     _cek("audio hening ditolak", hasil_hening.get("teks") == "", f"({hasil_hening.get('pesan')})")
+
+    # ── API sesi streaming ───────────────────────────────────────────────────
+    # Dipakai /ws/asr-stream: audio disuapkan bertahap, teks dibaca sementara,
+    # lalu ditutup untuk mendapat hasil final.
+    sesi = stt.buat_sesi()
+    if stt.apakah_siap:
+        _cek("sesi streaming bisa dibuat", sesi is not None)
+    if sesi is not None:
+        import numpy as np
+
+        hening_pcm = (np.zeros(8000, dtype=np.int16)).tobytes()
+        parsial = stt.terima_pcm(sesi, hening_pcm)
+        _cek("terima_pcm mengembalikan teks", isinstance(parsial, str), f"({parsial!r})")
+        _cek("apakah_akhir_ucapan mengembalikan bool", isinstance(stt.apakah_akhir_ucapan(sesi), bool))
+        final = stt.akhirkan(sesi)
+        _cek("akhirkan mengembalikan teks", isinstance(final, str), f"({final!r})")
+    else:
+        _cek("model ASR belum siap (sesi streaming dilewati)", not stt.apakah_siap)
 
 
 def uji_vad() -> None:
@@ -441,6 +532,24 @@ def uji_routing() -> None:
         not hilang,
         f"(hilang: {hilang})" if hilang else f"({sorted(dipilih)})",
     )
+
+    # ── Emosi suara: hanya 10 tag resmi Supertonic 3 yang boleh dipilih ─────
+    from core.tts_engine import TAG_RESMI
+
+    kombinasi_emosi = [
+        ("intent", i)
+        for i in ("sapaan", "identitas", "terima_kasih", "penutup", None, "lain")
+    ] + [(j, None) for j in ("kampus_kosong", "umum", "kampus", "web", "curhat")]
+    emosi_dipilih = {server.tentukan_emosi(j, i) for j, i in kombinasi_emosi}
+    emosi_dipakai = {e for e in emosi_dipilih if e}
+    _cek(
+        "tentukan_emosi hanya memakai tag resmi",
+        emosi_dipakai.issubset(set(TAG_RESMI)),
+        f"({sorted(emosi_dipakai)})",
+    )
+    _cek("curhat -> emosi sedih", server.tentukan_emosi("curhat") == "sad")
+    _cek("kampus_kosong -> helaan napas", server.tentukan_emosi("kampus_kosong") == "sigh")
+    _cek("jawaban kampus biasa tanpa emosi", server.tentukan_emosi("kampus") is None)
 
 
 def uji_server() -> None:
@@ -609,6 +718,113 @@ def uji_bersihkan_teks() -> None:
              _bersihkan_teks(angka) == angka, repr(_bersihkan_teks(angka)))
 
 
+def uji_keutuhan_bobot() -> None:
+    print("\n[18] Penjaga keutuhan bobot (safetensors terpotong & zip rusak)")
+    import json
+    import tempfile
+    import zipfile
+
+    import rag.embedder as E
+
+    # Ambang ukuran diturunkan sementara supaya berkas uji kecil tetap diuji.
+    # Harus benar-benar 1 (bukan 100): berkas safetensors sintetis di bawah ini
+    # hanya ~88 byte, sehingga ambang 100 menolaknya lebih dulu dan tes jadi
+    # menguji gerbang ukuran, bukan logika keutuhan isi yang sebenarnya dibidik.
+    ambang_asli = E._AMBANG_BOBOT_MIN
+    E._AMBANG_BOBOT_MIN = 1
+    akar = tempfile.mkdtemp(prefix="sela_bobot_")
+    try:
+        # ── safetensors: header SAH tapi data di akhir berkas hilang ─────────
+        # Inilah bentuk unduhan yang terputus di tengah. Pemeriksaan header saja
+        # akan meloloskannya (dulu begitu), padahal modelnya pasti gagal dimuat.
+        def _tulis_safetensors(jalur: str, potong: int = 0) -> int:
+            info = {"bobot": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}
+            header = json.dumps(info).encode("utf-8")
+            header += b" " * ((8 - len(header) % 8) % 8)
+            isi = len(header).to_bytes(8, "little") + header + b"\x00" * 16
+            if potong:
+                isi = isi[:-potong]
+            with open(jalur, "wb") as berkas:
+                berkas.write(isi)
+            return len(isi)
+
+        utuh = os.path.join(akar, "utuh.safetensors")
+        _tulis_safetensors(utuh)
+        _cek("safetensors utuh diterima", E.bobot_model_utuh(utuh) is True)
+
+        terpotong = os.path.join(akar, "terpotong.safetensors")
+        _tulis_safetensors(terpotong, potong=8)
+        _cek(
+            "safetensors terpotong DITOLAK (header tetap sah)",
+            E.bobot_model_utuh(terpotong) is False,
+        )
+
+        kosong = os.path.join(akar, "kosong.safetensors")
+        with open(kosong, "wb") as berkas:
+            berkas.write(b"\x00" * 200)
+        _cek("safetensors tanpa header sah DITOLAK", E.bobot_model_utuh(kosong) is False)
+
+        # ── .onnx: struktur protobuf habis tepat di akhir berkas ─────────────
+        # ONNX tidak punya indeks di akhir berkas, jadi ambang ukuran saja tidak
+        # cukup: unduhan terpotong yang masih besar akan lolos. Struktur field
+        # tingkat atas ditelusuri, sehingga potongan tetap terdeteksi.
+        def _tulis_onnx(jalur: str, potong: int = 0) -> int:
+            isi = b"\x08\x08"  # field 1 (ir_version), varint = 8
+            isi += b"\x1a\x04SELA"  # field 3 (producer_name), LEN = "SELA"
+            muatan = b"\x00" * 64
+            isi += b"\x42" + bytes([len(muatan)]) + muatan  # field 8 (graph)
+            if potong:
+                isi = isi[:-potong]
+            with open(jalur, "wb") as berkas:
+                berkas.write(isi)
+            return len(isi)
+
+        onnx_utuh = os.path.join(akar, "utuh.onnx")
+        _tulis_onnx(onnx_utuh)
+        _cek("onnx utuh diterima", E.bobot_model_utuh(onnx_utuh) is True)
+
+        onnx_potong = os.path.join(akar, "potong.onnx")
+        _tulis_onnx(onnx_potong, potong=16)
+        _cek(
+            "onnx terpotong DITOLAK (struktur tidak habis di akhir)",
+            E.bobot_model_utuh(onnx_potong) is False,
+        )
+
+        onnx_sampah = os.path.join(akar, "sampah.onnx")
+        with open(onnx_sampah, "wb") as berkas:
+            # Byte pertama 0x0B = field 1 wire type 3 (start group) yang tidak
+            # dipakai protobuf modern -> pasti ditolak. Sengaja deterministik;
+            # data acak bisa kebetulan lolos telusuran.
+            berkas.write(b"\x0b" + os.urandom(299))
+        _cek("onnx sampah DITOLAK", E.bobot_model_utuh(onnx_sampah) is False)
+
+        # ── .bin: central directory ada, isi entri rusak ─────────────────────
+        # `zipfile.namelist()` tetap berhasil pada zip yang isinya rusak, jadi
+        # penjaga yang hanya memanggilnya akan meloloskan berkas rusak.
+        baik = os.path.join(akar, "baik.bin")
+        with zipfile.ZipFile(baik, "w", zipfile.ZIP_DEFLATED) as arsip:
+            arsip.writestr("bobot/data.pkl", b"P" * 4096)
+        _cek("zip .bin utuh diterima", E.bobot_model_utuh(baik) is True)
+
+        rusak = os.path.join(akar, "rusak.bin")
+        with open(baik, "rb") as sumber, open(rusak, "wb") as tujuan:
+            isi_zip = bytearray(sumber.read())
+            # Rusak isi entri (bukan central directory di akhir berkas).
+            for i in range(40, min(400, len(isi_zip))):
+                isi_zip[i] = 0x5A
+            tujuan.write(bytes(isi_zip))
+        _cek("zip .bin dengan isi rusak DITOLAK", E.bobot_model_utuh(rusak) is False)
+
+        bukan_zip = os.path.join(akar, "bukan.bin")
+        with open(bukan_zip, "wb") as berkas:
+            berkas.write(os.urandom(300))
+        _cek("berkas .bin bukan zip DITOLAK", E.bobot_model_utuh(bukan_zip) is False)
+
+        _cek("berkas tidak ada DITOLAK", E.bobot_model_utuh(os.path.join(akar, "x.bin")) is False)
+    finally:
+        E._AMBANG_BOBOT_MIN = ambang_asli
+
+
 def main() -> int:
     print("=" * 64)
     print(" [SELA AI Desktop] Uji Asap Arsitektur Baru")
@@ -628,6 +844,7 @@ def main() -> int:
     uji_prompts()
     uji_unduh_model()
     uji_bersihkan_teks()
+    uji_keutuhan_bobot()
     if os.environ.get("SELA_UJI_SERVER") == "1":
         uji_routing()
         uji_server()

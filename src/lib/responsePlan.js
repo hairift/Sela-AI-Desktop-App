@@ -339,8 +339,8 @@ export function buildSpokenText(
   // TTS harus membacakan SELURUH jawaban yang tampil. Sebelumnya fungsi ini
   // hanya mengambil 2 kalimat pertama lalu memotongnya di 260 karakter (sisa
   // warisan mesin OmniVoice yang lambat), sehingga SELA kerap terdengar
-  // berhenti di tengah jawaban. Piper kini sanggup membaca teks panjang dengan
-  // cepat (~300 karakter/detik), jadi tidak ada lagi alasan memotong isi.
+  // berhenti di tengah jawaban. Mesin TTS Supertonic 3 kini sanggup membaca teks
+  // panjang dengan cepat, jadi tidak ada lagi alasan memotong isi.
   // Satu-satunya penyesuaian yang dipertahankan: URL tidak dieja huruf per
   // huruf, dan penanda markdown (**, #, `) dibuang agar suara tetap natural.
   const withoutLinks = cleanedText

@@ -4,11 +4,12 @@ SELA AI Desktop - Server Backend AI Lokal (FastAPI + WebSocket Full-Duplex)
 Satu-satunya titik masuk backend. Merangkai seluruh mesin SELA:
 
 - core.llm_engine  : LLM tunggal (llama-cpp-python, GGUF langsung, singleton)
-- core.stt_engine  : STT tunggal (faster-whisper, 100% memori, tanpa file tmp)
-- core.tts_engine  : TTS tunggal (Piper, singleton, audio di memori)
+- core.stt_engine  : STT tunggal (sherpa-onnx streaming zipformer, kata per kata,
+                    100% memori, tanpa file tmp)
+- core.tts_engine  : TTS tunggal (Supertonic 3 ONNX, singleton, audio di memori)
 - core.vad_engine  : VAD untuk barge-in (FastRTC Silero atau cadangan energi)
 - rag             : RAG anti-halusinasi (retriever leksikal BM25 + gerbang
-                    cakupan IDF; diperkuat bge-m3/FAISS bila tersedia)
+                    cakupan IDF; diperkuat multilingual-e5-small/FAISS bila tersedia)
 - tools           : campus_tool (RAG UCIC), web_search_tool, curhat_tool
 - prompts         : seluruh system prompt terpusat
 
@@ -90,7 +91,7 @@ alat_web = dapatkan_web_search()
 alat_curhat = dapatkan_curhat_tool()
 pengenal_user = PengenalUser()
 klien_mcp = KlienMcp()
-# Ringkasan RAG untuk log: tanpa bge-m3 jalur vektor memang dilewati (total_chunk
+# Ringkasan RAG untuk log: tanpa e5-small jalur vektor memang dilewati (total_chunk
 # tetap 0), jadi yang dilaporkan adalah jumlah dokumen leksikal yang benar-benar siap.
 _ringkasan_rag = (
     f"{alat_kampus.total_dokumen} dokumen + {alat_kampus.total_chunk} chunk"
@@ -113,6 +114,9 @@ class PermintaanObrolan(BaseModel):
 class PermintaanSintesis(BaseModel):
     teks_kalimat: str
     bahasa: Optional[str] = "id"
+    # Emosi opsional (mis. "sedih", "marah", "kaget"). Dipetakan ke salah satu
+    # dari 10 tag ekspresi Supertonic 3 di core/tts_engine.py.
+    emosi: Optional[str] = None
 
 
 class PermintaanWebSearch(BaseModel):
@@ -185,6 +189,28 @@ def tentukan_gerakan(jalur: str, intent: Optional[str] = None) -> str:
         return "Confused"
     # kampus / web / curhat: mengangguk sambil menyampaikan informasi.
     return "Nodding"
+
+
+def tentukan_emosi(jalur: str, intent: Optional[str] = None) -> Optional[str]:
+    """
+    Pilih emosi suara yang cocok dengan sifat jawaban.
+
+    Nilai yang dikembalikan adalah tag ekspresi resmi Supertonic 3 (lihat
+    core/tts_engine.py). Tag hanya benar-benar dipasang bila bahasanya termasuk
+    yang stabil (en/ja/ko), kecuali SELA_TTS_EMOSI=on dipasang eksplisit —
+    pada bahasa lain tag kadang dibaca sebagai teks biasa.
+    """
+    if jalur == "curhat":
+        # Empatik: nada sedih + helaan napas pelan.
+        return "sad"
+    if jalur == "kampus_kosong":
+        # Data resmi tidak memuat jawabannya -> helaan napas jujur, bukan mengarang.
+        return "sigh"
+    if jalur == "umum":
+        return "surprise"
+    if jalur == "intent" and intent == "terima_kasih":
+        return "laugh"
+    return None
 
 
 
@@ -458,10 +484,11 @@ async def cek_kesehatan():
         "vector_store": alat_kampus.rag.store.metode if alat_kampus.rag.store else None,
         "model_llm_tersedia": llm.apakah_siap,
         "model_llm_aktif": llm.info().get("model"),
-        "model_whisper_tersedia": stt.apakah_siap,
-        "model_whisper_aktif": stt.nama_model_aktif,
+        "model_asr_tersedia": stt.apakah_siap,
+        "model_asr_aktif": stt.nama_model_aktif,
+        "asr_streaming": True,
         "tts_siap": tts.apakah_siap,
-        "tts_engine": "Piper ONNX (singleton)",
+        "tts_engine": "Supertonic 3 ONNX (singleton)",
         "vad_metode": vad.metode_aktif,
     }
 
@@ -550,13 +577,17 @@ async def status_asr():
         "apakah_siap": stt.apakah_siap,
         "nama_model": stt.nama_model_aktif,
         "perangkat": stt.perangkat_aktif,
+        "streaming": True,
+        "mesin": "sherpa-onnx (zipformer streaming)",
     }
 
 
 # ── Sintesis (TTS) ────────────────────────────────────────────────────────────
 @aplikasi_server.post("/api/sintesis")
 async def sintesis_rest(data: PermintaanSintesis):
-    return await tts.sintesis_base64_async(data.teks_kalimat, data.bahasa or "id")
+    return await tts.sintesis_base64_async(
+        data.teks_kalimat, data.bahasa or "id", data.emosi
+    )
 
 
 @aplikasi_server.get("/api/status-tts")
@@ -605,23 +636,62 @@ async def konteks_user():
     return {"konteks": pengenal_user.dapatkan_konteks_user()}
 
 
-# ── WebSocket ASR streaming ───────────────────────────────────────────────────
+# ── WebSocket ASR streaming (REAL-TIME, kata per kata) ────────────────────────
 @aplikasi_server.websocket("/ws/asr-stream")
 async def ws_asr_streaming(koneksi: WebSocket):
-    """Streaming audio ke teks. Buffer hanya di memori, tanpa file tmp."""
+    """
+    Streaming audio ke teks secara real-time memakai sherpa-onnx.
+
+    Protokol:
+    - Klien  -> {"tipe":"mulai","bahasa":"id"}      siapkan sesi baru
+    - Klien  -> bingkai biner = PCM 16-bit mono 16 kHz (ArrayBuffer)
+    - Server -> {"tipe":"parsial","teks":"..."}     teks sementara, bertambah kata
+                                                    demi kata saat pengguna bicara
+    - Server -> {"tipe":"final","teks":"..."}       pengguna berhenti (endpoint)
+                                                    atau klien mengirim "selesai"
+    - Klien  -> {"tipe":"batal"}                    buang sesi berjalan
+
+    Buffer hanya di memori, tanpa file tmp. Setelah satu ucapan selesai
+    (endpoint), sesi otomatis diganti yang baru sehingga pengguna bisa langsung
+    berbicara lagi tanpa membuka koneksi baru.
+    """
     await koneksi.accept()
     print("[WS ASR] Klien terhubung.")
-    penyangga = bytearray()
-    bahasa_aktif = "id"
-    batas = 8 * 1024 * 1024
+
+    sesi = stt.buat_sesi()
+    teks_terkirim = ""
+    if sesi is None:
+        await koneksi.send_json(
+            {"tipe": "galat", "pesan": "Model ASR streaming belum siap"}
+        )
+    else:
+        await koneksi.send_json(
+            {"tipe": "siap", "streaming": True, "model": stt.nama_model_aktif}
+        )
+
     try:
         while True:
             pesan = await koneksi.receive()
+
+            # ── Bingkai audio biner: PCM 16-bit mono 16 kHz ───────────────────
             if pesan.get("bytes"):
-                if len(penyangga) < batas:
-                    penyangga.extend(pesan["bytes"])
-                await koneksi.send_json({"tipe": "parsial", "ukuran_bytes": len(penyangga)})
+                if sesi is None:
+                    continue
+                loop = asyncio.get_running_loop()
+                teks = await loop.run_in_executor(None, stt.terima_pcm, sesi, pesan["bytes"])
+                if teks and teks != teks_terkirim:
+                    teks_terkirim = teks
+                    await koneksi.send_json({"tipe": "parsial", "teks": teks})
+                # Pengguna berhenti bicara -> kirim final, lalu siapkan sesi baru.
+                if await loop.run_in_executor(None, stt.apakah_akhir_ucapan, sesi):
+                    final = await loop.run_in_executor(None, stt.akhirkan, sesi)
+                    await koneksi.send_json(
+                        {"tipe": "final", "teks": final, "sukses": True, "alasan": "endpoint"}
+                    )
+                    sesi = stt.buat_sesi()
+                    teks_terkirim = ""
                 continue
+
             if not pesan.get("text"):
                 continue
             try:
@@ -629,27 +699,28 @@ async def ws_asr_streaming(koneksi: WebSocket):
             except Exception:
                 continue
             tipe = paket.get("tipe", "")
-            bahasa_aktif = paket.get("bahasa") or paket.get("lang") or bahasa_aktif
-            if tipe == "batal":
-                penyangga.clear()
+
+            if tipe == "mulai":
+                sesi = stt.buat_sesi()
+                teks_terkirim = ""
+                await koneksi.send_json({"tipe": "siap", "streaming": sesi is not None})
+            elif tipe == "batal":
+                sesi = stt.buat_sesi()
+                teks_terkirim = ""
                 await koneksi.send_json({"tipe": "dibatalkan"})
             elif tipe == "selesai":
-                if len(penyangga) < 1000:
-                    await koneksi.send_json({"tipe": "hasil", "teks": "", "sukses": True})
-                else:
-                    loop = asyncio.get_running_loop()
-                    hasil = await loop.run_in_executor(
-                        None, stt.transkripsikan_bytes, bytes(penyangga), bahasa_aktif
-                    )
+                if sesi is None:
                     await koneksi.send_json(
-                        {
-                            "tipe": "hasil",
-                            "teks": hasil.get("teks", ""),
-                            "sukses": hasil.get("sukses", True),
-                            "bahasa": hasil.get("bahasa", bahasa_aktif),
-                        }
+                        {"tipe": "final", "teks": "", "sukses": False}
                     )
-                penyangga.clear()
+                    continue
+                loop = asyncio.get_running_loop()
+                final = await loop.run_in_executor(None, stt.akhirkan, sesi)
+                sesi = stt.buat_sesi()
+                teks_terkirim = ""
+                await koneksi.send_json(
+                    {"tipe": "final", "teks": final, "sukses": True, "alasan": "klien"}
+                )
     except WebSocketDisconnect:
         print("[WS ASR] Klien memutuskan koneksi.")
     except Exception as galat:
@@ -690,11 +761,14 @@ async def ws_dupleks(koneksi: WebSocket):
         nonlocal tugas_tts
         try:
             rencana = await run_in_threadpool(susun_rencana, kueri, riwayat, bahasa)
+            emosi = tentukan_emosi(rencana["jalur"], rencana.get("intent"))
             await koneksi.send_json(
                 {
                     "tipe": "mulai_menjawab",
                     "kueri": kueri,
                     "jalur": rencana["jalur"],
+                    "emosi": emosi,
+                    "gerakan": tentukan_gerakan(rencana["jalur"], rencana.get("intent")),
                     "dokumen_rujukan": [
                         {"judul": d["judul"], "kategori": d["kategori"]}
                         for d in rencana.get("dokumen", [])
@@ -739,7 +813,9 @@ async def ws_dupleks(koneksi: WebSocket):
                 teks_terkumpul.append(kalimat)
                 await koneksi.send_json({"tipe": "potongan_teks", "kalimat": kalimat})
 
-                tugas_tts = asyncio.create_task(tts.sintesis_base64_async(kalimat, bahasa))
+                tugas_tts = asyncio.create_task(
+                    tts.sintesis_base64_async(kalimat, bahasa, emosi)
+                )
                 try:
                     hasil_audio = await tugas_tts
                 except asyncio.CancelledError:
@@ -763,7 +839,11 @@ async def ws_dupleks(koneksi: WebSocket):
                     )
                 else:
                     await koneksi.send_json(
-                        {"tipe": "status_tts_gagal", "kalimat": kalimat, "engine": "piper-unavailable"}
+                        {
+                            "tipe": "status_tts_gagal",
+                            "kalimat": kalimat,
+                            "engine": "supertonic-unavailable",
+                        }
                     )
                 await asyncio.sleep(0.01)
 
@@ -772,6 +852,8 @@ async def ws_dupleks(koneksi: WebSocket):
                     {
                         "tipe": "selesai",
                         "teks_penuh": _bersihkan_teks(" ".join(teks_terkumpul)),
+                        "gerakan": tentukan_gerakan(rencana["jalur"], rencana.get("intent")),
+                        "emosi": emosi,
                         "dokumen_rujukan": [
                             {"judul": d["judul"], "kategori": d["kategori"]}
                             for d in rencana.get("dokumen", [])

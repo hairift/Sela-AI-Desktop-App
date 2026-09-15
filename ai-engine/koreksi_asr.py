@@ -1,6 +1,6 @@
 """
 SELA AI Desktop - Auto-Correct untuk ASR (Speech-to-Text)
-Mengoreksi typo dan kesalahan pengucapan hasil transkripsi Whisper.
+Mengoreksi typo dan kesalahan pengucapan hasil transkripsi sherpa-onnx.
 Menggunakan kamus koreksi kontekstual kampus UCIC + algoritma fuzzy matching.
 """
 
@@ -345,7 +345,7 @@ class KoreksiAsr:
             "shopeepay2": "shopeepay",
             "transfer2": "transfer",
             "transfer3": "transfer",
-            # Kesalahan Whisper untuk kata tanya
+            # Kesalahan ASR untuk kata tanya
             "giman": "gimana",
             "gimn": "gimana",
             "gmn3": "gimana",

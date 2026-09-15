@@ -1,21 +1,33 @@
 """
-SELA AI Desktop - Mesin STT Tunggal berbasis faster-whisper
-============================================================
-Mengubah audio (WebM/Opus/WAV/MP3/PCM dari mikrofon) menjadi teks, 100%
-di memori. TIDAK ADA berkas sementara: audio di-decode langsung dari
-io.BytesIO memakai PyAV bawaan faster-whisper, dengan fallback soundfile.
+SELA AI Desktop - Mesin STT Tunggal berbasis sherpa-onnx (STREAMING)
+=====================================================================
+Mengubah audio menjadi teks secara REAL-TIME: kata muncul saat pengguna masih
+berbicara, bukan menunggu rekaman selesai. Ini yang membuat SELA terasa seperti
+bercakap dengan manusia.
 
-Lapisan anti-halusinasi Whisper:
-1. Gerbang energi (RMS) + durasi minimum sebelum inferensi.
-2. VAD Silero bawaan faster-whisper dengan padding.
-3. beam size 5, no_speech_threshold, repetition_penalty, compression ratio.
-4. Filter kata/suku-kata berulang.
-5. Koreksi ASR ringan (koreksi_asr) untuk istilah kampus UCIC.
+Model: `sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh-2025-02-10`
+(zipformer transducer streaming, 8 bahasa termasuk Indonesia). Empat berkas
+model disimpan di `ai-engine/models/sherpa-streaming-zipformer/`.
+
+Menggantikan faster-whisper sepenuhnya. Whisper bersifat "batch" (harus menunggu
+seluruh rekaman) sehingga tidak bisa memenuhi kebutuhan real-time.
+
+Dua jalur pemakaian:
+1. STREAMING (utama, real-time) — dipakai `/ws/asr-stream`:
+       sesi = stt.buat_sesi()
+       stt.terima_pcm(sesi, pcm_int16_bytes)      # dipanggil terus-menerus
+       stt.hasil_terkini(sesi)                    # teks sementara (kata per kata)
+       stt.apakah_akhir_ucapan(sesi)              # deteksi pengguna berhenti
+       stt.akhirkan(sesi)                         # teks final
+2. BATCH (cadangan, kompatibel) — dipakai `/api/transcribe`:
+       stt.transkripsikan_bytes(byte_audio, bahasa="id")
+
+Seluruh audio diproses di memori. TIDAK ADA berkas sementara di disk.
 
 Pemakaian:
     from core import dapatkan_stt
     stt = dapatkan_stt()
-    hasil = stt.transkripsikan_bytes(byte_audio, bahasa="id")
+    print(stt.transkripsikan_bytes(wav_bytes, "id"))
 """
 
 from __future__ import annotations
@@ -24,16 +36,40 @@ import io
 import os
 import re
 import threading
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-# Urutan model dari paling akurat ke paling ringan (semua di models/whisper).
-MODEL_PILIHAN = ("small", "medium", "base", "tiny")
+# Nama berkas model di ai-engine/models/sherpa-streaming-zipformer/.
+BERKAS_ENCODER = "encoder-epoch-75-avg-11-chunk-16-left-128.int8.onnx"
+BERKAS_DECODER = "decoder-epoch-75-avg-11-chunk-16-left-128.onnx"
+BERKAS_JOINER = "joiner-epoch-75-avg-11-chunk-16-left-128.int8.onnx"
+BERKAS_TOKENS = "tokens.txt"
+
+SAMPLE_RATE = 16000
 AMBANG_RMS_HENING = 0.0015
 DURASI_MIN_DETIK = 0.2
 
+# Deteksi akhir ucapan (endpoint) agar SELA bisa langsung menjawab begitu
+# pengguna berhenti bicara. Nilai kecil = respons lebih cepat, tetapi berisiko
+# memotong jeda berpikir yang wajar. 1,2 detik hening setelah ada kata adalah
+# keseimbangan yang dipakai asisten suara umum; sebelum ada kata sama sekali
+# dipakai 2 detik supaya pengguna sempat mulai.
+HENING_AKHIR_TANPA_TEKS = float(os.environ.get("SELA_ASR_HENING1", "2.0"))
+HENING_AKHIR_SETELAH_TEKS = float(os.environ.get("SELA_ASR_HENING2", "1.2"))
+MAKS_PANJANG_UCAPAN = float(os.environ.get("SELA_ASR_MAKS_UCAPAN", "20"))
+
+
+class SesiAsr:
+    """Satu sesi streaming: menyimpan stream sherpa + teks yang sudah terkumpul."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stream = stream
+        self.teks_final: List[str] = []
+        self.teks_terakhir = ""
+        self.jumlah_bingkai = 0
+
 
 class SttEngine:
-    """Pembungkus tunggal faster-whisper untuk transkripsi ucapan SELA."""
+    """Pembungkus tunggal OnlineRecognizer sherpa-onnx untuk ucapan SELA."""
 
     _instance: Optional["SttEngine"] = None
     _kunci_singleton = threading.Lock()
@@ -47,29 +83,22 @@ class SttEngine:
                     cls._instance = instansi
         return cls._instance
 
-    def __init__(self, ukuran_model: str = "small") -> None:
+    def __init__(self) -> None:
         if getattr(self, "_sudah_disiapkan", False):
             return
         self._sudah_disiapkan = True
 
         self.direktori_induk = os.path.dirname(os.path.abspath(__file__))
         self.direktori_model = os.path.abspath(
-            os.path.join(self.direktori_induk, "..", "models", "whisper")
+            os.path.join(self.direktori_induk, "..", "models", "sherpa-streaming-zipformer")
         )
-        os.makedirs(self.direktori_model, exist_ok=True)
 
-        self.ukuran_model = ukuran_model
-        self.model = None
+        self.recognizer: Any = None
         self.apakah_siap = False
         self.nama_model_aktif = ""
         self.perangkat_aktif = ""
-
-        # Kosakata pembantu kampus untuk menaikkan akurasi transkripsi.
-        self.prompt_konteks = (
-            "SELA, UCIC, Universitas Catur Insan Cendekia, Cirebon, kampus, mahasiswa, prodi, "
-            "fakultas, FTI, FEB, FPS, Teknik Informatika, Sistem Informasi, DKV, Manajemen, "
-            "Akuntansi, Bisnis Digital, pendaftaran, PMB, beasiswa, UKT, biaya kuliah, KRS, wisuda."
-        )
+        self.pesan_status = "belum dimuat"
+        self._kunci = threading.Lock()
 
         try:
             from koreksi_asr import KoreksiAsr  # modul lama tetap dipakai
@@ -81,95 +110,90 @@ class SttEngine:
         self._muat_model()
 
     # ── Pemuatan model ────────────────────────────────────────────────────────
-    def _apakah_lengkap(self, nama: str) -> bool:
-        akar = os.path.join(self.direktori_model, f"models--Systran--faster-whisper-{nama}")
-        snap = os.path.join(akar, "snapshots")
-        if not os.path.isdir(snap):
-            return False
-        try:
-            for folder in os.listdir(snap):
-                berkas = os.path.join(snap, folder, "model.bin")
-                if os.path.exists(berkas) and os.path.getsize(berkas) > 10 * 1024 * 1024:
-                    return True
-        except Exception:
-            pass
-        return False
+    def _jalur(self, nama: str) -> str:
+        return os.path.join(self.direktori_model, nama)
 
-    def _coba_muat(self, nama: str):
-        from faster_whisper import WhisperModel
-
-        kandidat = []
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                kandidat.append(("cuda", "float16"))
-        except Exception:
-            pass
-        kandidat.append(("cpu", "int8"))
-
-        for perangkat, tipe in kandidat:
-            try:
-                model = WhisperModel(
-                    nama, device=perangkat, compute_type=tipe, download_root=self.direktori_model
-                )
-                # Probe ringan untuk memastikan backend benar-benar berfungsi.
-                list(model.transcribe(io.BytesIO(self._wav_uji()), language="id", beam_size=5)[0])
-                return model, perangkat
-            except Exception as galat:
-                print(f"[STT] '{nama}' pada {perangkat} gagal: {galat}")
-        return None, ""
-
-    @staticmethod
-    def _wav_uji() -> bytes:
-        """WAV hening 0,5 detik untuk probe backend (di memori)."""
-        import math
-        import struct
-        import wave
-
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(16000)
-            bingkai = [int(9000 * math.sin(2 * math.pi * 440 * i / 16000)) for i in range(8000)]
-            wav.writeframes(struct.pack("<" + "h" * len(bingkai), *bingkai))
-        return buf.getvalue()
+    def _semua_berkas_ada(self) -> bool:
+        return all(
+            os.path.exists(self._jalur(n))
+            for n in (BERKAS_ENCODER, BERKAS_DECODER, BERKAS_JOINER, BERKAS_TOKENS)
+        )
 
     def _muat_model(self) -> None:
         try:
-            import faster_whisper  # noqa: F401
+            import sherpa_onnx
         except Exception:
             self.apakah_siap = False
-            print("[STT] faster-whisper belum terpasang. Jalankan: pip install faster-whisper")
+            self.pesan_status = "paket sherpa-onnx belum terpasang"
+            print("[STT] sherpa-onnx belum terpasang. Jalankan: pip install sherpa-onnx")
             return
 
-        urutan = [self.ukuran_model] + [m for m in MODEL_PILIHAN if m != self.ukuran_model]
-        for nama in urutan:
-            if not self._apakah_lengkap(nama) and nama != self.ukuran_model:
-                continue
-            model, perangkat = self._coba_muat(nama)
-            if model is not None:
-                self.model = model
-                self.nama_model_aktif = nama
-                self.perangkat_aktif = perangkat
-                self.apakah_siap = True
-                print(f"[STT] Whisper '{nama}' siap pada {perangkat}.")
-                return
-        self.apakah_siap = False
-        print("[STT] Tidak ada model Whisper yang bisa dimuat.")
+        if not self._semua_berkas_ada():
+            self.apakah_siap = False
+            self.pesan_status = "berkas model zipformer belum lengkap"
+            print(
+                f"[STT] Model streaming belum lengkap di {self.direktori_model}. "
+                "Jalankan: python ai-engine/persiapan_model.py --unduh-asr"
+            )
+            return
 
-    # ── Decoding (100% memori) ────────────────────────────────────────────────
-    def _decode_pcm16k(self, data_audio: bytes):
-        """Decode audio apa pun menjadi float32 mono 16 kHz tanpa menyentuh disk."""
         try:
-            from faster_whisper.audio import decode_audio
-
-            pcm = decode_audio(io.BytesIO(data_audio), sampling_rate=16000)
-            if pcm is not None and len(pcm) > 0:
-                return pcm
+            self.recognizer = sherpa_onnx.OnlineRecognizer.from_transducer(
+                tokens=self._jalur(BERKAS_TOKENS),
+                encoder=self._jalur(BERKAS_ENCODER),
+                decoder=self._jalur(BERKAS_DECODER),
+                joiner=self._jalur(BERKAS_JOINER),
+                num_threads=int(os.environ.get("SELA_ASR_THREAD", "2")),
+                sample_rate=SAMPLE_RATE,
+                feature_dim=80,
+                # greedy_search sudah cukup akurat untuk model kecil ini dan
+                # paling cepat — penting untuk latensi real-time.
+                decoding_method="greedy_search",
+                # Deteksi akhir ucapan: pengguna berhenti -> SELA langsung menjawab.
+                enable_endpoint_detection=True,
+                rule1_min_trailing_silence=HENING_AKHIR_TANPA_TEKS,
+                rule2_min_trailing_silence=HENING_AKHIR_SETELAH_TEKS,
+                rule3_min_utterance_length=MAKS_PANJANG_UCAPAN,
+                provider="cpu",
+            )
         except Exception as galat:
-            print(f"[STT] Decode PyAV/BytesIO gagal ({galat}); coba soundfile.")
+            self.apakah_siap = False
+            self.pesan_status = f"gagal memuat model: {galat}"
+            print(f"[STT] Gagal memuat model sherpa-onnx: {galat}")
+            return
+
+        self.apakah_siap = True
+        self.nama_model_aktif = "sherpa-onnx-streaming-zipformer-ar_en_id_ja_ru_th_vi_zh"
+        self.perangkat_aktif = "cpu"
+        self.pesan_status = "sherpa-onnx streaming zipformer siap (realtime, kata per kata)"
+        print(f"[STT] {self.nama_model_aktif} siap (streaming, cpu).")
+
+    # ── Decoding audio ke PCM 16 kHz mono (100% memori) ───────────────────────
+    @staticmethod
+    def _ke_mono_16k(data_audio: bytes):
+        """
+        Decode audio apa pun (WebM/Opus/WAV/MP3/OGG) menjadi float32 mono 16 kHz.
+
+        PyAV dipakai lebih dulu karena browser mengirim `audio/webm` (Opus) yang
+        tidak bisa dibaca soundfile. soundfile tetap menjadi cadangan untuk
+        WAV/FLAC/OGG.
+        """
+        try:
+            import av  # PyAV
+            import numpy as np
+
+            with av.open(io.BytesIO(data_audio)) as wadah:
+                aliran = wadah.streams.audio[0]
+                potongan = []
+                resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+                for bingkai in wadah.decode(aliran):
+                    for hasil in resampler.resample(bingkai):
+                        arr = hasil.to_ndarray()
+                        potongan.append(np.asarray(arr, dtype="float32").reshape(-1))
+                if potongan:
+                    return np.concatenate(potongan).astype("float32") / 32768.0
+        except Exception as galat:
+            print(f"[STT] Decode PyAV gagal ({galat}); coba soundfile.")
 
         try:
             import numpy as np
@@ -182,11 +206,9 @@ class SttEngine:
                 return None
             if data.ndim > 1:
                 data = data.mean(axis=1)
-            if sr != 16000:
-                # Resampling linier sederhana (cukup untuk gate energi + ASR).
-                import math
-
-                n_target = int(len(data) * 16000 / sr)
+            if sr != SAMPLE_RATE:
+                # Resampling linier sederhana — cukup untuk ASR.
+                n_target = int(len(data) * SAMPLE_RATE / sr)
                 idx = np.linspace(0, len(data) - 1, n_target)
                 data = np.interp(idx, np.arange(len(data)), data).astype(np.float32)
             return data
@@ -204,45 +226,126 @@ class SttEngine:
             return 0.0
 
     @staticmethod
-    def _normalisasi_bahasa(bahasa: Optional[str]) -> Optional[str]:
+    def _normalisasi_bahasa(bahasa: Optional[str]) -> str:
         kode = (bahasa or "id").strip().lower().replace("_", "-").split("-")[0]
-        if kode == "auto":
-            return None
-        if kode in ("jv", "jw", "jawa"):
+        if kode in ("jv", "jw", "jawa", "su", "sunda"):
             return "id"
-        if kode.startswith("en"):
-            return "en"
-        return "id"
+        return kode or "id"
 
-    def _params(self, kode_bahasa) -> Dict[str, Any]:
-        return dict(
-            language=kode_bahasa,
-            initial_prompt=self.prompt_konteks,
-            beam_size=5,
-            best_of=5,
-            patience=1.0,
-            vad_filter=True,
-            vad_parameters=dict(min_silence_duration_ms=400, speech_pad_ms=300, threshold=0.35),
-            condition_on_previous_text=False,
-            compression_ratio_threshold=2.4,
-            log_prob_threshold=-1.0,
-            no_speech_threshold=0.6,
-            repetition_penalty=1.2,
-        )
+    def _koreksi(self, teks: str) -> str:
+        """Perbaiki istilah kampus UCIC yang sering salah dengar."""
+        if teks and self.koreksi is not None:
+            try:
+                teks_terkoreksi = self.koreksi.koreksi_teks(teks)
+                if teks_terkoreksi != teks:
+                    print(f"[STT] Auto-correct: '{teks}' -> '{teks_terkoreksi}'")
+                    return teks_terkoreksi
+            except Exception:
+                pass
+        return teks
 
-    # ── Transkripsi utama ─────────────────────────────────────────────────────
+    @staticmethod
+    def _buang_halusinasi(teks: str) -> bool:
+        """True bila teks tampak seperti pengulangan halusinatif."""
+        if re.search(r"(\b\w+\b)(?:\s*[,.]?\s*\1){2,}", teks, re.IGNORECASE):
+            return True
+        if re.search(r"(\w{2,3})\1{3,}", teks, re.IGNORECASE):
+            return True
+        return False
+
+    # ── Jalur STREAMING (utama) ───────────────────────────────────────────────
+    def buat_sesi(self) -> Optional[SesiAsr]:
+        """Buat sesi streaming baru. None bila model belum siap."""
+        if not (self.apakah_siap and self.recognizer is not None):
+            return None
+        try:
+            return SesiAsr(self.recognizer.create_stream())
+        except Exception as galat:
+            print(f"[STT] Gagal membuat sesi streaming: {galat}")
+            return None
+
+    def terima_pcm(self, sesi: Optional[SesiAsr], data_pcm) -> Optional[str]:
+        """
+        Suapkan potongan audio ke sesi dan kembalikan teks terkini.
+
+        `data_pcm` boleh berupa byte PCM 16-bit mono 16 kHz (dari browser) atau
+        array float32. Setiap panggilan men-decode potongan yang sudah siap dan
+        mengembalikan teks sementara (bisa bertambah kata demi kata).
+        """
+        if sesi is None or not self.recognizer:
+            return None
+        try:
+            import numpy as np
+
+            if isinstance(data_pcm, (bytes, bytearray)):
+                if not data_pcm:
+                    return sesi.teks_terakhir
+                sampel = np.frombuffer(bytes(data_pcm), dtype=np.int16).astype("float32") / 32768.0
+            else:
+                sampel = np.asarray(data_pcm, dtype="float32").reshape(-1)
+            if sampel.size == 0:
+                return sesi.teks_terakhir
+
+            with self._kunci:
+                sesi.stream.accept_waveform(SAMPLE_RATE, sampel)
+                sesi.jumlah_bingkai += 1
+                while self.recognizer.is_ready(sesi.stream):
+                    self.recognizer.decode_stream(sesi.stream)
+                teks = self.recognizer.get_result(sesi.stream) or ""
+            sesi.teks_terakhir = teks.strip()
+            return sesi.teks_terakhir
+        except Exception as galat:
+            print(f"[STT] Kendala saat menerima audio: {galat}")
+            return sesi.teks_terakhir
+
+    def apakah_akhir_ucapan(self, sesi: Optional[SesiAsr]) -> bool:
+        """True bila model mendeteksi pengguna sudah berhenti bicara."""
+        if sesi is None or not self.recognizer:
+            return False
+        try:
+            with self._kunci:
+                return bool(self.recognizer.is_endpoint(sesi.stream))
+        except Exception:
+            return False
+
+    def akhirkan(self, sesi: Optional[SesiAsr]) -> str:
+        """Tutup sesi dan kembalikan teks final (setelah sisa audio di-decode)."""
+        if sesi is None or not self.recognizer:
+            return ""
+        try:
+            import numpy as np
+
+            with self._kunci:
+                # Ekor hening 0,1 detik agar sisa bingkai yang masih tertahan di
+                # dalam stream ikut ter-decode sebelum hasil final dibaca.
+                sesi.stream.accept_waveform(
+                    SAMPLE_RATE, np.zeros(SAMPLE_RATE // 10, dtype="float32")
+                )
+                sesi.stream.input_finished()
+                while self.recognizer.is_ready(sesi.stream):
+                    self.recognizer.decode_stream(sesi.stream)
+                teks = (self.recognizer.get_result(sesi.stream) or "").strip()
+        except Exception as galat:
+            print(f"[STT] Gagal menutup sesi: {galat}")
+            teks = sesi.teks_terakhir
+        if self._buang_halusinasi(teks):
+            print(f"[STT] Abaikan halusinasi (kata berulang): {teks}")
+            teks = ""
+        return self._koreksi(teks)
+
+    # ── Jalur BATCH (cadangan, kompatibel dengan /api/transcribe) ─────────────
     def transkripsikan_bytes(self, data_audio: bytes, bahasa: str = "id") -> Dict[str, Any]:
         """Ubah byte audio menjadi teks. Selalu mengembalikan dict, tidak pernah raise."""
         if not data_audio or len(data_audio) < 1000:
             return {"teks": "", "pesan": "Audio terlalu pendek", "sukses": True}
-        if not (self.apakah_siap and self.model is not None):
-            return {"teks": "", "pesan": "Model Whisper belum siap", "sukses": False}
+        if not (self.apakah_siap and self.recognizer is not None):
+            return {"teks": "", "pesan": "Model ASR belum siap", "sukses": False}
 
-        pcm = self._decode_pcm16k(data_audio)
+        pcm = self._ke_mono_16k(data_audio)
         if pcm is None:
             return {"teks": "", "pesan": "Format audio tidak dikenali", "sukses": True}
 
-        durasi = len(pcm) / 16000.0
+        durasi = len(pcm) / float(SAMPLE_RATE)
         energi = self._rms(pcm)
         if durasi < DURASI_MIN_DETIK:
             return {"teks": "", "pesan": "Audio terlalu pendek", "sukses": True}
@@ -255,47 +358,29 @@ class SttEngine:
                 "energi": round(energi, 4),
             }
 
-        kode = self._normalisasi_bahasa(bahasa)
-        try:
-            segmen, info = self.model.transcribe(pcm, **self._params(kode))
-            potongan = []
-            for seg in segmen:
-                if getattr(seg, "no_speech_prob", 0) > 0.6:
-                    continue
-                teks_seg = seg.text.strip()
-                if not teks_seg:
-                    continue
-                if re.search(r"(\b\w+\b)(?:\s*[,.]?\s*\1){2,}", teks_seg, re.IGNORECASE):
-                    print(f"[STT] Abaikan halusinasi (kata berulang): {teks_seg}")
-                    continue
-                if re.search(r"(\w{2,3})\1{3,}", teks_seg, re.IGNORECASE):
-                    print(f"[STT] Abaikan halusinasi (suku berulang): {teks_seg}")
-                    continue
-                potongan.append(teks_seg)
-
-            teks = " ".join(potongan).strip()
-            if teks and self.koreksi is not None:
-                teks_terkoreksi = self.koreksi.koreksi_teks(teks)
-                if teks_terkoreksi != teks:
-                    print(f"[STT] Auto-correct: '{teks}' -> '{teks_terkoreksi}'")
-                    teks = teks_terkoreksi
-
-            return {
-                "teks": teks,
-                "sukses": True,
-                "bahasa": getattr(info, "language", kode or "id"),
-                "durasi": round(durasi, 2),
-                "energi": round(energi, 4),
-            }
-        except Exception as galat:
-            print(f"[STT] Galat transkripsi: {galat}")
-            return {"teks": "", "pesan": f"Galat transkripsi: {galat}", "sukses": False}
+        sesi = self.buat_sesi()
+        if sesi is None:
+            return {"teks": "", "pesan": "Sesi ASR gagal dibuat", "sukses": False}
+        # Suapkan per 0,5 detik supaya jalur batch memakai mekanisme streaming
+        # yang sama persis dengan jalur real-time.
+        langkah = SAMPLE_RATE // 2
+        for i in range(0, len(pcm), langkah):
+            self.terima_pcm(sesi, pcm[i : i + langkah])
+        teks = self.akhirkan(sesi)
+        return {
+            "teks": teks,
+            "sukses": True,
+            "bahasa": self._normalisasi_bahasa(bahasa),
+            "durasi": round(durasi, 2),
+            "energi": round(energi, 4),
+        }
 
     def info(self) -> Dict[str, Any]:
         return {
             "apakah_siap": self.apakah_siap,
             "model": self.nama_model_aktif,
             "perangkat": self.perangkat_aktif,
+            "streaming": True,
         }
 
 

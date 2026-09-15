@@ -31,26 +31,26 @@ function TtsStatusBadge() {
 
   if (!status) return null // Belum ada data
 
-  if (status.piper_siap) {
+  if (status.tts_siap) {
     return (
       <div
         id="tts-status-badge"
-        title={status.pesan_status || "Piper TTS siap"}
+        title={status.pesan_status || "Supertonic 3 TTS siap"}
         className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 border border-emerald-300 dark:border-emerald-600"
       >
         <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
         <span className="text-[9px] font-bold text-emerald-700 dark:text-emerald-300 uppercase tracking-wide hidden sm:inline">
-          Piper
+          Suara Siap
         </span>
       </div>
     )
   }
 
-  if (status.engine_aktif === "piper-unavailable") {
+  if (status.engine_aktif === "supertonic-unavailable") {
     return (
       <div
         id="tts-status-badge"
-        title={status.pesan_status || "Piper TTS gagal diinisialisasi"}
+        title={status.pesan_status || "Supertonic 3 TTS gagal diinisialisasi"}
         className="flex items-center gap-1 px-2 py-1 rounded-lg bg-amber-100 dark:bg-amber-900/40 border border-amber-300 dark:border-amber-600"
       >
         <span className="w-2 h-2 rounded-full bg-amber-500" />
@@ -61,11 +61,11 @@ function TtsStatusBadge() {
     )
   }
 
-  // Piper sedang memuat
+  // Model suara sedang dimuat
   return (
     <div
       id="tts-status-badge"
-      title="Memuat model Piper..."
+      title="Memuat model suara Supertonic 3..."
       className="flex items-center gap-1 px-2 py-1 rounded-lg bg-blue-100 dark:bg-blue-900/40 border border-blue-300 dark:border-blue-600"
     >
       <span className="w-2 h-2 rounded-full bg-blue-500 animate-ping" />

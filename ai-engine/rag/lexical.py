@@ -4,9 +4,9 @@ SELA AI Desktop - Retriever Leksikal BM25 + Gerbang Cakupan IDF
 Pencarian kata kunci cerdas untuk basis pengetahuan resmi UCIC.
 
 Peran dalam arsitektur RAG:
-- Jalur UTAMA saat embedder semantik (bge-m3) belum tersedia, sehingga RAG
+- Jalur UTAMA saat embedder semantik (multilingual-e5-small) belum tersedia, sehingga RAG
   tetap presisi tanpa unduhan model besar.
-- Penguat PRESISI saat bge-m3 aktif (hybrid: leksikal + semantik).
+- Penguat PRESISI saat e5-small aktif (hybrid: leksikal + semantik).
 
 Mengapa lebih baik daripada pencarian fuzzy murni:
 1. BM25 dengan bobot medan: judul dan kata kunci berbobot 3x, isi 1x.

@@ -2,7 +2,7 @@
 SELA AI Desktop - Mesin RAG Anti-Halusinasi (Leksikal BM25 + Vektor opsional)
 =============================================================================
 Menggabungkan chunker jendela kalimat, retriever leksikal BM25, dan (bila
-tersedia) embedder semantik bge-m3 + vector store menjadi satu mesin
+tersedia) embedder semantik multilingual-e5-small + vector store menjadi satu mesin
 pencarian yang membumi pada data resmi UCIC.
 
 Anti-halusinasi berlapis:
@@ -11,7 +11,7 @@ Anti-halusinasi berlapis:
    luar kampus ("resep rendang", "siapa presiden") gagal di sini.
 2. Ambang relatif terhadap kandidat teratas, agar dokumen yang jauh lebih lemah
    tidak ikut menjadi konteks.
-3. Bila embedder bge-m3 aktif, ambang kosinus absolut 0,72 tetap diberlakukan
+3. Bila embedder e5-small aktif, ambang kosinus absolut 0,72 tetap diberlakukan
    sebagai lapisan tambahan pada jalur semantik.
 
 Sumber data: src/data/ucic_dataset.json (atau ai-engine/data/*.json).
@@ -138,7 +138,8 @@ class RagEngine:
             self.store = VectorStore(dimensi=self.embedder.dimensi, direktori=self.direktori_indeks)
             return
 
-        vektor = self.embedder.encode([c.teks for c in chunk_semua])
+        # Dokumen diindeks dengan prefiks "passage: " (konvensi wajib model e5).
+        vektor = self.embedder.encode([c.teks for c in chunk_semua], jenis="passage")
         self.store = VectorStore(dimensi=self.embedder.dimensi, direktori=self.direktori_indeks)
         self.store.tambah(vektor, [c.ke_metadata() for c in chunk_semua])
         self.store.simpan()
@@ -152,7 +153,7 @@ class RagEngine:
         """Muat indeks vektor bila embedder semantik siap; jika tidak, lewati."""
         self.store = VectorStore(dimensi=self.embedder.dimensi, direktori=self.direktori_indeks)
         if not self.embedder.metode.startswith("sentence-transformers"):
-            # Tanpa bge-m3, jalur vektor tidak dipakai; retriever leksikal BM25
+            # Tanpa e5-small, jalur vektor tidak dipakai; retriever leksikal BM25
             # yang menangani seluruh pencarian. Indeks lama tidak perlu dibangun.
             self.pesan_status = (
                 f"retriever leksikal BM25 siap: {self.total_dokumen} dokumen "
@@ -229,9 +230,10 @@ class RagEngine:
     def _gabung_semantik(
         self, kueri: str, kandidat: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """Gabungkan skor BM25 ternormalisasi dengan kemiripan kosinus bge-m3."""
+        """Gabungkan skor BM25 ternormalisasi dengan kemiripan kosinus e5-small."""
         try:
-            vektor_kueri = self.embedder.encode(kueri)
+            # Kueri diberi prefiks "query: " (konvensi wajib model e5).
+            vektor_kueri = self.embedder.encode(kueri, jenis="query")
             pasangan = self.store.cari(vektor_kueri, top_k=max(len(self.dokumen), 8))
         except Exception as galat:  # pragma: no cover - bergantung paket opsional
             print(f"[RAG] Jalur semantik dilewati: {galat}")
@@ -250,7 +252,7 @@ class RagEngine:
         for k in kandidat:
             id_dok = k["dokumen"].get("id", "")
             kos = kosinus_per_dok.get(id_dok, 0.0)
-            # Ambang kosinus absolut tetap berlaku bila embedder benar-benar bge-m3.
+            # Ambang kosinus absolut tetap berlaku bila embedder benar-benar e5-small.
             if self.embedder.metode.startswith("sentence-transformers") and kos < self.ambang:
                 kos = 0.0
             leks_norm = k["skor"] / skor_leks_max

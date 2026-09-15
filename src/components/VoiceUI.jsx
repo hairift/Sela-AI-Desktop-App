@@ -12,8 +12,8 @@ import {
   streamChatAndVoice,
   getTimeBasedGreeting,
   archiveConversationSession,
-  prepareTranscriptForRag,
-  looksLikeShortValidQuery,
+  mulaiAsrStreaming,
+  rapikanJawabanServer,
 } from "../lib/ai";
 
 // ── SVG Icons ────────────────────────────────────────────────────
@@ -153,6 +153,17 @@ const quickReplies = {
 
 // ─────────────────────────────────────────────────────────────────
 const SILENCE_DURATION = 800; // ms diam setelah ada suara → auto-stop lebih cepat
+// Jalur jawaban cepat: jawaban dialirkan per kalimat lewat /ws/dupleks sehingga
+// suara mulai berbunyi setelah kalimat pertama (bukan setelah seluruh jawaban).
+// Set SELA_STREAMING_JAWABAN=0 di localStorage untuk mematikan dan memakai jalur REST.
+const STREAMING_JAWABAN_AKTIF = (() => {
+  try {
+    return localStorage.getItem("SELA_STREAMING_JAWABAN") !== "0";
+  } catch (_) {
+    return true;
+  }
+})();
+
 const MIN_SPEECH_MS = 250; // ms minimum bicara — ramah pertanyaan pendek
 const MIN_BLOB_SIZE = 500; // bytes minimum audio
 const MAX_RECORD_MS = 25000; // 25 detik maksimal recording sebagai failsafe
@@ -229,6 +240,8 @@ export default function VoiceUI({
   const audioCtxRef = useRef(null);
   const analyserRef = useRef(null);
   const recorderRef = useRef(null);
+  const asrRef = useRef(null); // sesi ASR streaming yang sedang berjalan
+  const jawabanStreamRef = useRef(null); // sesi jawaban streaming (/ws/dupleks)
   const aiRequestSeqRef = useRef(0);
   const vadFrameRef = useRef(null);
   const silenceStartRef = useRef(null);
@@ -582,6 +595,12 @@ export default function VoiceUI({
   const stopListening = () => {
     isListeningRef.current = false;
     cancelAnimationFrame(vadFrameRef.current);
+    // Tutup sesi ASR streaming (socket + AudioContext khusus PCM).
+    const sesiAsr = asrRef.current;
+    asrRef.current = null;
+    try {
+      sesiAsr?.batal();
+    } catch (_) {} // eslint-disable-line no-empty
     if (recorderRef.current?.state !== "inactive") {
       recorderRef.current?.stop();
     }
@@ -606,10 +625,14 @@ export default function VoiceUI({
       return;
     }
     if (isListeningRef.current) {
-      if (recorderRef.current && recorderRef.current.state !== "inactive") {
+      // Tekan lagi = "saya sudah selesai bicara": minta teks final ke server,
+      // lalu `onFinal` yang memproses pertanyaannya.
+      if (asrRef.current) {
         hasSpeechRef.current = true;
         if (!speechStartRef.current) speechStartRef.current = Date.now() - 600;
-        recorderRef.current.stop();
+        asrRef.current.hentikan();
+      } else {
+        stopListening();
       }
       return;
     }
@@ -708,227 +731,99 @@ export default function VoiceUI({
       source.connect(analyser);
       analyserRef.current = analyser;
 
-      // MediaRecorder
-      const recorder = new MediaRecorder(stream);
-      recorderRef.current = recorder;
-      let chunks = [];
+      // ── ASR STREAMING (sherpa-onnx): transkrip muncul kata per kata ──────
+      // Menggantikan MediaRecorder + unggah blob. Audio dialirkan sebagai PCM
+      // 16 kHz ke /ws/asr-stream sehingga pengguna melihat teksnya hidup, dan
+      // server memberi tahu saat pengguna berhenti bicara.
+      rmsMaxSiklusIniRef.current = 0;
+      hasSpeechRef.current = false;
+      speechStartRef.current = null;
 
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
-
-      recorder.onstop = () => {
-        if (suppressRecorderOnStopRef.current) {
-          chunks = [];
-          stopListening();
-          suppressRecorderOnStopRef.current = false;
-          return;
-        }
-        const speechDuration = speechStartRef.current
-          ? Date.now() - speechStartRef.current
-          : 0;
-        const audioBlob = new Blob(chunks, { type: "audio/webm" });
-        const hadSpeech = hasSpeechRef.current;
-        
-        if (
-          !hadSpeech ||
-          speechDuration < MIN_SPEECH_MS ||
-          audioBlob.size < MIN_BLOB_SIZE
-        ) {
-          console.log("[SELA] Skip — noise/pendek/kecil:", {
-            hadSpeech,
-            speechDuration,
-            blobSize: audioBlob.size,
-          });
-
-          // Siklus hening/noise biasa — kembali ke idle (tidak auto-restart)
-          rmsMaxSiklusIniRef.current = 0;
-          setAvatarState("idle");
-          stopListening();
-          return;
-        }
-
-        console.log(
-          "[SELA] recorder.onstop | hadSpeech:",
-          hadSpeech,
-          "| speechDuration:",
-          speechDuration,
-          "ms | firstSpeechDelay:",
-          firstSpeechDetectedAtRef.current && baselineStartedAtRef.current
-            ? firstSpeechDetectedAtRef.current - baselineStartedAtRef.current
-            : null,
-          "ms | blobSize:",
-          audioBlob.size,
-        );
-        stopListening();
-
-        if (
-          !hadSpeech ||
-          speechDuration < MIN_SPEECH_MS ||
-          audioBlob.size < MIN_BLOB_SIZE
-        ) {
-          console.log("[SELA] Skip — noise/pendek/kecil:", {
-            hadSpeech,
-            speechDuration,
-            blobSize: audioBlob.size,
-          });
-          setAvatarState("idle");
-          return;
-        }
-
-        // Ada suara valid → proses
-        console.log("[SELA] Ada suara valid, mulai processing...");
-        processAudioRef.current(audioBlob);
-      };
-
-      recorder.start(100);
-      setAvatarState("listening");
-      baselineStartedAtRef.current = Date.now();
-
-      // Failsafe: force stop setelah MAX_RECORD_MS
-      const maxTimer = setTimeout(() => {
-        if (recorderRef.current?.state !== "inactive")
-          recorderRef.current.stop();
-      }, MAX_RECORD_MS);
-
-      // ── Baseline sampling phase (500ms) ────────────────────
-      const data = new Uint8Array(analyser.fftSize);
-      let baselineRmsValues = [];
-
-      const baselineCheck = () => {
+      // Pantauan mikrofon: hanya untuk tahu apakah mikrofon benar-benar
+      // menangkap suara. Penentuan giliran bicara dilakukan server (VAD
+      // sherpa-onnx), jadi tidak ada lagi ambang ganda di sisi klien.
+      const dataMic = new Uint8Array(analyser.fftSize);
+      const pantauMikrofon = () => {
         if (!isListeningRef.current) return;
-
-        analyser.getByteTimeDomainData(data);
-        const rms = Math.sqrt(
-          data.reduce((s, v) => s + (v - 128) * (v - 128), 0) / data.length,
-        );
-        baselineRmsValues.push(rms);
-        const avgSoFar =
-          baselineRmsValues.reduce((a, b) => a + b, 0) /
-          baselineRmsValues.length;
-        const provisionalThreshold = Math.max(
-          MIN_RMS_FOR_VALID_SPEECH,
-          avgSoFar * EARLY_SPEECH_THRESHOLD_MULTIPLIER,
-        );
-
-        if (rms > provisionalThreshold && !hasSpeechRef.current) {
+        analyser.getByteTimeDomainData(dataMic);
+        let jumlah = 0;
+        for (let i = 0; i < dataMic.length; i++) {
+          const d = dataMic[i] - 128;
+          jumlah += d * d;
+        }
+        const rms = Math.sqrt(jumlah / dataMic.length);
+        if (rms > rmsMaxSiklusIniRef.current) rmsMaxSiklusIniRef.current = rms;
+        if (rms > MIN_RMS_FOR_VALID_SPEECH && !hasSpeechRef.current) {
           hasSpeechRef.current = true;
           speechStartRef.current = Date.now();
-          firstSpeechDetectedAtRef.current = speechStartRef.current;
-          dynamicThresholdRef.current = Math.max(
-            MIN_RMS_FOR_VALID_SPEECH,
-            avgSoFar * THRESHOLD_MULTIPLIER,
-          );
-          console.log("[SELA VAD] Early speech detected during baseline", {
-            rms: Number(rms.toFixed(2)),
-            provisionalThreshold: Number(provisionalThreshold.toFixed(2)),
-            threshold: Number(dynamicThresholdRef.current.toFixed(2)),
-          });
-          startActualVAD();
+        }
+        vadFrameRef.current = requestAnimationFrame(pantauMikrofon);
+      };
+      vadFrameRef.current = requestAnimationFrame(pantauMikrofon);
+
+      let sudahDiproses = false;
+
+      const tanganiFinal = (teks) => {
+        if (sudahDiproses) return;
+        sudahDiproses = true;
+        asrRef.current = null;
+        const sempatBicara = hasSpeechRef.current;
+        const rmsPuncak = rmsMaxSiklusIniRef.current;
+        stopListening();
+        setValue("");
+        setAvatarState("idle");
+
+        const bersih = (teks || "").trim();
+        if (!bersih) {
+          // Tidak ada kata sama sekali. Bila mikrofon juga tidak pernah
+          // menangkap suara, beri tahu pengguna bahwa mikrofonnya tidak aktif.
+          if (!sempatBicara || rmsPuncak < MIN_RMS_FOR_VALID_SPEECH) {
+            setMicTidakAktif(true);
+          }
+          isProcessingRef.current = false;
           return;
         }
 
-        if (Date.now() - baselineStartedAtRef.current < BASELINE_SAMPLE_MS) {
-          vadFrameRef.current = requestAnimationFrame(baselineCheck);
-        } else {
-          const avgBaseline =
-            baselineRmsValues.reduce((a, b) => a + b, 0) /
-            baselineRmsValues.length;
-
-          // Calculate baseline variance — stable/low variance = noise floor
-          const variance =
-            baselineRmsValues.reduce(
-              (sq, x) => sq + (x - avgBaseline) * (x - avgBaseline),
-              0,
-            ) / baselineRmsValues.length;
-
-          dynamicThresholdRef.current = Math.max(
-            MIN_RMS_FOR_VALID_SPEECH,
-            avgBaseline * THRESHOLD_MULTIPLIER,
-          );
-          console.log(
-            "[SELA VAD] Baseline:",
-            avgBaseline.toFixed(2),
-            "| Variance:",
-            variance.toFixed(2),
-            "→ Dynamic Threshold:",
-            dynamicThresholdRef.current.toFixed(2),
-          );
-          startActualVAD();
+        // Buang gumaman/filler mikrofon.
+        const isNoise =
+          bersih.length < 2 || /^(uh|um|ah|eh|oh|hmm|hm|mm|m)$/i.test(bersih);
+        if (isNoise) {
+          console.log("[SELA] Diabaikan (filler mikrofon):", bersih);
+          isProcessingRef.current = false;
+          return;
         }
+
+        console.log("[SELA ASR] Transkrip final:", bersih);
+        markSessionInteraction();
+        if (isFarewell(bersih)) {
+          handleFarewell(bersih);
+          return;
+        }
+        onSend(bersih);
+        handleAssistantInteraction(bersih, true);
       };
 
-      // Start baseline sampling
-      vadFrameRef.current = requestAnimationFrame(baselineCheck);
+      asrRef.current = mulaiAsrStreaming({
+        bahasa: lang,
+        stream,
+        onParsial: (teks) => {
+          if (teks) setValue(teks);
+        },
+        onFinal: tanganiFinal,
+        onGalat: (err) => {
+          console.warn("[SELA ASR] Streaming gagal:", err?.message);
+          stopListening();
+          setAvatarState("idle");
+          isProcessingRef.current = false;
+        },
+      });
 
-      // ── Actual VAD loop ────────────────────────────────────
-      const startActualVAD = () => {
-        let logThrottle = 0;
-        const checkSilence = () => {
-          if (!isListeningRef.current) {
-            clearTimeout(maxTimer);
-            return;
-          }
-          analyser.getByteTimeDomainData(data);
-          // Nilai time-domain: 128 = silence, deviation dari 128 = ada suara
-          const rms = Math.sqrt(
-            data.reduce((s, v) => s + (v - 128) * (v - 128), 0) / data.length,
-          );
-
-          // Log RMS setiap ~500ms supaya bisa debug threshold
-          logThrottle++;
-          if (logThrottle % 30 === 0)
-            console.log(
-              "[SELA VAD] RMS:",
-              rms.toFixed(2),
-              "| threshold:",
-              dynamicThresholdRef.current.toFixed(2),
-              "| hasSpeech:",
-              hasSpeechRef.current,
-            );
-          // Lacak RMS maksimum siklus ini untuk deteksi mikrofon tidak aktif
-          if (rms > rmsMaxSiklusIniRef.current) {
-            rmsMaxSiklusIniRef.current = rms;
-          }
-
-          if (rms > dynamicThresholdRef.current) {
-
-            if (!hasSpeechRef.current) {
-              hasSpeechRef.current = true;
-              speechStartRef.current = Date.now();
-              firstSpeechDetectedAtRef.current = speechStartRef.current;
-              console.log("[SELA VAD] Speech detected! RMS:", rms.toFixed(2));
-            }
-            silenceStartRef.current = null;
-          } else if (hasSpeechRef.current) {
-            if (!silenceStartRef.current) {
-              silenceStartRef.current = Date.now();
-              console.log("[SELA VAD] Silence window started");
-            } else if (
-              Date.now() - silenceStartRef.current >
-              (speechStartRef.current &&
-              Date.now() - speechStartRef.current >= QUICK_COMMIT_MIN_SPEECH_MS
-                ? QUICK_COMMIT_SILENCE_MS
-                : SILENCE_DURATION)
-            ) {
-              // Diam cukup lama → stop otomatis
-              console.log("[SELA VAD] Auto-stop commit", {
-                speechMs: speechStartRef.current
-                  ? Date.now() - speechStartRef.current
-                  : 0,
-                silenceMs: Date.now() - silenceStartRef.current,
-              });
-              clearTimeout(maxTimer);
-              if (recorderRef.current?.state !== "inactive") {
-                recorderRef.current.stop();
-              }
-              return;
-            }
-          }
-          vadFrameRef.current = requestAnimationFrame(checkSilence);
-        };
-        vadFrameRef.current = requestAnimationFrame(checkSilence);
-      };
+      const asrSiap = await asrRef.current.mulai();
+      if (!asrSiap) {
+        stopListening();
+        setAvatarState("idle");
+        isProcessingRef.current = false;
+      }
     } catch (err) {
       console.error("[SELA] Mic error:", err);
       if (err.name === "NotFoundError" || err.name === "DevicesNotFoundError") {
@@ -944,6 +839,87 @@ export default function VoiceUI({
       isListeningRef.current = false;
     }
   };
+
+  // ── Jalur jawaban cepat (WebSocket /ws/dupleks) ──────────────────────────
+  // Barge-in khusus jalur streaming: hentikan aliran server + audio klien.
+  const handleBargeInJawaban = () => {
+    try {
+      jawabanStreamRef.current?.cancel();
+    } catch (_) {} // eslint-disable-line no-empty
+    jawabanStreamRef.current = null;
+    stopSpeaking();
+    hentikanMonitorBargeIn();
+    setAvatarState("idle");
+    isProcessingRef.current = false;
+  };
+
+  // Alirkan jawaban per kalimat. Mengembalikan true bila berhasil (teks sudah
+  // ditampilkan dan suara mengalir), false bila harus jatuh ke jalur REST.
+  const alirkanJawabanCepat = (userText, history, requestId) =>
+    new Promise((resolve) => {
+      let teksTerkumpul = "";
+      let sudahSelesai = false;
+      const selesaikan = (hasil) => {
+        if (sudahSelesai) return;
+        sudahSelesai = true;
+        jawabanStreamRef.current = null;
+        resolve(hasil);
+      };
+
+      const sesi = streamChatAndVoice({
+        query: userText,
+        history,
+        lang,
+        onTextChunk: (kalimat) => {
+          if (requestId !== aiRequestSeqRef.current) return;
+          teksTerkumpul = teksTerkumpul ? `${teksTerkumpul} ${kalimat}` : kalimat;
+        },
+        onStart: () => {
+          if (requestId !== aiRequestSeqRef.current) return;
+          setIsWaitingAI(false);
+          setAvatarState("speaking");
+          mulaiMonitorBargeIn(handleBargeInJawaban);
+        },
+        onEnd: () => {
+          hentikanMonitorBargeIn();
+          setAvatarState("idle");
+          isProcessingRef.current = false;
+        },
+        onDone: (data) => {
+          if (requestId !== aiRequestSeqRef.current) return;
+          setIsWaitingAI(false);
+          const jawaban = rapikanJawabanServer(
+            data?.teks_penuh || teksTerkumpul,
+            lang,
+            data?.gerakan,
+          );
+          if (jawaban.text === "[IGNORE_NOISE]") {
+            console.log("[SELA Streaming] AI mengabaikan input (noise).");
+            isProcessingRef.current = false;
+            setAvatarState("idle");
+            selesaikan(true);
+            return;
+          }
+          if (!jawaban.text?.trim()) {
+            selesaikan(false);
+            return;
+          }
+          if (onReceive) onReceive(jawaban);
+          markSessionInteraction();
+          jalankanGerakan(jawaban.gerakan);
+          setLatestSpokenText(jawaban.spokenText);
+          selesaikan(true);
+        },
+        onError: () => selesaikan(false),
+      });
+
+      if (!sesi) {
+        selesaikan(false);
+        return;
+      }
+      jawabanStreamRef.current = sesi;
+    });
+
 
   // ── Penanganan Interaksi Asisten (RAG Anti-Halusinasi Cepat & Responsif) ──
   const handleAssistantInteraction = async (userText, isVoice = false) => {
@@ -966,6 +942,19 @@ export default function VoiceUI({
           ),
       );
     history.push({ role: "user", content: userText });
+
+    // ── JALUR CEPAT (real-time): jawaban mengalir per kalimat ────────────────
+    // Suara mulai berbunyi begitu kalimat pertama siap, bukan setelah seluruh
+    // jawaban selesai. Bila gagal, jatuh ke jalur REST di bawah tanpa error.
+    if (STREAMING_JAWABAN_AKTIF) {
+      const berhasil = await alirkanJawabanCepat(userText, history, requestId);
+      if (berhasil) return;
+      if (requestId !== aiRequestSeqRef.current) return;
+      console.warn("[SELA Streaming] Beralih ke jalur REST biasa.");
+      setIsWaitingAI(true);
+      setAvatarState("thinking");
+      isProcessingRef.current = true;
+    }
 
     try {
       // 1. Eksekusi RAG Anti-Halusinasi & Pencocokan Fakta Kampus UCIC
@@ -1008,62 +997,6 @@ export default function VoiceUI({
     }
   };
 
-  // ── Process audio → transcribe → AI → TTS ────────────────────
-  // Juga disimpan di ref supaya startListening bisa memanggilnya
-  const processAudioRef = useRef(null);
-  processAudioRef.current = async (audioBlob) => {
-    isProcessingRef.current = true;
-    setAvatarState("thinking");
-    try {
-      const rawText = await transcribeAudio(audioBlob, lang);
-
-      // Check if server filtered out background audio
-      if (!rawText || rawText.trim().length === 0) {
-        console.log("[SELA] Server filtered out background audio");
-        isProcessingRef.current = false;
-        setAvatarState("idle");
-        return;
-      }
-
-      const preparedTranscript = prepareTranscriptForRag(rawText);
-      const text = preparedTranscript.cleanedText;
-      console.log("[SELA Voice] Transcript pipeline:", {
-        rawText: preparedTranscript.rawText,
-        cleanedText: preparedTranscript.cleanedText,
-        marker: preparedTranscript.marker,
-        removedSegments: preparedTranscript.removedSegments,
-      });
-
-      // 1. Filter Client-Side: Hanya buang jika benar-benar kosong atau suara gumaman/filler mikrofon
-      const trimmedText = text?.trim() || "";
-      const isNoise =
-        !trimmedText ||
-        trimmedText.length < 2 ||
-        /^(uh|um|ah|eh|oh|hmm|hm|mm|m)$/i.test(trimmedText);
-
-      if (isNoise) {
-        console.log("[SELA] Diabaikan (filler mikrofon):", text);
-        isProcessingRef.current = false;
-        setAvatarState("idle");
-        return;
-      }
-
-      markSessionInteraction();
-      if (isFarewell(text)) {
-        handleFarewell(text);
-        return;
-      }
-
-      onSend(text);
-      await handleAssistantInteraction(text, true);
-    } catch (error) {
-      console.error(error);
-      setIsWaitingAI(false);
-      if (onReceive) onReceive(t[lang].error_stt);
-      setAvatarState("idle");
-      isProcessingRef.current = false;
-    }
-  };
 
   // ── Bersihkan audio saat unmount (tidak auto-listen) ──────────
   useEffect(() => {
