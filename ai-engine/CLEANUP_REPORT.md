@@ -1563,3 +1563,81 @@ Uji asap **171 lulus / 0 gagal** (naik dari 169; 2 pemeriksaan baru untuk bagian
 goldens tetap **20/20**. Bundel `dist/` dibangun ulang (hash tidak berubah karena yang
 diubah hanya komentar, yang memang dibuang saat minifikasi).
 
+## 30. Setelan serving `llama-server` diuji dan ditolak; jeda endpointing jadi pengungkit terakhir
+
+### 30.1 Pertanyaan yang diuji
+Setelah awalan prompt dipanaskan (§28), biaya yang tersisa di jalur jawaban adalah prefill
+bagian dinamis dan decode. Dua setelan `llama-server` yang belum pernah diuji dicurigai bisa
+menekan keduanya: `-fa` (flash attention) dan `-ub` (physical batch / ubatch). Keduanya
+murni penyetelan komputasi, jadi bila menang seharusnya menang tanpa mengubah mutu jawaban.
+
+### 30.2 Metode
+Empat **sesi server baru** (bukan satu sesi dengan empat percobaan), karena `-np 1` hanya
+menyimpan KV permintaan terakhir — mengukur dua setelan pada satu sesi berarti arm kedua
+mewarisi cache arm pertama. Tiap arm: nyalakan server, tunggu `/health`, pemanasan dengan
+awalan prompt produksi (`pesan_sistem_kampus("PEMANASAN", "pemanasan")`, 1.555 token),
+lalu permintaan berisi konteks RAG dan pertanyaan "berapa biaya kuliah di UCIC", diulang dua
+kali. Loopback diukur lewat `no_proxy` (§28.1) dan seluruh arm berjalan dalam satu tugas
+karena proses latar mati bersama tugasnya (§28.2).
+
+### 30.3 Hasil (permintaan pertama, `timings` dari llama-server)
+
+| Setelan | prompt_n | prefill | prompt_ms | decode | Muat |
+| --- | --- | --- | --- | --- | --- |
+| bawaan | 686 | 1.030 token/detik | **666 ms** | 40,4 token/detik | 3,6 s |
+| `-fa on` | 686 | 1.021 token/detik | 672 ms | 39,8 token/detik | 3,5 s |
+| `-ub 1024` | 1.198 | 1.157 token/detik | 1.035 ms | 40,9 token/detik | 3,5 s |
+| `-fa on -ub 1024` | 1.198 | 1.176 token/detik | 1.019 ms | 40,4 token/detik | 3,6 s |
+
+Keputusan: **jangan ubah setelan apa pun.** `-fa on` justru sedikit lebih lambat pada build
+Vulkan ini. `-ub 1024` menaikkan *laju* prefill 12% tetapi memperbesar jumlah token yang harus
+dinilai ulang dari 686 menjadi 1.198, sehingga waktu prefill nyata naik dari 666 ms ke
+1.035 ms — lebih lambat 55%. Jawaban keempat arm identik karakter demi karakter
+("Biaya kuliah untuk angkatan baru adalah delapan juta lima ratus ribu rupiah per ..."), jadi
+tidak ada alasan mutu untuk berpindah.
+
+### 30.4 Pelajaran: laju token/detik menipu bila penyebutnya ikut berubah
+`-ub 1024` terlihat lebih cepat di kolom "token/detik" dan justru lebih lambat di jam dinding.
+Laju adalah besaran turunan; yang menentukan pengalaman pengguna adalah `prompt_ms`. Karena
+itu tabel di atas sengaja memuat **token dinilai ulang** dan **waktu nyata**, bukan hanya laju.
+Ini kasus kedua dari pola yang sama: `prompt_n` yang besar bukan berarti prompt panjang,
+melainkan cache yang tidak terpakai ulang (§28.3).
+
+Bukti bahwa pemakaian ulang cache memang bekerja pada setelan bawaan: permintaan kedua yang
+identik hanya menilai ulang **18 token** dari 1.555, dengan prefill 146 token/detik pada sisa
+kecil itu dan decode tetap ~40 token/detik.
+
+### 30.5 Jeda endpointing: satu-satunya pengungkit latensi murni yang tersisa
+Setelah §28 dan §30.3, biaya per giliran sudah terpetakan: RAG+routing 17-57 ms, prefill
+bagian dinamis ~666 ms, kalimat pertama LLM ~730 ms, TTS satu kalimat ~890 ms. Semuanya
+sudah di batas perangkat atau batas panjang teks.
+
+Yang tersisa bukan milik model, melainkan aturan endpointing ASR di `core/stt_engine.py`:
+jawaban baru disusun setelah `SELA_ASR_HENING2` detik hening (bawaan **1,2 detik**).
+Endpoint dihitung dari jumlah sampel hening, dan klien mengirim audio pada kecepatan 1x,
+jadi satu detik hening berarti satu detik menunggu — **jeda mati 1,2 detik pada setiap
+giliran**, bukan sesuatu yang perlu diukur ulang, melainkan aritmetika.
+
+Dua hal yang perlu dicatat agar tidak salah dibidik di kemudian hari:
+
+- Angka itu **sekaligus** toleransi terhadap jeda di tengah kalimat. Menurunkannya ke `0.8`
+  (bawaan sherpa-onnx) menghemat 0,4 detik per giliran tetapi membuat ucapan terpotong bila
+  pengguna berhenti lebih lama dari 0,8 detik di tengah pertanyaan. Itu pertukaran
+  kecepatan lawan ketahanan, bukan bug — dan `SELA_ASR_HENING2` sudah bisa diatur lewat
+  lingkungan tanpa mengubah kode. Bawaannya sengaja dibiarkan 1,2 detik.
+- `BINGKAI_HENING = 18` (~576 ms) di `core/vad_engine.py` **bukan** bagian dari jeda itu. VAD
+  hanya dipakai untuk barge-in; jalur jawaban memakai aturan endpoint sherpa-onnx. Menurunkan
+  konstanta VAD tidak akan mempercepat jawaban sama sekali.
+
+### 30.6 Diperiksa dan sudah beres
+- TTS ternyata **sudah** memanaskan suara bawaannya saat dimuat (`tts_engine.py`, "Panaskan
+  suara bawaan supaya permintaan pertama tidak terasa lambat"), jadi tidak ada biaya muat
+  malas yang tertinggal di jalur suara — berbeda dengan LLM yang butuh pemanasan awalan (§28).
+- Muat model `llama-server` hanya 3,5-3,6 detik karena berkas GGUF sudah ada di cache sistem.
+
+### 30.7 Verifikasi
+Uji asap **171 lulus / 0 gagal**, goldens **20/20** (tidak ada kode produksi yang berubah —
+hanya README dan berkas ini). `SELA_ASR_HENING1`/`SELA_ASR_HENING2` yang sebelumnya hanya
+tercatat di sini kini masuk tabel variabel lingkungan `README.md`.
+
+

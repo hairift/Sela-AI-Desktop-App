@@ -114,6 +114,44 @@ Angka di atas adalah kondisi terbaik. Kecepatan mesin berubah-ubah cukup besar
 kode), jadi sesekali ada giliran yang jauh lebih lambat. Konteks `-c 4096` sendiri
 sudah memadai: percakapan lima giliran hanya memakai ~2.600 token.
 
+### Jeda menunggu pengguna berhenti bicara
+
+Ada satu komponen latensi yang bukan milik model, melainkan milik aturan endpointing
+ASR: SELA baru mulai menyusun jawaban setelah mendengar `SELA_ASR_HENING2` detik hening
+(bawaan 1,2 detik). Angka itu adalah **jeda mati yang selalu terbayar di setiap
+giliran** — endpoint dihitung dari jumlah sampel hening, dan klien mengirim audio pada
+kecepatan 1x, jadi satu detik hening berarti satu detik menunggu.
+
+Nilai itu sekaligus menjadi toleransi terhadap jeda di tengah kalimat, sehingga
+menurunkannya adalah pertukaran, bukan perbaikan gratis:
+
+| `SELA_ASR_HENING2` | Jeda mati per giliran | Ucapan mulai terpotong bila jeda tengah kalimat melebihi |
+| --- | --- | --- |
+| `1.2` (bawaan) | 1,2 detik | 1,2 detik |
+| `0.8` | 0,8 detik | 0,8 detik |
+
+Bawaan 1,2 detik menjaga pengguna yang berpikir sejenak di tengah pertanyaan agar tidak
+dipotong menjadi dua giliran. Bila kecepatan lebih penting daripada itu, `0.8` adalah
+nilai bawaan sherpa-onnx sendiri dan menghemat 0,4 detik pada setiap giliran.
+
+### Setelan `llama-server` yang sudah diuji dan ditolak
+
+`-fa` (flash attention) dan `-ub` (ubatch) sempat dicurigai bisa mempercepat prefill.
+A/B empat sesi server baru menunjukkan keduanya tidak layak dipakai:
+
+| Setelan | Laju prefill | Token dinilai ulang | Waktu prefill nyata | Laju decode |
+| --- | --- | --- | --- | --- |
+| bawaan | 1.030 token/detik | 686 | **666 ms** | 40,4 token/detik |
+| `-fa on` | 1.021 token/detik | 686 | 672 ms | 39,8 token/detik |
+| `-ub 1024` | 1.157 token/detik | 1.198 | 1.035 ms | 40,9 token/detik |
+| `-fa on -ub 1024` | 1.176 token/detik | 1.198 | 1.019 ms | 40,4 token/detik |
+
+`-fa on` justru sedikit lebih lambat. `-ub 1024` memang menaikkan laju prefill, tetapi
+**memotong pemakaian ulang KV cache** sehingga token yang harus dinilai ulang naik dari
+686 menjadi 1.198 — dalam waktu nyata giliran itu lebih lambat. Setelan bawaan sudah
+yang tercepat, dan jawaban keempat arm identik sehingga tidak ada alasan mutu untuk
+berpindah.
+
 ### Mesin lain
 
 | Variabel | Bawaan | Keterangan |
@@ -122,6 +160,8 @@ sudah memadai: percakapan lima giliran hanya memakai ~2.600 token.
 | `SELA_PYTHON` | otomatis | Paksa jalur interpreter Python tertentu |
 | `SELA_LLM_PORT` | `8088` | Port internal `llama-server.exe` |
 | `SELA_ASR_THREAD` | `2` | Jumlah utas ASR (naikkan bila CPU longgar) |
+| `SELA_ASR_HENING1` | `2.0` | Hening (detik) untuk mengakhiri ucapan yang **belum** menghasilkan kata |
+| `SELA_ASR_HENING2` | `1.2` | Hening (detik) untuk mengakhiri ucapan yang **sudah** menghasilkan kata |
 | `SELA_ASR_MAKS_UCAPAN` | `20` | Batas panjang satu ucapan (detik) |
 | `SELA_EMBEDDER_HF` | mati | `1` mengizinkan unduh embedder dari HuggingFace |
 | `SELA_UJI_SERVER` | mati | `1` ikut menguji endpoint HTTP di `test_server.py` |
