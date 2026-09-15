@@ -88,6 +88,11 @@ pertanyaan **pertama** selalu paling lambat. Karena itu server memanaskan awalan
 prompt di latar belakang begitu mesin siap: waktu ke token pertama pertanyaan
 kampus pertama turun dari **2.147 ms menjadi 987 ms (-54%)**.
 
+Angka di atas adalah kondisi terbaik. Kecepatan mesin berubah-ubah cukup besar
+(decode pernah terukur 39 token/detik, pernah juga 7-12 token/detik tanpa perubahan
+kode), jadi sesekali ada giliran yang jauh lebih lambat. Konteks `-c 4096` sendiri
+sudah memadai: percakapan lima giliran hanya memakai ~2.600 token.
+
 ### Mesin lain
 
 | Variabel | Bawaan | Keterangan |

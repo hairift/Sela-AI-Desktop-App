@@ -1467,7 +1467,44 @@ lambat, dan di situlah pemanasan bekerja.
    tertinggi (langkah 8, laju 1,0) — tes ASR butuh ucapan yang jelas, bukan cepat.
    Sesudah perbaikan, "kuliah" terbaca benar di ketiga kali penjalanan.
 
-### 28.6 Verifikasi
+### 28.6 Percakapan multi-giliran: `-c 4096` ternyata SUDAH CUKUP
+
+Dugaan yang diuji: system prompt ~2.100 token + riwayat empat giliran + jawaban sampai
+512 token bisa mendekati batas `-c 4096`, memicu context shift yang membuang KV cache
+sehingga token pertama melambat di TENGAH percakapan. Bila benar, menaikkan konteks
+akan menolong.
+
+Percakapan lima giliran kampus, tiga sesi pada `-c 4096`:
+
+| | giliran 1 | giliran 2 | giliran 3 | giliran 4 | giliran 5 |
+|---|---|---|---|---|---|
+| token prompt | 2.124 | 1.794-1.888 | 2.150-2.255 | 2.575-2.613 | 2.148-2.222 |
+| TTFT sesi 1 | 1.300 ms | 1.025 ms | 1.381 ms | 1.603 ms | 1.356 ms |
+| TTFT sesi B | 1.704 ms | 1.201 ms | 1.513 ms | 1.823 ms | 1.564 ms |
+
+- Prompt puncak **2.613 token dari 4.096** — masih longgar.
+- Log llama-server: `context shift = 0` dan `truncat = 0` di semua sesi.
+
+**Kesimpulan: `-c 4096` sudah memadai. Menaikkannya ke 8.192 hanya memakan VRAM tanpa
+manfaat terukur — jangan diubah tanpa bukti baru.**
+
+Dua dari empat sesi sempat menunjukkan stall ~20 detik (TTFT 20.654 ms dan 23.352 ms).
+Itu **bukan** efek konteks, dengan dua bukti:
+
+1. Delapan pertanyaan berbeda TANPA riwayat -> **0 stall** (TTFT 971-1.967 ms).
+2. Pada giliran yang stall, **decode ikut ambruk**: 33.537 ms untuk 88 token = 8,6
+   token/detik, padahal normalnya 39. Masalah prefill/KV cache hanya akan memperlambat
+   token PERTAMA, bukan decode.
+
+Sebab sebenarnya adalah kecepatan mesin yang berubah-ubah: pada dua sesi yang sama-sama
+sehat, decode terukur **39 token/detik** pada satu waktu dan **7-12 token/detik** pada
+waktu lain, tanpa perubahan kode sama sekali (suhu/ daya/ beban aplikasi lain).
+
+Pelajaran: **catat kondisi mesin saat mengukur.** Angka latensi di bagian 28 adalah
+kondisi terbaik; "memperbaiki" kode karena stall sesekali berarti mengejar penyebab
+yang salah.
+
+### 28.7 Verifikasi
 Uji asap **169 lulus / 0 gagal** (naik dari 163; 6 pemeriksaan baru untuk pemanasan
 awalan), dijalankan **tiga kali berturut-turut** dan ketiganya 169/0 — jalur ASR
 yang sebelumnya gagal sesekali kini stabil.
