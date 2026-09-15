@@ -135,6 +135,58 @@ def mode_emosi() -> str:
     return nilai if nilai in ("auto", "on", "off") else "auto"
 
 
+# ── Setelan kecepatan sintesis ───────────────────────────────────────────────
+# Angka bawaan dipilih dari pengukuran nyata, bukan tebakan (lihat
+# CLEANUP_REPORT.md §27). `total_steps` = jumlah langkah difusi model: semakin
+# sedikit langkah semakin cepat, TETAPI amplitudo puncak ikut naik dan bisa
+# melewati skala penuh sehingga audio terpotong (distorsi).
+# Hasil ukur 4 kalimat Indonesia, rata-rata:
+#   steps=8 -> 1.223 ms, puncak 0,41   (bawaan lama)
+#   steps=6 ->   923 ms, puncak 0,49   (bawaan sekarang, 25% lebih cepat)
+#   steps=5 ->   785 ms, puncak 0,56   (aman, 36% lebih cepat)
+#   steps=4 ->   665 ms, puncak 0,89   DAN pernah 1,26 di kalimat lain -> TIDAK AMAN
+# Jadi bawaan 6 (aman, jelas lebih cepat); 5 sudah terukur aman dan bisa dipilih
+# lewat SELA_TTS_STEPS bila kecepatan lebih penting daripada kehalusan suara.
+STEPS_BAWAAN = 6
+KECEPATAN_BAWAAN = 1.15
+JEDA_BAWAAN = 0.15
+
+
+def _angka_lingkungan(nama: str, bawaan: float) -> float:
+    """Baca angka dari variabel lingkungan; kembalikan bawaan bila tidak sah."""
+    mentah = (os.environ.get(nama) or "").strip()
+    if not mentah:
+        return bawaan
+    try:
+        return float(mentah)
+    except ValueError:
+        return bawaan
+
+
+def jumlah_langkah() -> int:
+    """Jumlah langkah difusi dari SELA_TTS_STEPS (4-16, bawaan 6)."""
+    nilai = int(_angka_lingkungan("SELA_TTS_STEPS", STEPS_BAWAAN))
+    return nilai if 4 <= nilai <= 16 else STEPS_BAWAAN
+
+
+def kecepatan_bicara() -> float:
+    """Pengali kecepatan bicara dari SELA_TTS_SPEED (0,5-2,0, bawaan 1,15)."""
+    nilai = _angka_lingkungan("SELA_TTS_SPEED", KECEPATAN_BAWAAN)
+    return nilai if 0.5 <= nilai <= 2.0 else KECEPATAN_BAWAAN
+
+
+def jeda_antar_potongan() -> float:
+    """
+    Jeda antar potongan teks (detik) dari SELA_TTS_JEDA (0-1, bawaan 0,15).
+
+    Supertonic menyisipkan jeda ini di antara potongan panjang (teks > 300
+    karakter). Bawaan paketnya 0,3 detik -- terlalu panjang untuk percakapan
+    karena terasa menggantung di tengah jawaban.
+    """
+    nilai = _angka_lingkungan("SELA_TTS_JEDA", JEDA_BAWAAN)
+    return nilai if 0.0 <= nilai <= 1.0 else JEDA_BAWAAN
+
+
 def normalisasi_emosi(emosi: Optional[str]) -> Optional[str]:
     """Ubah nama emosi bebas menjadi salah satu dari 10 tag resmi (atau None)."""
     if not emosi:
@@ -343,6 +395,13 @@ class TtsEngine:
         data = np.asarray(gelombang, dtype="float32").reshape(-1)
         if data.size == 0:
             return None
+        # Model dengan langkah difusi sedikit dapat menghasilkan amplitudo puncak
+        # DI ATAS skala penuh (terukur 1,26 pada steps=4). Memotongnya keras akan
+        # menimbulkan distorsi; mengecilkan seluruh gelombang secara proporsional
+        # jauh lebih halus dan hanya sedikit menurunkan volume.
+        puncak = float(np.max(np.abs(data)))
+        if puncak > 1.0:
+            data = data / puncak
         data = np.clip(data, -1.0, 1.0)
         pcm = (data * 32767.0).astype("<i2").tobytes()
         buffer = io.BytesIO()
@@ -377,7 +436,12 @@ class TtsEngine:
             try:
                 with self._kunci_sintesis:
                     gelombang, _ = self._tts.synthesize(
-                        bagian, voice_style=gaya, lang=kode
+                        bagian,
+                        voice_style=gaya,
+                        total_steps=jumlah_langkah(),
+                        speed=kecepatan_bicara(),
+                        silence_duration=jeda_antar_potongan(),
+                        lang=kode,
                     )
             except Exception as galat:
                 print(f"[TTS] Sintesis gagal: {galat}")

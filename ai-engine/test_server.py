@@ -406,6 +406,82 @@ def uji_tts() -> None:
         _cek("tag nonaktif untuk Bahasa Indonesia", not apakah_tag_dipakai("id"))
         _cek("tag aktif untuk Bahasa Inggris", apakah_tag_dipakai("en"))
 
+    # ── Setelan kecepatan sintesis (SELA_TTS_STEPS/SPEED/JEDA) ───────────────
+    from core.tts_engine import (
+        JEDA_BAWAAN,
+        KECEPATAN_BAWAAN,
+        STEPS_BAWAAN,
+        jeda_antar_potongan,
+        jumlah_langkah,
+        kecepatan_bicara,
+    )
+
+    _cek("jumlah langkah bawaan", jumlah_langkah() == STEPS_BAWAAN, f"({jumlah_langkah()})")
+    _cek("kecepatan bawaan", abs(kecepatan_bicara() - KECEPATAN_BAWAAN) < 1e-9, f"({kecepatan_bicara()})")
+    _cek("jeda bawaan", abs(jeda_antar_potongan() - JEDA_BAWAAN) < 1e-9, f"({jeda_antar_potongan()})")
+
+    os.environ["SELA_TTS_STEPS"] = "5"
+    os.environ["SELA_TTS_SPEED"] = "1.25"
+    os.environ["SELA_TTS_JEDA"] = "0"
+    _cek("SELA_TTS_STEPS dibaca", jumlah_langkah() == 5, f"({jumlah_langkah()})")
+    _cek("SELA_TTS_SPEED dibaca", abs(kecepatan_bicara() - 1.25) < 1e-9)
+    _cek("SELA_TTS_JEDA dibaca", abs(jeda_antar_potongan()) < 1e-9)
+
+    # Nilai sampah / di luar rentang wajib kembali ke bawaan, bukan bikin galat.
+    os.environ["SELA_TTS_STEPS"] = "99"
+    os.environ["SELA_TTS_SPEED"] = "abc"
+    os.environ["SELA_TTS_JEDA"] = "-5"
+    _cek("SELA_TTS_STEPS di luar rentang -> bawaan", jumlah_langkah() == STEPS_BAWAAN)
+    _cek("SELA_TTS_SPEED bukan angka -> bawaan", abs(kecepatan_bicara() - KECEPATAN_BAWAAN) < 1e-9)
+    _cek("SELA_TTS_JEDA negatif -> bawaan", abs(jeda_antar_potongan() - JEDA_BAWAAN) < 1e-9)
+    for nama in ("SELA_TTS_STEPS", "SELA_TTS_SPEED", "SELA_TTS_JEDA"):
+        os.environ.pop(nama, None)
+
+    # ── Penjaga anti-terpotong ───────────────────────────────────────────────
+    # Model dengan langkah difusi sedikit bisa menghasilkan amplitudo di atas
+    # skala penuh (terukur 1,26 pada steps=4). Versi lama memotongnya keras
+    # (clip) sehingga timbul distorsi; sekarang gelombang diperkecil proporsional.
+    import numpy as _np
+
+    wav_keras = tts._ke_wav_bytes(_np.array([0.5, 1.5, -1.5, 0.25], dtype="float32"))
+    if wav_keras:
+        with wave.open(io.BytesIO(wav_keras), "rb") as _w:
+            pcm = _np.frombuffer(_w.readframes(_w.getnframes()), dtype="<i2").astype("float32") / 32767.0
+        puncak = float(_np.max(_np.abs(pcm)))
+        _cek("gelombang di atas skala penuh tidak lagi distorsi", puncak <= 1.0005, f"(puncak={puncak:.3f})")
+        # Perbandingan antar-sampel membedakan "diperkecil" dari "dipotong":
+        # hasil potong keras akan memberi rasio 0,333 -> 0,5.
+        rasio = float(pcm[0]) / max(float(pcm[1]), 1e-9)
+        _cek("bentuk gelombang tetap proporsional", abs(rasio - (0.5 / 1.5)) < 0.01, f"(rasio={rasio:.3f})")
+    else:
+        _cek("penjaga anti-terpotong dapat diuji", False)
+
+    # Setelan harus benar-benar sampai ke model, bukan sekadar tersimpan.
+    if tts.apakah_siap:
+        teks_uji = "Biaya kuliah UCIC sekitar dua juta rupiah per semester."
+        os.environ["SELA_TTS_SPEED"] = "1.05"
+        lambat = tts.sintesis_wav_bytes(teks_uji, "id") or b""
+        os.environ["SELA_TTS_SPEED"] = "1.4"
+        cepat = tts.sintesis_wav_bytes(teks_uji, "id") or b""
+        os.environ.pop("SELA_TTS_SPEED", None)
+        _cek(
+            "SELA_TTS_SPEED benar-benar memperpendek audio",
+            bool(lambat) and bool(cepat) and len(cepat) < len(lambat),
+            f"({len(lambat)} -> {len(cepat)} byte)",
+        )
+
+        # Hasil sintesis nyata tidak boleh mengandung sampel yang jenuh.
+        wav_nyata = tts.sintesis_wav_bytes(teks_uji, "id")
+        if wav_nyata:
+            with wave.open(io.BytesIO(wav_nyata), "rb") as _w:
+                pcm2 = _np.frombuffer(_w.readframes(_w.getnframes()), dtype="<i2").astype("float32") / 32767.0
+            jenuh = int(_np.sum(_np.abs(pcm2) >= 0.9999))
+            _cek(
+                "audio Supertonic tidak jenuh (tanpa distorsi)",
+                jenuh == 0,
+                f"(puncak={float(_np.max(_np.abs(pcm2))):.3f}, {jenuh} sampel jenuh)",
+            )
+
 
 def uji_stt() -> None:
     print("\n[11] STT sherpa-onnx (gerbang energi + sesi streaming)")

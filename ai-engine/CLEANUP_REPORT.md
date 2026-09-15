@@ -1302,3 +1302,83 @@ pertanyaan baru, sehingga urutan pesan yang dinilai selalu pasti tiba — tanpa 
 risiko tes menggantung.
 
 Hasil: **150 lulus / 0 gagal** (naik dari 139).
+
+---
+
+## 27. Profil latensi TTS & setelan kecepatan yang terukur (15 Sep 2026)
+
+### 27.1 Cara menemukan sumbernya
+Permintaan pengguna adalah jawaban "secepat mungkin, real time kaya ngobrol sama manusia".
+Jalur `/ws/dupleks` diprofilkan per tahap, dan hasilnya membantah dugaan awal:
+
+| Tahap | Waktu |
+|---|---|
+| `susun_rencana` (RAG + routing) | ~23 ms |
+| Kalimat pertama dari LLM | ~1.010 ms |
+| **TTS kalimat pertama** | **~1.400-1.700 ms** |
+
+Dua dugaan awal **salah** dan sudah diuji:
+
+1. *"TTS kalah bersaing dengan utas LLM"* — TIDAK. TTS diukur saat mesin menganggur
+   705 ms, dan saat LLM sedang mengalirkan kalimat 715 ms. Tidak ada perebutan.
+2. *"Kalimat pertama terlalu panjang"* — TIDAK. Kalimat pertama ternyata pendek
+   (29-88 karakter, sekitar 2-4 detik audio).
+
+Yang benar: **ada biaya tetap besar per panggilan sintesis**. Kalimat 29 karakter
+("Halo, selamat datang di UCIC.") butuh 707 ms, sedangkan kalimat 88 karakter butuh
+1.035 ms. Artinya sekitar 600 ms tidak bergantung panjang teks.
+
+### 27.2 Parameter yang ternyata belum dipakai
+`supertonic.synthesize()` punya parameter yang selama ini dibiarkan pada nilai bawaan
+paketnya:
+
+| Parameter | Bawaan paket | Arti |
+|---|---|---|
+| `total_steps` | 8 | jumlah langkah difusi |
+| `speed` | 1.05 | pengali kecepatan bicara |
+| `silence_duration` | 0.3 | jeda antar potongan panjang (detik) |
+
+Diukur pada 4 kalimat Indonesia (rata-rata):
+
+| steps | sintesis | puncak amplitudo | catatan |
+|---|---|---|---|
+| 8 | 1.223 ms | 0.406 | bawaan lama |
+| 6 | 923 ms | 0.485 | **bawaan sekarang** (-25%) |
+| 5 | 785 ms | 0.556 | aman, -36%, bisa dipilih lewat env |
+| 4 | 665 ms | 0.892 | **TIDAK AMAN** — pada kalimat lain terukur 1.257 (di atas skala penuh) |
+
+> Pelajaran: mengukur *waktu* saja tidak cukup. `steps=4` tampak paling menarik
+> (-46%) tetapi amplitudonya melewati skala penuh, dan encoder WAV memotongnya
+> keras -> distorsi. Pemeriksaan puncak amplitudo yang mengungkapnya.
+
+### 27.3 Bug yang ikut ketahuan: pemotongan keras gelombang
+`_ke_wav_bytes()` memakai `np.clip(data, -1, 1)`. Untuk model dengan langkah difusi
+sedikit, gelombang bisa mencapai 1,26 sehingga pemotongan keras itu menimbulkan
+distorsi. Sekarang gelombang **diperkecil proporsional** bila puncaknya melewati 1,0 —
+jauh lebih halus dan hanya sedikit menurunkan volume. Dijaga dua tes: puncak hasil
+harus <= 1,0, dan rasio antar-sampel harus tetap (pemotongan keras akan mengubah rasio).
+
+### 27.4 Setelan baru (dapat diubah lewat lingkungan)
+| Variabel | Bawaan | Rentang sah |
+|---|---|---|
+| `SELA_TTS_STEPS` | 6 | 4-16 |
+| `SELA_TTS_SPEED` | 1.15 | 0.5-2.0 |
+| `SELA_TTS_JEDA` | 0.15 | 0.0-1.0 |
+
+Nilai di luar rentang atau bukan angka **kembali ke bawaan**, bukan menimbulkan galat.
+
+### 27.5 Hasil A/B (proses sama, tiga pertanyaan sama)
+| Konfigurasi | Jeda teks->audio | Audio pertama | Total jawaban |
+|---|---|---|---|
+| LAMA (steps=8, speed=1.05, jeda=0.3) | 1.372 ms | 2.563 ms | 10.345 ms |
+| **BARU (steps=6, speed=1.15, jeda=0.15)** | **1.065 ms** | **2.443 ms** | **8.623 ms** |
+| AGRESIF (steps=5, speed=1.15) | 854 ms | 2.276 ms | 8.182 ms |
+
+Bawaan BARU: jeda TTS **-22%**, total jawaban **-17%**. Bila kecepatan lebih penting
+daripada kehalusan suara, `SELA_TTS_STEPS=5` memberi **-38%** jeda TTS dan **-21%**
+total; konfigurasi itu sudah terukur aman (puncak 0,556).
+
+### 27.6 Verifikasi
+Uji asap **163 lulus / 0 gagal** (naik dari 150; 13 pemeriksaan baru untuk setelan
+kecepatan, penjaga anti-terpotong, dan bukti bahwa `SELA_TTS_SPEED` benar-benar
+mempersingkat audio: 405.548 -> 301.100 byte).

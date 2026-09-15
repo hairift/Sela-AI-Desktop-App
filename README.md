@@ -48,3 +48,36 @@ py -3.12 ai-engine/persiapan_model.py                 # cek kelengkapan saja
 | TTS Supertonic 3 | 396 MB | `--unduh-tts` |
 | ASR streaming zipformer | 340 MB | `--unduh-asr` |
 | Embedder multilingual-e5-small | 493 MB | `--unduh-embedder` |
+
+## Setelan lingkungan (opsional)
+
+Semua nilai di bawah punya bawaan yang sudah terukur; nilai yang tidak sah otomatis
+kembali ke bawaan.
+
+### Suara (TTS)
+
+| Variabel | Bawaan | Keterangan |
+| --- | --- | --- |
+| `SELA_TTS_SUARA` | `F1` | Gaya suara: `F1`-`F5` (perempuan), `M1`-`M5` (laki-laki) |
+| `SELA_TTS_EMOSI` | `auto` | `auto` \| `on` \| `off`. `auto` hanya memasang tag ekspresi untuk en/ja/ko — tag Supertonic belum konsisten untuk Bahasa Indonesia |
+| `SELA_TTS_STEPS` | `6` | Langkah difusi (4-16). Lebih sedikit = lebih cepat, tetapi amplitudo naik; **4 pernah melewati skala penuh** sehingga berisiko distorsi |
+| `SELA_TTS_SPEED` | `1.15` | Pengali kecepatan bicara (0,5-2,0) |
+| `SELA_TTS_JEDA` | `0.15` | Jeda antar potongan panjang dalam detik (0-1) |
+| `SELA_TTS_UNDUH` | `1` | `0` melarang unduh model otomatis (dipakai saat aplikasi sudah dikemas offline) |
+
+Kecepatan respons terukur pada tiga pertanyaan kampus (rata-rata, jeda dari teks
+pertama sampai suara pertama): `SELA_TTS_STEPS=6` + `SELA_TTS_SPEED=1.15` memberi
+**1.065 ms** (-22% dibanding setelan bawaan paket), dan `SELA_TTS_STEPS=5` memberi
+**854 ms** (-38%) dengan amplitudo puncak 0,556 sehingga masih aman.
+
+### Mesin lain
+
+| Variabel | Bawaan | Keterangan |
+| --- | --- | --- |
+| `PORT_SELA_AI` | `8008` | Port server AI lokal |
+| `SELA_PYTHON` | otomatis | Paksa jalur interpreter Python tertentu |
+| `SELA_LLM_PORT` | `8088` | Port internal `llama-server.exe` |
+| `SELA_ASR_THREAD` | `2` | Jumlah utas ASR (naikkan bila CPU longgar) |
+| `SELA_ASR_MAKS_UCAPAN` | `20` | Batas panjang satu ucapan (detik) |
+| `SELA_EMBEDDER_HF` | mati | `1` mengizinkan unduh embedder dari HuggingFace |
+| `SELA_UJI_SERVER` | mati | `1` ikut menguji endpoint HTTP di `test_server.py` |
