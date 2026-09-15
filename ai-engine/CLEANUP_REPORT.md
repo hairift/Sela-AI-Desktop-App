@@ -1135,3 +1135,74 @@ ASR (dekode WebM/Opus) dan TTS (ONNX Runtime).
 - **sherpa-onnx nyata:** model dimuat 4 detik, sesi streaming dibuat, `terima_pcm` /
   `apakah_akhir_ucapan` / `akhirkan` berjalan tanpa galat.
 - **Frontend:** bundel esbuild bersih (4,2 MB JS, 3,6 KB CSS), tanpa peringatan.
+
+---
+
+## 24. Perbaikan setelah uji WebSocket nyata (2026-09-15)
+
+Sampai §23, kedua endpoint WebSocket hanya diverifikasi secara tidak langsung (impor modul,
+bundel, server menyala). Belum pernah ada satu pun tes yang benar-benar **membuka socket**.
+Begitu diuji dengan ucapan sungguhan, tiga masalah nyata langsung muncul.
+
+### 24.1 Bug terbesar: jawaban TIDAK benar-benar streaming
+`/ws/dupleks` mengumpulkan **seluruh** jawaban LLM lebih dulu, baru mulai TTS:
+
+```python
+while True:
+    item = await antrean.get()
+    if item is None:
+        break
+    kalimat_list.append(item)   # <- menampung SEMUA kalimat dulu
+# baru setelah loop ini selesai: for item in kalimat_list: ... TTS ...
+```
+
+Akibatnya pengguna menunggu model menuntaskan jawabannya (±4 detik) sebelum mendengar kata
+pertama — persis kebalikan dari tujuan streaming, dan bertentangan langsung dengan permintaan
+"jawabannya secepat mungkin dan real time kaya ngobrol sama manusia".
+
+Perbaikan: kedua jalur (niat cepat, LLM, dan cadangan) kini mengisi **satu antrean**, dan
+kalimat langsung dikirim + disintesis begitu tiba; sisa jawaban tetap dihasilkan di latar.
+
+### 24.2 Koreksi otomatis ASR mengubah token derau menjadi kata acak
+`koreksi_asr.py::_koreksi_fuzzy()` menerima kata berapa pun dengan panjang ≥ 3 dan jarak
+Levenshtein ≤ 2. Untuk kata 3 huruf, jarak 2 berarti hanya 1 huruf yang cocok — hampir semua
+entri kamus "cocok". Kasus nyata: `uj一` (jarak 2 dari `udh`) dikoreksi menjadi `sudah`,
+sehingga "berapa biaya kuliah di UCIC" berubah menjadi "... di Sudah".
+
+Perbaikan: hanya kata berhuruf **Latin-ASCII** yang boleh dikoreksi (catatan: `str.isalpha()`
+tidak cukup — aksara CJK juga dianggap alfabetis, jadi yang dipakai `isascii()`), panjang
+minimum dinaikkan ke 4, dan ambang jarak menyesuaikan panjang kata (≤1 untuk 4-5 huruf,
+≤2 untuk 6+).
+
+### 24.3 Aksara asing dari model multibahasa
+Model ASR mencakup ar/en/id/ja/ru/th/vi/zh, jadi saat audio ambigu ia kadang menyelipkan
+aksara lain — nyata: "BERAPA BIAYA KULIAH DI UJ一". Untuk aplikasi kampus berbahasa
+Indonesia/Inggris, token itu selalu derau: ikut terkirim sebagai pertanyaan pengguna dan
+tampil di layar chat. Ditambahkan `stt_engine._bersihkan_aksara_asing()` yang dijalankan
+**sebelum** koreksi otomatis (supaya token derau tidak sempat dicocokkan ke kamus).
+
+### 24.4 Metrik setelah perbaikan
+Kueri "Berapa biaya kuliah di UCIC?" lewat `/ws/dupleks`:
+
+| Metrik | Sebelum | Sesudah |
+|---|---|---|
+| Teks pertama | 5,96 s | **1,02 s** |
+| **Suara pertama** | 7,57 s | **2,48 s** |
+| Total jawaban | 21,16 s | **12,44 s** |
+
+Rincian hangat dari profil langsung: `susun_rencana` (RAG + routing) 0,02 s · kalimat pertama
+LLM 0,73 s · TTS satu kalimat 0,89 s. Jadi ±1,6 detik sampai suara pertama — setara jeda
+percakapan manusia. Yang paling lambat ternyata bukan modelnya, melainkan cara server
+menunggu jawaban selesai.
+
+### 24.5 Tes regresi [19]
+Ditambahkan `uji_realtime_ws()` yang benar-benar membuka socket, dan **selalu dijalankan**
+(tidak digerbang `SELA_UJI_SERVER`) karena jalur realtime adalah inti produk:
+
+- `/ws/asr-stream`: kalimat uji disintesis TTS → resample PCM 16 kHz → disuapkan bertahap;
+  diperiksa ada pesan `parsial` yang bertambah kata demi kata, ada `final`, kata kunci
+  terbaca, dan hasilnya bebas aksara non-Latin.
+- `/ws/dupleks`: diperiksa ada `mulai_menjawab` + `gerakan`, teks dan audio mengalir
+  per kalimat, dan penjaga regresi utamanya — **potongan audio PERTAMA wajib tiba SEBELUM
+  potongan teks TERAKHIR**. Dengan bug lama, urutannya menjadi teks…teks lalu audio, jadi
+  tes ini langsung gagal.

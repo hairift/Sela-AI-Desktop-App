@@ -541,14 +541,35 @@ class KoreksiAsr:
 
         return ' '.join(hasil)
 
+    # Panjang kata minimum agar koreksi fuzzy boleh dicoba. Kata 3 huruf dengan
+    # jarak 2 praktis hanya cocok 1 huruf, sehingga hampir semua entri kamus
+    # "cocok" -- dan hasilnya acak.
+    _MIN_PANJANG_FUZZY = 4
+
     def _koreksi_fuzzy(self, kata: str) -> str:
         """
-        Koreksi menggunakan fuzzy matching (jarak Levenshtein).
-        Jika kata mirip dengan entri di kamus koreksi dalam jarak <= 2,
-        kembalikan koreksinya.
+        Koreksi ejaan memakai jarak Levenshtein (fuzzy matching).
+
+        Dua penjaga yang wajib ada:
+
+        1. **Hanya kata berhuruf Latin-ASCII.** Model ASR ini multibahasa
+           (ar/en/id/ja/ru/th/vi/zh), jadi kadang memunculkan token aksara lain
+           saat audio ambigu. Token seperti itu TIDAK boleh "dikoreksi" menjadi
+           kata Indonesia karena hasilnya acak. Kasus nyata: `uj一` (jarak 2 dari
+           `udh`) dikoreksi menjadi `sudah`, sehingga kalimat
+           "berapa biaya kuliah di UCIC" berubah menjadi
+           "... di Sudah". Catatan: `str.isalpha()` saja tidak cukup -- aksara
+           CJK juga dianggap alfabetis, jadi yang dipakai `isascii()`.
+
+        2. **Ambang jarak menyesuaikan panjang kata.** Kata pendek butuh ambang
+           lebih ketat; jarak 2 pada kata 4-5 huruf sudah terlalu longgar.
         """
-        if len(kata) < 3:
+        if len(kata) < self._MIN_PANJANG_FUZZY:
             return kata
+        if not kata.isascii() or not kata.isalpha():
+            return kata
+
+        ambang = 1 if len(kata) <= 5 else 2
 
         # Cari kata di kamus yang paling mirip
         best_match = None
@@ -559,7 +580,7 @@ class KoreksiAsr:
             if abs(len(kata_salah) - len(kata)) > 2:
                 continue
             distance = self._levenshtein(kata, kata_salah)
-            if distance < best_distance and distance <= 2:
+            if distance < best_distance and distance <= ambang:
                 best_distance = distance
                 best_match = kata_benar
 

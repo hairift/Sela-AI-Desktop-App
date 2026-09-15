@@ -253,6 +253,26 @@ class SttEngine:
             return True
         return False
 
+    @staticmethod
+    def _bersihkan_aksara_asing(teks: str) -> str:
+        """
+        Buang aksara non-Latin dari hasil transkripsi.
+
+        Model ini multibahasa (ar/en/id/ja/ru/th/vi/zh), jadi saat audio ambigu
+        ia kadang menyelipkan aksara lain di tengah kalimat Indonesia. Kasus
+        nyata: "berapa biaya kuliah di UCIC" keluar sebagai
+        "BEBERAPA BIAYA KULIAH DI UJ一". Untuk aplikasi kampus berbahasa
+        Indonesia/Inggris, token seperti itu selalu derau: ikut terkirim sebagai
+        pertanyaan pengguna, tampil di layar chat, dan dulu bahkan memicu koreksi
+        otomatis yang salah. Huruf Latin, angka, tanda baca, dan spasi tetap.
+        """
+        if not teks:
+            return teks
+        bersih = "".join(
+            huruf if (huruf.isascii() or huruf.isspace()) else " " for huruf in teks
+        )
+        return re.sub(r"\s+", " ", bersih).strip()
+
     # ── Jalur STREAMING (utama) ───────────────────────────────────────────────
     def buat_sesi(self) -> Optional[SesiAsr]:
         """Buat sesi streaming baru. None bila model belum siap."""
@@ -331,6 +351,9 @@ class SttEngine:
         if self._buang_halusinasi(teks):
             print(f"[STT] Abaikan halusinasi (kata berulang): {teks}")
             teks = ""
+        # Aksara asing dibuang SEBELUM koreksi otomatis, supaya token derau tidak
+        # sempat dicocokkan ke kamus koreksi.
+        teks = self._bersihkan_aksara_asing(teks)
         return self._koreksi(teks)
 
     # ── Jalur BATCH (cadangan, kompatibel dengan /api/transcribe) ─────────────

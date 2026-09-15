@@ -776,36 +776,50 @@ async def ws_dupleks(koneksi: WebSocket):
                 }
             )
 
-            # Jalur niat cepat: langsung kirim jawaban + audio.
-            if rencana["jalur"] == "intent" and rencana.get("jawaban_langsung"):
-                kalimat_list = [
-                    {"teks": s}
-                    for s in re.split(r"(?<=[.!?])\s+", rencana["jawaban_langsung"]) if s.strip()
-                ]
-            elif llm.apakah_siap and rencana.get("pesan"):
-                kalimat_list = []
-                loop = asyncio.get_running_loop()
-                antrean: asyncio.Queue = asyncio.Queue()
+            # ── Satu antrean untuk semua jalur ────────────────────────────────
+            # Kalimat WAJIB diproses SEGERA setelah dihasilkan. Versi lama
+            # mengumpulkan seluruh jawaban lebih dulu (`kalimat_list.append` di
+            # dalam loop) dan baru mulai TTS setelah loop selesai, sehingga
+            # pengguna menunggu LLM menuntaskan jawabannya (±4 detik) sebelum
+            # mendengar kata pertama -- justru menghapus manfaat streaming.
+            # Sekarang tiap kalimat langsung dikirim dan disintesis, sementara
+            # sisa jawaban tetap dihasilkan di latar belakang.
+            loop = asyncio.get_running_loop()
+            antrean: asyncio.Queue = asyncio.Queue()
 
-                def _produksi():
-                    for item in llm.stream_per_kalimat(rencana["pesan"]):
+            def _produksi():
+                try:
+                    if rencana["jalur"] == "intent" and rencana.get("jawaban_langsung"):
+                        sumber = [
+                            {"teks": s}
+                            for s in re.split(
+                                r"(?<=[.!?])\s+", rencana["jawaban_langsung"]
+                            )
+                            if s.strip()
+                        ]
+                    elif llm.apakah_siap and rencana.get("pesan"):
+                        sumber = llm.stream_per_kalimat(rencana["pesan"])
+                    else:
+                        jawaban = _jawab_langsung(rencana, kueri)
+                        sumber = [
+                            {"teks": s}
+                            for s in re.split(r"(?<=[.!?])\s+", jawaban)
+                            if s.strip()
+                        ]
+                    for item in sumber:
                         loop.call_soon_threadsafe(antrean.put_nowait, item)
+                except Exception as galat:
+                    print(f"[WS Dupleks] Galat saat menghasilkan kalimat: {galat}")
+                finally:
                     loop.call_soon_threadsafe(antrean.put_nowait, None)
 
-                threading.Thread(target=_produksi, daemon=True).start()
-                while True:
-                    item = await antrean.get()
-                    if item is None:
-                        break
-                    kalimat_list.append(item)
-            else:
-                jawaban = _jawab_langsung(rencana, kueri)
-                kalimat_list = [
-                    {"teks": s} for s in re.split(r"(?<=[.!?])\s+", jawaban) if s.strip()
-                ]
+            threading.Thread(target=_produksi, daemon=True).start()
 
             teks_terkumpul: List[str] = []
-            for item in kalimat_list:
+            while True:
+                item = await antrean.get()
+                if item is None:
+                    break
                 if dibatalkan.is_set():
                     print("[WS Dupleks] Aliran dihentikan oleh barge-in.")
                     return

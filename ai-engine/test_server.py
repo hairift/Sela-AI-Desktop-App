@@ -21,6 +21,7 @@ Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 16. Pengunduh model (truncate berkas rusak / resume / verifikasi)
 17. Pembersih teks jawaban (pemisah paragraf & daftar tetap utuh)
 18. Penjaga keutuhan bobot (safetensors terpotong & zip rusak)
+19. WebSocket realtime (ASR streaming + jawaban bersuara per kalimat)
 
 Jalankan:  python ai-engine/test_server.py
 """
@@ -825,6 +826,165 @@ def uji_keutuhan_bobot() -> None:
         E._AMBANG_BOBOT_MIN = ambang_asli
 
 
+def _pcm_uji_asr(durasi_hening: float = 2.5):
+    """
+    Sintesis kalimat uji lalu ubah menjadi PCM 16-bit mono 16 kHz.
+
+    Dipakai untuk menguji `/ws/asr-stream` dengan ucapan sungguhan, bukan data
+    acak. Kembalikan None bila mesin TTS/ASR belum siap.
+    """
+    try:
+        from core import dapatkan_stt, dapatkan_tts
+
+        stt = dapatkan_stt()
+        tts = dapatkan_tts()
+        if not (stt.apakah_siap and tts.apakah_siap):
+            return None
+        wav = tts.sintesis_wav_bytes("berapa biaya kuliah di UCIC", bahasa="id")
+        if not wav:
+            return None
+
+        import av
+
+        sumber = av.open(io.BytesIO(wav), mode="r")
+        pengubah = av.AudioResampler(format="s16", layout="mono", rate=16000)
+        keluaran = bytearray()
+        for bingkai in sumber.decode(audio=0):
+            for hasil in pengubah.resample(bingkai):
+                keluaran += bytes(hasil.planes[0])[: hasil.samples * 2]
+        for hasil in pengubah.resample(None):
+            keluaran += bytes(hasil.planes[0])[: hasil.samples * 2]
+        if durasi_hening:
+            keluaran += b"\x00\x00" * int(16000 * durasi_hening)
+        return bytes(keluaran)
+    except Exception:
+        return None
+
+
+def uji_realtime_ws() -> None:
+    """
+    Uji NYATA kedua WebSocket realtime (bukan sekadar impor modul).
+
+    Bagian ini ada karena satu bug nyata pernah lolos tanpa terdeteksi:
+    `/ws/dupleks` mengumpulkan SELURUH jawaban LLM lebih dulu, baru mulai TTS,
+    sehingga pengguna menunggu ±4 detik sebelum mendengar kata pertama. Tidak ada
+    tes yang menyentuh socket, jadi regresinya tidak terlihat. Penjaga utamanya:
+    potongan audio PERTAMA wajib tiba SEBELUM potongan teks TERAKHIR.
+    """
+    print("\n[19] WebSocket realtime (/ws/asr-stream & /ws/dupleks)")
+    try:
+        from fastapi.testclient import TestClient
+
+        import server
+
+        klien = TestClient(server.aplikasi_server)
+    except Exception as galat:  # pragma: no cover
+        _cek("TestClient siap", False, f"({galat})")
+        return
+
+    # ── /ws/asr-stream: ucapan -> teks kata per kata ─────────────────────────
+    pcm = _pcm_uji_asr()
+    if pcm is None:
+        _cek("ASR streaming dapat diuji", False, "(TTS/ASR belum siap)")
+    else:
+        parsial = []
+        final = None
+        with klien.websocket_connect("/ws/asr-stream") as ws:
+            siap = ws.receive_json()
+            _cek(
+                "WS ASR mengirim status siap",
+                siap.get("tipe") == "siap",
+                f"({siap.get('tipe')})",
+            )
+            blok = int(16000 * 0.1) * 2
+            for i in range(0, len(pcm), blok):
+                ws.send_bytes(pcm[i : i + blok])
+            ws.send_json({"tipe": "selesai"})
+            for _ in range(400):
+                try:
+                    pesan = ws.receive_json()
+                except Exception:
+                    break
+                if pesan.get("tipe") == "parsial":
+                    parsial.append(pesan.get("teks", ""))
+                elif pesan.get("tipe") == "final":
+                    final = pesan
+                    break
+
+        _cek(
+            "WS ASR mengirim teks PARSIAL bertahap",
+            len(parsial) >= 2,
+            f"({len(parsial)} pesan)",
+        )
+        _cek(
+            "teks parsial bertambah kata demi kata",
+            all(len(parsial[i]) >= len(parsial[i - 1]) for i in range(1, len(parsial))),
+        )
+        teks_final = ((final or {}).get("teks") or "").lower()
+        _cek("WS ASR mengirim teks FINAL", bool(teks_final), f"({teks_final[:48]!r})")
+        _cek(
+            "hasil ASR memuat kata kunci ucapan",
+            "biaya" in teks_final and "kuliah" in teks_final,
+            f"({teks_final[:48]!r})",
+        )
+        # Regresi: aksara CJK bocor ("UJ一") lalu dikoreksi otomatis jadi kata
+        # acak ("Sudah"). Hasil akhir wajib bersih dari aksara non-Latin.
+        _cek(
+            "hasil ASR bebas aksara non-Latin",
+            teks_final.isascii(),
+            f"({teks_final[:48]!r})",
+        )
+
+    # ── /ws/dupleks: jawaban + suara mengalir per kalimat ────────────────────
+    urutan = []
+    mulai = None
+    selesai = None
+    with klien.websocket_connect("/ws/dupleks") as ws:
+        ws.send_json(
+            {
+                "tipe": "tanya",
+                "kueri": "Berapa biaya kuliah di UCIC?",
+                "riwayat": [],
+                "bahasa": "id",
+            }
+        )
+        for _ in range(900):
+            try:
+                pesan = ws.receive_json()
+            except Exception:
+                break
+            tipe = pesan.get("tipe")
+            if tipe == "mulai_menjawab":
+                mulai = pesan
+            elif tipe in ("potongan_teks", "potongan_audio"):
+                urutan.append(tipe)
+            elif tipe == "selesai":
+                selesai = pesan
+                break
+
+    _cek("WS dupleks mengirim mulai_menjawab", mulai is not None)
+    _cek("mulai_menjawab menyertakan gerakan", bool((mulai or {}).get("gerakan")))
+    jumlah_teks = urutan.count("potongan_teks")
+    jumlah_audio = urutan.count("potongan_audio")
+    _cek("teks jawaban mengalir per kalimat", jumlah_teks >= 2, f"({jumlah_teks} kalimat)")
+    _cek("audio mengalir per kalimat", jumlah_audio >= 2, f"({jumlah_audio} potongan)")
+    _cek("WS dupleks mengirim selesai", selesai is not None)
+
+    if jumlah_audio and jumlah_teks:
+        idx_audio_pertama = urutan.index("potongan_audio")
+        idx_teks_terakhir = len(urutan) - 1 - urutan[::-1].index("potongan_teks")
+        _cek(
+            "audio pertama tiba SEBELUM teks terakhir (streaming sungguhan)",
+            idx_audio_pertama < idx_teks_terakhir,
+            f"(audio#{idx_audio_pertama} vs teks#{idx_teks_terakhir})",
+        )
+    if selesai:
+        _cek(
+            "selesai menyertakan teks_penuh",
+            bool((selesai.get("teks_penuh") or "").strip()),
+        )
+
+
 def main() -> int:
     print("=" * 64)
     print(" [SELA AI Desktop] Uji Asap Arsitektur Baru")
@@ -845,6 +1005,10 @@ def main() -> int:
     uji_unduh_model()
     uji_bersihkan_teks()
     uji_keutuhan_bobot()
+    # Selalu dijalankan (tidak digerbang SELA_UJI_SERVER): jalur realtime adalah
+    # inti produk, dan satu regresi besar pernah lolos karena tidak ada tes yang
+    # menyentuh WebSocket sama sekali.
+    uji_realtime_ws()
     if os.environ.get("SELA_UJI_SERVER") == "1":
         uji_routing()
         uji_server()
