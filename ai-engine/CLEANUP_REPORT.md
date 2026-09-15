@@ -1206,3 +1206,20 @@ Ditambahkan `uji_realtime_ws()` yang benar-benar membuka socket, dan **selalu di
   per kalimat, dan penjaga regresi utamanya — **potongan audio PERTAMA wajib tiba SEBELUM
   potongan teks TERAKHIR**. Dengan bug lama, urutannya menjadi teks…teks lalu audio, jadi
   tes ini langsung gagal.
+
+### 24.6 Drift kontrak klien–server pada WebSocket
+Setelah protokol server diverifikasi, klien di `src/lib/ai.js` dibandingkan dengan tipe pesan
+yang **benar-benar** dikirim `server.py`. Ditemukan satu ketidakcocokan:
+
+- Klien menangani `potongan_teks_fallback_tts` — tipe ini **tidak pernah dikirim server**
+  (sisa dari nama tipe lama), jadi cabangnya mati.
+- Sebaliknya, `status_tts_gagal` yang **memang** dikirim server saat sintesis satu kalimat
+  gagal tidak ditangani sama sekali.
+
+Akibatnya saat TTS gagal, kalimat itu hilang dari rangkuman klien tanpa jejak. Perbaikan:
+cabang mati dibuang, `status_tts_gagal` ditangani — teksnya tetap diteruskan agar rangkuman
+jawaban tidak bolong, dan sengaja **tidak** diganti suara lain (Web Speech API dsb.) karena
+karakter suara SELA harus konsisten Supertonic 3, sesuai keputusan di `speakText()`.
+
+Catatan: `dokumen_rujukan` juga dikirim server tetapi tidak dipakai di frontend mana pun
+(termasuk jalur REST), jadi itu keputusan produk yang sudah ada, bukan regresi.

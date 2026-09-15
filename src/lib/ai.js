@@ -1843,18 +1843,18 @@ export function streamChatAndVoice({
       const data = JSON.parse(event.data);
       if (data.tipe === "potongan_teks" && data.kalimat) {
         if (onTextChunk) onTextChunk(data.kalimat);
-      } else if (data.tipe === "potongan_teks_fallback_tts" && data.kalimat) {
-        // TTS server gagal - gunakan Web Speech API untuk kalimat ini
+      } else if (data.tipe === "status_tts_gagal" && data.kalimat) {
+        // Server tidak berhasil menyintesis kalimat ini. Teksnya TETAP diteruskan
+        // supaya rangkuman jawaban tidak bolong, dan sengaja TIDAK diganti suara
+        // lain (Web Speech API dsb.) karena karakter suara SELA harus konsisten
+        // Supertonic 3 -- lihat catatan pada speakText().
+        // Catatan: tipe lama `potongan_teks_fallback_tts` sudah tidak pernah
+        // dikirim server, jadi cabangnya dibuang agar tidak menyesatkan.
+        console.warn(
+          `[SELA Streaming] TTS gagal untuk kalimat ini (${data.engine || "?"}):`,
+          data.kalimat,
+        );
         if (onTextChunk) onTextChunk(data.kalimat);
-        try {
-          if ("speechSynthesis" in window) {
-            const utter = new SpeechSynthesisUtterance(data.kalimat);
-            utter.lang = data.bahasa === "en" ? "en-US" : "id-ID";
-            utter.rate = 1.0;
-            utter.pitch = 1.1;
-            window.speechSynthesis.speak(utter);
-          }
-        } catch (_) {}
       } else if (data.tipe === "potongan_audio" && data.audio_base64) {
         audioQueueManager.enqueue({
           audio_base64: data.audio_base64,
