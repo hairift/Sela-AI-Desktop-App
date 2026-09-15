@@ -22,6 +22,7 @@ Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 17. Pembersih teks jawaban (pemisah paragraf & daftar tetap utuh)
 18. Penjaga keutuhan bobot (safetensors terpotong & zip rusak)
 19. WebSocket realtime (ASR streaming + jawaban bersuara per kalimat)
+20. Barge-in (interupsi eksplisit + deteksi ucapan VAD) lewat socket nyata
 
 Jalankan:  python ai-engine/test_server.py
 """
@@ -985,6 +986,159 @@ def uji_realtime_ws() -> None:
         )
 
 
+def _bingkai_ucapan_uji(jumlah: int = 6) -> list:
+    """
+    Bangun bingkai PCM 16-bit mono 16 kHz yang menyerupai ucapan manusia.
+
+    Dipakai untuk memicu SPEECH_START pada VAD jalur energi: nada 40 Hz
+    beramplitudo tinggi lolos ambang RMS sekaligus tetap di bawah gerbang
+    zero-crossing. VAD memotong masukan per blok 512 sampel, jadi tiap bingkai
+    di sini tepat satu blok.
+    """
+    import numpy as np
+
+    gelombang = np.sin(np.linspace(0.0, 2.0 * np.pi * 40.0, 512)) * 12000.0
+    satu_bingkai = gelombang.astype(np.int16).tobytes()
+    return [satu_bingkai] * jumlah
+
+
+def uji_barge_in() -> None:
+    """
+    Uji barge-in lewat socket NYATA: pengguna memotong SELA saat ia berbicara.
+
+    Produk punya dua jalur interupsi dan keduanya diuji terpisah:
+      1. sinyal eksplisit {"tipe":"interupsi"} (kontrol di UI),
+      2. deteksi ucapan lewat {"tipe":"audio_frame"} -> VAD SPEECH_START.
+
+    Alasan bagian ini ada: persis seperti bug streaming sebelumnya, jalur
+    barge-in sudah ditulis di server DAN klien tetapi belum pernah sekali pun
+    dieksekusi di atas socket sungguhan, sehingga regresinya tidak akan terlihat.
+    Penjaga utamanya: setelah interupsi, jawaban lama TIDAK boleh dituntaskan.
+
+    Catatan teknis: `receive_json()` TestClient memblokir tanpa batas bila server
+    berhenti mengirim, jadi tes ini sengaja TIDAK menunggu keheningan. Setiap
+    pembacaan diakhiri oleh pertanyaan baru, sehingga urutan pesan yang dinilai
+    selalu pasti tiba.
+    """
+    print("\n[20] Barge-in lewat socket nyata (/ws/dupleks)")
+    try:
+        import base64
+
+        from fastapi.testclient import TestClient
+
+        import server
+
+        klien = TestClient(server.aplikasi_server)
+    except Exception as galat:  # pragma: no cover
+        _cek("TestClient siap untuk barge-in", False, f"({galat})")
+        return
+
+    def _baca(ws, henti, batas: int = 400):
+        """Baca pesan sampai `henti(tipe, pesan)` benar; hasilnya daftar (tipe, pesan)."""
+        terkumpul = []
+        for _ in range(batas):
+            try:
+                pesan = ws.receive_json()
+            except Exception:
+                break
+            terkumpul.append((pesan.get("tipe"), pesan))
+            if henti(pesan.get("tipe"), pesan):
+                break
+        return terkumpul
+
+    def _penanda_teks(minimal: int):
+        """Penanda henti: sejumlah potongan teks sudah tiba (jawaban sedang jalan)."""
+        hitung = {"n": 0}
+
+        def _henti(tipe, _pesan):
+            if tipe == "potongan_teks":
+                hitung["n"] += 1
+            return hitung["n"] >= minimal
+
+        return _henti
+
+    def _tanya(ws, kueri: str) -> None:
+        ws.send_json({"tipe": "tanya", "kueri": kueri, "riwayat": [], "bahasa": "id"})
+
+    def _kirim_ucapan(ws, bingkai) -> None:
+        for satu in bingkai:
+            ws.send_json(
+                {
+                    "tipe": "audio_frame",
+                    "pcm_base64": base64.b64encode(satu).decode("ascii"),
+                }
+            )
+
+    bingkai_ucapan = _bingkai_ucapan_uji()
+    tanya_panjang = "Ceritakan fasilitas kampus UCIC secara lengkap"
+    tanya_pendek = "Berapa biaya kuliah di UCIC?"
+
+    # ── Jalur 1: sinyal interupsi eksplisit ──────────────────────────────────
+    with klien.websocket_connect("/ws/dupleks") as ws:
+        _tanya(ws, tanya_panjang)
+        awal = _baca(ws, _penanda_teks(2))
+        tipe_awal = [t for t, _ in awal]
+        _cek(
+            "jawaban mengalir sebelum interupsi",
+            tipe_awal.count("potongan_teks") >= 2,
+            f"({tipe_awal.count('potongan_teks')} kalimat)",
+        )
+        _cek("jawaban belum tuntas saat interupsi dikirim", "selesai" not in tipe_awal)
+        ws.send_json({"tipe": "interupsi"})
+        # Pertanyaan baru = penanda akhir pembacaan. Bila jawaban lama benar-benar
+        # dihentikan, `selesai` miliknya tidak akan pernah muncul lagi.
+        _tanya(ws, tanya_pendek)
+        sesudah = _baca(ws, lambda t, _p: t == "mulai_menjawab")
+    tipe_sesudah = [t for t, _ in sesudah]
+    _cek("interupsi eksplisit diakui server", "interupsi_berhasil" in tipe_sesudah)
+    _cek("jawaban lama TIDAK dituntaskan setelah interupsi", "selesai" not in tipe_sesudah)
+    _cek("pertanyaan baru tetap dilayani", "mulai_menjawab" in tipe_sesudah)
+
+    # ── Jalur 2: barge-in dari VAD (klien mengirim bingkai audio) ────────────
+    with klien.websocket_connect("/ws/dupleks") as ws:
+        _tanya(ws, tanya_panjang)
+        awal = _baca(ws, _penanda_teks(2))
+        _cek(
+            "jawaban mengalir sebelum ucapan pengguna",
+            [t for t, _ in awal].count("potongan_teks") >= 2,
+        )
+        _kirim_ucapan(ws, bingkai_ucapan)
+        _tanya(ws, tanya_pendek)
+        sesudah = _baca(ws, lambda t, _p: t == "mulai_menjawab")
+    pemicu = [p for t, p in sesudah if t == "barge_in"]
+    _cek("VAD mendeteksi ucapan dan memicu barge_in", bool(pemicu))
+    _cek(
+        "barge_in menyebut alasan speech_start",
+        any(p.get("alasan") == "speech_start" for p in pemicu),
+        f"({[p.get('alasan') for p in pemicu]})",
+    )
+    _cek(
+        "jawaban lama TIDAK dituntaskan setelah barge_in",
+        "selesai" not in [t for t, _ in sesudah],
+    )
+
+    # ── Penjaga regresi: tanpa generasi aktif, ucapan TIDAK boleh barge_in ──
+    # Tugas yang sudah selesai tetap tersimpan di variabel server, jadi
+    # `tugas_generasi or tugas_tts` selalu benar setelah jawaban pertama tuntas.
+    # Akibatnya setiap ucapan berikutnya (justru cara normal bertanya lagi!)
+    # memicu barge_in palsu. Karena itu status `done()` wajib diperiksa.
+    with klien.websocket_connect("/ws/dupleks") as ws:
+        _tanya(ws, tanya_pendek)
+        tuntas = _baca(ws, lambda t, _p: t == "selesai")
+        _cek(
+            "jawaban tuntas sebelum uji barge_in palsu",
+            "selesai" in [t for t, _ in tuntas],
+        )
+        _kirim_ucapan(ws, bingkai_ucapan)
+        _tanya(ws, tanya_pendek)
+        lanjut = _baca(ws, lambda t, _p: t == "mulai_menjawab")
+    _cek(
+        "ucapan setelah jawaban selesai TIDAK memicu barge_in palsu",
+        "barge_in" not in [t for t, _ in lanjut],
+        f"({[t for t, _ in lanjut]})",
+    )
+
+
 def main() -> int:
     print("=" * 64)
     print(" [SELA AI Desktop] Uji Asap Arsitektur Baru")
@@ -1009,6 +1163,7 @@ def main() -> int:
     # inti produk, dan satu regresi besar pernah lolos karena tidak ada tes yang
     # menyentuh WebSocket sama sekali.
     uji_realtime_ws()
+    uji_barge_in()
     if os.environ.get("SELA_UJI_SERVER") == "1":
         uji_routing()
         uji_server()

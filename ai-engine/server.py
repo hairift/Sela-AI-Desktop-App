@@ -787,6 +787,23 @@ async def ws_dupleks(koneksi: WebSocket):
             loop = asyncio.get_running_loop()
             antrean: asyncio.Queue = asyncio.Queue()
 
+            def _antrekan(item) -> None:
+                """
+                Titipkan satu item ke antrean dari utas penghasil kalimat.
+
+                Bila koneksi sudah ditutup saat LLM masih menghasilkan kalimat,
+                loop-nya sudah tidak berjalan lagi dan `call_soon_threadsafe`
+                melempar RuntimeError("Event loop is closed"). Itu BUKAN galat:
+                hasilnya memang sudah tidak dibutuhkan. Sebelumnya pengecualian
+                ini tertangkap penangkap umum dan tercetak sebagai
+                "Galat saat menghasilkan kalimat: Event loop is closed",
+                sehingga menutupi galat yang sungguhan.
+                """
+                try:
+                    loop.call_soon_threadsafe(antrean.put_nowait, item)
+                except RuntimeError:
+                    pass
+
             def _produksi():
                 try:
                     if rencana["jalur"] == "intent" and rencana.get("jawaban_langsung"):
@@ -807,11 +824,11 @@ async def ws_dupleks(koneksi: WebSocket):
                             if s.strip()
                         ]
                     for item in sumber:
-                        loop.call_soon_threadsafe(antrean.put_nowait, item)
+                        _antrekan(item)
                 except Exception as galat:
                     print(f"[WS Dupleks] Galat saat menghasilkan kalimat: {galat}")
                 finally:
-                    loop.call_soon_threadsafe(antrean.put_nowait, None)
+                    _antrekan(None)
 
             threading.Thread(target=_produksi, daemon=True).start()
 
@@ -899,7 +916,18 @@ async def ws_dupleks(koneksi: WebSocket):
                 except Exception:
                     pcm = b""
                 peristiwa = vad.proses_bingkai(pcm) if pcm else None
-                if peristiwa == "SPEECH_START" and (tugas_generasi or tugas_tts):
+                # Status `done()` WAJIB diperiksa, bukan sekadar "tugas ada".
+                # Tugas yang sudah selesai normal tetap tersimpan di variabel ini
+                # (tidak di-nol-kan saat `alirkan` berakhir), sehingga
+                # `tugas_generasi or tugas_tts` selalu benar setelah jawaban
+                # pertama tuntas. Akibatnya setiap ucapan pengguna sesudahnya --
+                # justru cara normal mengajukan pertanyaan berikutnya -- memicu
+                # `barge_in` palsu dan membuat UI mengira SELA dipotong.
+                ada_generasi_aktif = any(
+                    tugas is not None and not tugas.done()
+                    for tugas in (tugas_generasi, tugas_tts)
+                )
+                if peristiwa == "SPEECH_START" and ada_generasi_aktif:
                     await batalkan_semua("VAD mendeteksi SPEECH_START")
                     await koneksi.send_json({"tipe": "barge_in", "alasan": "speech_start"})
                 continue

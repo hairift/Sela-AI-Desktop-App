@@ -1246,3 +1246,59 @@ itu menjelaskan *sebab* sebuah aturan, bukan menamai mesin yang dipakai — jadi
 Verifikasi: `vite build` bersih (714 modul) → `dist/assets/index-6ca3ae42.js`; bundel memuat
 `Memainkan suara Supertonic 3`, **0** kemunculan "Piper", memuat `status_tts_gagal`, dan **0**
 kemunculan `potongan_teks_fallback_tts`. Uji asap tetap **139 lulus / 0 gagal**.
+
+---
+
+## 26. Barge-in: jalur yang belum pernah dieksekusi (15 Sep 2026)
+
+### 26.1 Kenapa bagian ini ditambahkan
+Persyaratan pengguna adalah percakapan "kaya ngobrol sama manusia" — dan inti dari itu adalah
+pengguna bisa **memotong** SELA di tengah kalimat. Jalur barge-in sudah lengkap di kedua sisi
+(`server.py` menangani `interupsi` + VAD `SPEECH_START`; `VoiceUI.jsx` punya monitor RMS
+full-duplex), tetapi **belum pernah sekali pun dieksekusi di atas socket sungguhan** — persis
+kondisi yang dulu menyembunyikan bug streaming terbesar (§24.1). Jadi bagian **[20]** ditulis
+lebih dulu untuk membongkar masalahnya, bukan sesudahnya.
+
+### 26.2 Bug nyata: `barge_in` palsu setiap kali pengguna bicara setelah jawaban selesai
+Penjaga VAD di `/ws/dupleks` berbunyi:
+
+```python
+if peristiwa == "SPEECH_START" and (tugas_generasi or tugas_tts):
+```
+
+Tugas yang **sudah selesai** tidak pernah di-nol-kan saat `alirkan()` berakhir normal, sehingga
+`tugas_generasi` tetap berupa objek Task (truthy) selamanya. Akibatnya, setelah jawaban pertama
+tuntas, **setiap** ucapan pengguna memicu `barge_in` — padahal itu justru cara normal mengajukan
+pertanyaan berikutnya. UI lalu mengira SELA baru saja dipotong.
+
+Perbaikan: status `done()` wajib diperiksa, bukan sekadar keberadaan tugas.
+
+```python
+ada_generasi_aktif = any(
+    tugas is not None and not tugas.done() for tugas in (tugas_generasi, tugas_tts)
+)
+if peristiwa == "SPEECH_START" and ada_generasi_aktif:
+```
+
+### 26.3 Kebisingan log yang menutupi galat sungguhan
+Uji ini juga memperlihatkan `[WS Dupleks] Galat saat menghasilkan kalimat: Event loop is closed`.
+Penyebabnya: utas `_produksi` masih menghasilkan kalimat saat koneksi sudah ditutup, lalu
+`loop.call_soon_threadsafe` melempar `RuntimeError`. Itu bukan galat — hasilnya memang sudah tidak
+dibutuhkan — tetapi tertangkap penangkap umum sehingga tercetak sebagai galat. Kini dititipkan
+lewat pembantu `_antrekan()` yang menelan `RuntimeError` secara sengaja.
+
+### 26.4 Uji regresi bagian [20]
+Tiga sesi terpisah, masing-masing lewat socket nyata:
+
+| Skenario | Penjaga |
+|---|---|
+| Interupsi eksplisit `{"tipe":"interupsi"}` saat jawaban mengalir | `interupsi_berhasil` diterima **dan** `selesai` jawaban lama tidak pernah muncul |
+| Barge-in VAD: klien mengirim bingkai audio berisi ucapan | `barge_in` terbit dengan `alasan == "speech_start"` |
+| Ucapan dikirim **setelah** jawaban tuntas | `barge_in` **tidak** boleh terbit (penjaga anti-palsu) |
+
+Catatan teknis penting: `receive_json()` pada `TestClient` memblokir tanpa batas bila server
+berhenti mengirim, jadi tes ini **tidak** menunggu keheningan. Setiap pembacaan diakhiri oleh
+pertanyaan baru, sehingga urutan pesan yang dinilai selalu pasti tiba — tanpa `sleep` dan tanpa
+risiko tes menggantung.
+
+Hasil: **150 lulus / 0 gagal** (naik dari 139).
