@@ -1223,3 +1223,26 @@ karakter suara SELA harus konsisten Supertonic 3, sesuai keputusan di `speakText
 
 Catatan: `dokumen_rujukan` juga dikirim server tetapi tidak dipakai di frontend mana pun
 (termasuk jalur REST), jadi itu keputusan produk yang sudah ada, bukan regresi.
+
+---
+
+## 25. Sapuan akhir sisa penyebutan mesin lama (15 Sep 2026)
+
+Setelah ketiga mesin diganti dan seluruh tes lulus, repositori disapu ulang dengan pencarian
+`piper|whisper|bge-m3|OmniVoice|fuse.js` untuk memastikan tidak ada lagi rujukan ke mesin yang
+sudah dibuang. Hasil sapuan: hampir semua kemunculan ada di **berkas ini sendiri**, yang memang
+changelog historis — jadi wajar dan harus tetap ada. Yang benar-benar masih hidup hanya tiga:
+
+| Lokasi | Isi lama | Masalah | Perbaikan |
+|---|---|---|---|
+| `src/lib/ai.js` (log `speakText`) | `` `Memainkan suara Piper (${... \|\| 'piper'})` `` | Log runtime menyesatkan; nilai cadangan `'piper'` sudah tidak pernah benar | Jadi `Memainkan suara Supertonic 3`, cadangan `'supertonic-3'` (nilai nyata dari `tts_engine.py`) |
+| `ai-engine/koreksi_asr.py` | komentar "kesalahan umum Whisper" | Nama mesin sudah tidak ada | Jadi "kesalahan umum ASR" |
+| `ai-engine/persiapan_model.py` | alias CLI `--unduh-bge-m3` | Menyediakan jalan unduh untuk model yang sudah dibuang; tidak didokumentasikan di mana pun | Alias dihapus, tinggal `--unduh-embedder` |
+
+Satu kemunculan **sengaja dipertahankan**: komentar di `src/lib/responsePlan.js` yang menerangkan
+bahwa pemotongan 260 karakter / 2 kalimat dulu adalah warisan mesin OmniVoice yang lambat. Komentar
+itu menjelaskan *sebab* sebuah aturan, bukan menamai mesin yang dipakai — jadi justru berguna.
+
+Verifikasi: `vite build` bersih (714 modul) → `dist/assets/index-6ca3ae42.js`; bundel memuat
+`Memainkan suara Supertonic 3`, **0** kemunculan "Piper", memuat `status_tts_gagal`, dan **0**
+kemunculan `potongan_teks_fallback_tts`. Uji asap tetap **139 lulus / 0 gagal**.

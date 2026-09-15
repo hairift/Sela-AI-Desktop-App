@@ -234,7 +234,7 @@ class KoreksiAsr:
             "lbih": "lebih",
             "kurang2": "kurang",
             "krang": "kurang",
-            # Tambahan: kesalahan umum Whisper untuk bahasa Indonesia
+            # Tambahan: kesalahan umum ASR untuk bahasa Indonesia
             "selesa": "selesai",
             "selesainya": "selesainya",
             "denger": "dengar",

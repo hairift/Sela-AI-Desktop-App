@@ -1943,7 +1943,7 @@ export async function speakText(text, onStart, onEnd, lang = "id") {
     if (respons.ok) {
       const dataSintesis = await respons.json();
       if (dataSintesis.audio_base64) {
-        console.log(`[SELA TTS] Memainkan suara Piper (${dataSintesis.engine || 'piper'})`);
+        console.log(`[SELA TTS] Memainkan suara Supertonic 3 (${dataSintesis.engine || 'supertonic-3'})`);
         
         // Konversi base64 ke Blob URL untuk performa audio dan lipsync optimal
         const binaryString = atob(dataSintesis.audio_base64);

@@ -530,7 +530,7 @@ def periksa() -> int:
 
 if __name__ == "__main__":
     argumen = set(sys.argv[1:])
-    if "--unduh-embedder" in argumen or "--unduh-bge-m3" in argumen:
+    if "--unduh-embedder" in argumen:
         sys.exit(unduh_embedder())
     if "--unduh-asr" in argumen:
         sys.exit(unduh_asr())
