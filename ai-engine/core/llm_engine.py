@@ -333,6 +333,58 @@ class LlmEngine:
         else:
             yield from self._stream_llama_server(messages, suhu, token_maksimal)
 
+    def hangatkan_awalan(self, teks_sistem: str) -> bool:
+        """
+        Isi KV cache llama-server dengan awalan prompt yang selalu dipakai.
+
+        llama-server hanya menyimpan KV permintaan TERAKHIR pada slotnya
+        (dijalankan dengan `-np 1`). Tanpa pemanasan, pertanyaan PERTAMA
+        pengguna harus menilai ulang seluruh awalan persona + aturan (sekitar
+        1.300 token) sehingga token pertama baru muncul setelah ~2,1 detik.
+        Satu permintaan pemanasan berisi awalan itu membuat pertanyaan pertama
+        pengguna hanya menilai sisanya (A/B dua sesi server baru: 2.147 ms
+        turun ke 987 ms, -54%).
+
+        Awalan yang dipakai harus PERSIS sama dengan awal system prompt asli;
+        bagian yang berbeda (dokumen RAG, pertanyaan) berada di belakangnya,
+        jadi tidak memengaruhi kecocokan awalan.
+
+        Aman dipanggil kapan saja: kegagalan pemanasan tidak pernah
+        menggagalkan aplikasi, paling buruk token pertama kembali lambat.
+        """
+        if not self.apakah_siap or not (teks_sistem or "").strip():
+            return False
+        if self.backend == "llama-cpp-python":
+            # Backend itu memakai KV di dalam proses yang sama dan tidak punya
+            # slot yang perlu dipanaskan; jangan buang waktu komputasi.
+            return False
+        data = json.dumps(
+            {
+                "messages": [
+                    {"role": "system", "content": teks_sistem},
+                    {"role": "user", "content": "pemanasan"},
+                ],
+                "stream": False,
+                "temperature": 0.0,
+                # Cukup satu token: yang dibutuhkan hanya penilaian awalan
+                # (prefill), bukan panjang jawabannya.
+                "max_tokens": 1,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+        ).encode("utf-8")
+        try:
+            with self._kunci_inferensi:
+                req = urllib.request.Request(
+                    f"{self._url_server}/v1/chat/completions",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(req, timeout=120) as respon:
+                    respon.read()
+            return True
+        except Exception:
+            return False
+
     def _stream_llama_cpp(
         self, messages: List[Dict[str, str]], suhu: float, token_maksimal: int
     ) -> Generator[str, None, None]:

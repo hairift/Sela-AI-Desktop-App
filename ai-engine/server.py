@@ -104,6 +104,27 @@ print(f"[Server AI] Siap. LLM={'ok' if llm.apakah_siap else 'off'} "
 klien_mcp.mulai()
 
 
+def _hangatkan_awalan_llm() -> None:
+    """
+    Panaskan KV cache llama-server dengan awalan prompt jalur kampus.
+
+    llama-server hanya menyimpan KV permintaan TERAKHIR pada slotnya, jadi
+    tanpa langkah ini pertanyaan pertama pengguna menanggung seluruh biaya
+    prefill persona + aturan (A/B dua sesi server baru: 2.147 ms ke token
+    pertama, turun ke 987 ms bila awalannya sudah ada di cache). Dijalankan di
+    latar belakang supaya kesiapan server tidak ikut tertunda.
+    """
+    try:
+        awal = pesan_sistem_kampus("PEMANASAN", "pemanasan")
+        if llm.hangatkan_awalan(awal):
+            print("[Server AI] Awalan prompt dipanaskan; token pertama lebih cepat.")
+    except Exception as galat:
+        print(f"[Server AI] Pemanasan awalan dilewati: {galat}")
+
+
+threading.Thread(target=_hangatkan_awalan_llm, daemon=True, name="sela-pemanasan").start()
+
+
 # ── Skema REST ────────────────────────────────────────────────────────────────
 class PermintaanObrolan(BaseModel):
     pesan_pengguna: Optional[str] = None

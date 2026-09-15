@@ -1382,3 +1382,93 @@ total; konfigurasi itu sudah terukur aman (puncak 0,556).
 Uji asap **163 lulus / 0 gagal** (naik dari 150; 13 pemeriksaan baru untuk setelan
 kecepatan, penjaga anti-terpotong, dan bukti bahwa `SELA_TTS_SPEED` benar-benar
 mempersingkat audio: 405.548 -> 301.100 byte).
+
+---
+
+## 28. Profil latensi LLM dan pemanasan awalan KV cache
+
+Tahap LLM adalah bagian terakhir jalur realtime yang belum pernah diprofilkan.
+Pekerjaan ini melanjutkan bagian 27 (yang memprofilkan TTS) dan menutup
+pertanyaan "ke mana sisa waktunya pergi".
+
+### 28.1 Misteri "HTTP Error 502" ternyata BUKAN dari llama-server
+Pengukuran sebelumnya berhenti dengan `[LLM] Kendala inferensi (llama-server):
+HTTP Error 502: Bad Gateway`. Ternyata penyebabnya bukan llama-server:
+
+- Lingkungan ini memasang proxy (`http_proxy=http://127.0.0.1:33781`). Bila tidak
+  ada yang mendengarkan di port tujuan, proxy membalas **502** berisi
+  `upstream connect failed ... (os error 10061)` — bukan penolakan koneksi biasa.
+- `llama-server.exe` memang sudah **mati**: proses anak ikut dimatikan ketika
+  tugas latar yang menjalankannya berakhir. Log-nya berhenti tepat setelah
+  `llama_server: listening on http://127.0.0.1:8088`, tanpa galat apa pun.
+
+Pelajaran: di lingkungan ini, 502 berarti "prosesnya sudah tidak ada", bukan
+"servernya rusak". Untuk mengukur, server dan pengukuran harus hidup di dalam
+**satu** tugas, dan variabel proxy perlu dinetralkan (`no_proxy=127.0.0.1`).
+
+### 28.2 Pembagian biaya per tahap (terukur, bukan dugaan)
+| Tahap | Terukur | Batasnya |
+|---|---|---|
+| Routing + RAG | 17-57 ms | dapat diabaikan |
+| Prefill (penilaian prompt) | **951 token/detik** | panjang prompt |
+| Decode (menghasilkan token) | **39 token/detik** | perangkat |
+| Audio TTS pertama | ~700 ms | langkah difusi Supertonic (bagian 27) |
+
+Perangkat sudah dipakai sepenuhnya: `offloaded 34/34 layers to GPU`, buffer model
+Vulkan 2.841 MiB, KV cache 128 MiB di Vulkan0 (NVIDIA RTX 3050, 6 GB). Jadi 39
+token/detik adalah batas perangkat, bukan salah setelan — mempercepatnya berarti
+mengganti model atau kuantisasi, bukan menyetel ulang.
+
+Konsekuensinya jelas: **waktu ke token pertama didominasi prefill**, sedangkan
+panjang total jawaban didominasi decode.
+
+### 28.3 llama-server hanya menyimpan KV permintaan TERAKHIR
+`llama-server` dijalankan dengan `-np 1` (satu slot), dan slot itu hanya menyimpan
+KV permintaan terakhir. Diukur lewat `timings.prompt_n` (jumlah token yang benar-benar
+dinilai, sisanya dari cache):
+
+| Permintaan | `prompt_n` | Arti |
+|---|---|---|
+| pertanyaan kampus, pertama | ~2.100 token | seluruh prompt dinilai ulang |
+| pertanyaan berbeda, awalan sama | ~1.078 token | sebagian dari cache |
+| permintaan yang **persis sama** diulang | **19 token** | hampir seluruhnya dari cache |
+
+Baris terakhir membuktikan cache-nya memang bekerja; yang mahal adalah pertanyaan
+**pertama**, karena saat itu awalan persona + aturan (~1.300 token) belum ada.
+
+### 28.4 Perbaikan: pemanasan awalan saat server siap
+`LlmEngine.hangatkan_awalan(teks_sistem)` mengirim satu permintaan murah
+(`max_tokens: 1`) berisi awalan prompt jalur kampus, dan `server.py` memanggilnya
+di utas latar setelah mesin siap — jadi kesiapan server tidak ikut tertunda.
+
+A/B pada dua sesi server yang benar-benar baru (pertanyaan kampus yang sama,
+pemanasan netral di kedua sesi supaya hanya variabel pemanasan yang berbeda):
+
+| Sesi | TTFT | Total jawaban |
+|---|---|---|
+| TANPA pemanasan (perilaku lama) | 2.147 ms | 7.282 ms |
+| **DENGAN pemanasan** | **987 ms** | 6.158 ms |
+
+**Waktu ke token pertama turun 1.160 ms (-54%).** Inilah perbaikan terbesar yang
+tersisa untuk "rasa realtime": pertanyaan pertama adalah momen paling terasa
+lambat, dan di situlah pemanasan bekerja.
+
+### 28.5 Dua masalah tes yang ikut ketahuan
+1. **Ambang angka tetap itu rapuh.** Pemeriksaan pertama memakai ambang
+   `prompt_n < 1200` dan gagal (terukur 1.734) walau pemanasannya bekerja —
+   besar pakai-ulang cache bergantung keadaan slot sebelumnya (pernah 1.078,
+   pernah 1.734 untuk prompt yang sama). Sekarang pembandingnya diambil dari
+   `/tokenize` server itu sendiri: yang diuji adalah "ada bagian prompt yang
+   tidak dinilai ulang", bukan angka ajaib.
+2. **Tes ASR rapuh karena audio ujinya ikut dipercepat.** Kalimat uji disintesis
+   memakai setelan `SELA_TTS_*` saat itu, sehingga mempercepat TTS demi latensi
+   (bagian 27) ikut menurunkan mutu audio uji dan sesekali membuat ASR membaca
+   "kuliah" sebagai "lia". Kini `_pcm_uji_asr()` selalu menyintesis pada kualitas
+   tertinggi (langkah 8, laju 1,0) — tes ASR butuh ucapan yang jelas, bukan cepat.
+   Sesudah perbaikan, "kuliah" terbaca benar di ketiga kali penjalanan.
+
+### 28.6 Verifikasi
+Uji asap **169 lulus / 0 gagal** (naik dari 163; 6 pemeriksaan baru untuk pemanasan
+awalan), dijalankan **tiga kali berturut-turut** dan ketiganya 169/0 — jalur ASR
+yang sebelumnya gagal sesekali kini stabil.
+

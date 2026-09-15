@@ -70,6 +70,24 @@ pertama sampai suara pertama): `SELA_TTS_STEPS=6` + `SELA_TTS_SPEED=1.15` member
 **1.065 ms** (-22% dibanding setelan bawaan paket), dan `SELA_TTS_STEPS=5` memberi
 **854 ms** (-38%) dengan amplitudo puncak 0,556 sehingga masih aman.
 
+### Kecepatan jawaban (LLM)
+
+Profil terukur pada mesin acuan (RTX 3050 6 GB lewat Vulkan, model 4B Q4_K_XL).
+Seluruh 34 lapisan memang dijalankan di GPU, jadi angka decode di bawah adalah
+batas perangkat, bukan salah setelan.
+
+| Tahap | Terukur | Batasnya |
+| --- | --- | --- |
+| Routing + RAG | 17-57 ms | dapat diabaikan |
+| Prefill prompt | 951 token/detik | panjang prompt |
+| Decode jawaban | 39 token/detik | perangkat |
+| Suara pertama | ~700 ms | langkah difusi TTS |
+
+`llama-server` hanya menyimpan KV permintaan terakhir (`-np 1`), sehingga
+pertanyaan **pertama** selalu paling lambat. Karena itu server memanaskan awalan
+prompt di latar belakang begitu mesin siap: waktu ke token pertama pertanyaan
+kampus pertama turun dari **2.147 ms menjadi 987 ms (-54%)**.
+
 ### Mesin lain
 
 | Variabel | Bawaan | Keterangan |

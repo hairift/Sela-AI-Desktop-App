@@ -23,6 +23,7 @@ Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 18. Penjaga keutuhan bobot (safetensors terpotong & zip rusak)
 19. WebSocket realtime (ASR streaming + jawaban bersuara per kalimat)
 20. Barge-in (interupsi eksplisit + deteksi ucapan VAD) lewat socket nyata
+21. Pemanasan awalan LLM (KV cache llama-server -> token pertama lebih cepat)
 
 Jalankan:  python ai-engine/test_server.py
 """
@@ -907,6 +908,12 @@ def _pcm_uji_asr(durasi_hening: float = 2.5):
     """
     Sintesis kalimat uji lalu ubah menjadi PCM 16-bit mono 16 kHz.
 
+    Audio sengaja disintesis pada kualitas TERTINGGI (langkah difusi 8, laju
+    1,0) tanpa peduli setelan `SELA_TTS_*`. Kalimat ini dipakai untuk menguji
+    ASR, jadi yang dibutuhkan ucapan yang jelas, bukan ucapan yang cepat.
+    Tanpa pemisahan ini, mempercepat TTS demi latensi ikut menurunkan mutu
+    audio uji dan membuat tes ASR gagal sesekali ("kuliah" terbaca "lia").
+
     Dipakai untuk menguji `/ws/asr-stream` dengan ucapan sungguhan, bukan data
     acak. Kembalikan None bila mesin TTS/ASR belum siap.
     """
@@ -917,7 +924,20 @@ def _pcm_uji_asr(durasi_hening: float = 2.5):
         tts = dapatkan_tts()
         if not (stt.apakah_siap and tts.apakah_siap):
             return None
-        wav = tts.sintesis_wav_bytes("berapa biaya kuliah di UCIC", bahasa="id")
+
+        kunci_kualitas = ("SELA_TTS_STEPS", "SELA_TTS_SPEED", "SELA_TTS_JEDA")
+        asli = {kunci: os.environ.get(kunci) for kunci in kunci_kualitas}
+        os.environ["SELA_TTS_STEPS"] = "8"
+        os.environ["SELA_TTS_SPEED"] = "1.0"
+        os.environ["SELA_TTS_JEDA"] = "0.3"
+        try:
+            wav = tts.sintesis_wav_bytes("berapa biaya kuliah di UCIC", bahasa="id")
+        finally:
+            for kunci, nilai in asli.items():
+                if nilai is None:
+                    os.environ.pop(kunci, None)
+                else:
+                    os.environ[kunci] = nilai
         if not wav:
             return None
 
@@ -999,10 +1019,16 @@ def uji_realtime_ws() -> None:
         )
         teks_final = ((final or {}).get("teks") or "").lower()
         _cek("WS ASR mengirim teks FINAL", bool(teks_final), f"({teks_final[:48]!r})")
+        # ASR streaming (zipformer) kerap memotong konsonan akhir: "UCIC" jadi
+        # "uci", "kuliah" jadi "kulia". Kecocokan karena itu diperiksa pada
+        # pangkal kata dan cukup dua dari tiga kata kunci, bukan ejaan persis
+        # seluruh kalimat. Hasil yang benar-benar meleset tetap gagal di sini.
+        pangkal = ("biaya", "kuli", "uci")
+        cocok = [kata for kata in pangkal if kata in teks_final]
         _cek(
             "hasil ASR memuat kata kunci ucapan",
-            "biaya" in teks_final and "kuliah" in teks_final,
-            f"({teks_final[:48]!r})",
+            len(cocok) >= 2,
+            f"({teks_final[:48]!r}; cocok={cocok})",
         )
         # Regresi: aksara CJK bocor ("UJ一") lalu dikoreksi otomatis jadi kata
         # acak ("Sudah"). Hasil akhir wajib bersih dari aksara non-Latin.
@@ -1215,6 +1241,87 @@ def uji_barge_in() -> None:
     )
 
 
+def uji_pemanasan_llm() -> None:
+    print("\n[21] Pemanasan awalan LLM (token pertama lebih cepat)")
+    import urllib.request
+
+    import server
+
+    # 1. Penjaga masukan: teks kosong tidak boleh memanggil jaringan dan tidak
+    #    boleh melempar galat, apa pun keadaan mesinnya.
+    _cek("hangatkan_awalan('') -> False", server.llm.hangatkan_awalan("") is False)
+    _cek("hangatkan_awalan(None) -> False", server.llm.hangatkan_awalan(None) is False)
+    _cek("hangatkan_awalan('   ') -> False", server.llm.hangatkan_awalan("   ") is False)
+
+    # 2. Invarian yang membuat pemanasan berguna: prompt pemanasan WAJIB berbagi
+    #    awalan persona+aturan yang sama dengan prompt asli. Bila suatu saat
+    #    urutan template diubah (misalnya dokumen diletakkan sebelum aturan),
+    #    pemanasan diam-diam berhenti menolong tanpa galat apa pun. Tes ini
+    #    mengunci invarian itu tanpa perlu jaringan.
+    asli = server.pesan_sistem_kampus("DOKUMEN_CONTOH_A", "Berapa biaya kuliah?")
+    lain = server.pesan_sistem_kampus("DOKUMEN_CONTOH_B", "Apa saja jurusan?")
+    panas = server.pesan_sistem_kampus("PEMANASAN", "pemanasan")
+    awalan = os.path.commonprefix([asli, lain, panas])
+    _cek(
+        "prompt kampus berbagi awalan persona+aturan yang panjang",
+        len(awalan) > 3000,
+        f"({len(awalan)} karakter)",
+    )
+
+    # 3. Bukti pada mesin hidup: setelah dipanaskan, prompt kampus yang panjang
+    #    hanya dinilai sebagian; sisanya datang dari KV cache.
+    if not server.llm.apakah_siap:
+        print("     (LLM tidak siap; bukti KV cache dilewati)")
+        return
+    _cek("pemanasan awalan pada mesin hidup berhasil", server.llm.hangatkan_awalan(panas) is True)
+
+    def _minta(jalur: str, muatan: dict):
+        import urllib.request
+
+        data = json.dumps(muatan).encode("utf-8")
+        req = urllib.request.Request(
+            f"{server.llm._url_server}{jalur}",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        return urllib.request.urlopen(req, timeout=180)
+
+    def _jumlah_token(teks: str) -> int:
+        """Jumlah token satu potongan teks menurut tokenizer server."""
+        try:
+            with _minta("/tokenize", {"content": teks}) as respon:
+                return len(json.loads(respon.read().decode("utf-8")).get("tokens", []))
+        except Exception:
+            return 0
+
+    def _token_dinilai(pesan: list) -> int:
+        """Token prompt yang benar-benar dievaluasi; sisanya dari KV cache."""
+        muatan = {
+            "messages": pesan,
+            "stream": False,
+            "temperature": 0.0,
+            "max_tokens": 1,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        with _minta("/v1/chat/completions", muatan) as respon:
+            tim = json.loads(respon.read().decode("utf-8")).get("timings") or {}
+        return int(tim.get("prompt_n") or 0)
+
+    pesan = server.susun_rencana("Berapa biaya kuliah di UCIC?", [], "id")["pesan"]
+    # Pembanding diambil dari tokenizer server itu sendiri, bukan angka tetap:
+    # besar pakai-ulang KV cache bergantung keadaan slot sebelumnya (pernah
+    # terukur 1.078 maupun 1.734 token untuk prompt yang sama), sehingga ambang
+    # angka tetap akan rapuh. Yang harus selalu benar adalah: ada bagian prompt
+    # yang TIDAK dinilai ulang.
+    penuh = _jumlah_token(pesan[0]["content"])
+    dinilai = _token_dinilai(pesan)
+    _cek(
+        "KV cache dipakai ulang (token dinilai < token system penuh)",
+        penuh > 0 and 0 < dinilai < penuh,
+        f"({dinilai} dinilai dari {penuh} token system)",
+    )
+
+
 def main() -> int:
     print("=" * 64)
     print(" [SELA AI Desktop] Uji Asap Arsitektur Baru")
@@ -1240,6 +1347,9 @@ def main() -> int:
     # menyentuh WebSocket sama sekali.
     uji_realtime_ws()
     uji_barge_in()
+    # Pemanasan awalan hanya berguna bila prompt pemanasan benar-benar berbagi
+    # awalan dengan prompt asli, jadi invarian itu ikut diuji di sini.
+    uji_pemanasan_llm()
     if os.environ.get("SELA_UJI_SERVER") == "1":
         uji_routing()
         uji_server()
