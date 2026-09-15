@@ -94,8 +94,12 @@ async function buatJendelaUtama() {
 
   if (process.env.NODE_ENV === 'development') {
     try {
-      console.log('[SELA Desktop] Memuat antarmuka dev Vite: http://127.0.0.1:5174?desktop=1');
-      await jendelaUtama.loadURL('http://127.0.0.1:5174?desktop=1');
+      // Port 5173 = bawaan Vite (vite.config.js tidak menyetel `server.port`) dan sama
+      // dengan yang ditunggu skrip `npm run desktop` (wait-on tcp:5173). Sebelumnya di
+      // sini tertulis 5174, sehingga alur dev selalu gagal memuat Vite lalu diam-diam
+      // jatuh ke server AI 8008 — membingungkan karena tampilan produksi yang muncul.
+      console.log('[SELA Desktop] Memuat antarmuka dev Vite: http://127.0.0.1:5173?desktop=1');
+      await jendelaUtama.loadURL('http://127.0.0.1:5173?desktop=1');
     } catch {
       await jendelaUtama.loadURL(urlServerAi);
     }
