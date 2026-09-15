@@ -26,6 +26,7 @@ Menguji setiap lapisan tanpa perlu menjalankan server penuh:
 21. Pemanasan awalan LLM (KV cache llama-server -> token pertama lebih cepat),
     termasuk penjaga bahwa `server.py` benar-benar MENJALANKAN pemanasan itu
 22. Tes frontend node:test (dilewati bila Node tidak ada di PATH)
+23. Loopback tidak lewat proxy (http_proxy tidak boleh memutus llama-server)
 
 Jalankan:  python ai-engine/test_server.py
 """
@@ -1350,6 +1351,102 @@ def uji_pemanasan_llm() -> None:
         )
 
 
+def uji_loopback_tanpa_proxy() -> None:
+    """
+    Loopback tidak boleh lewat proxy.
+
+    Bila mesin pengguna menyetel `http_proxy`/`https_proxy` (umum di jaringan
+    kantor), `urllib` mengirim permintaan ke `127.0.0.1` lewat proxy itu --
+    `proxy_bypass("127.0.0.1")` mengembalikan False di Windows, jadi tidak ada
+    pengecualian otomatis. Pemeriksaan kesehatan llama-server lalu selalu gagal
+    (proxy membalas 502), mesin menganggap LLM tidak pernah siap, dan SELA
+    kehilangan kemampuan menjawabnya -- tanpa galat yang menjelaskan sebabnya,
+    karena `_cek_server()` menelan semua pengecualian. Karena itu panggilan
+    loopback memakai `_pembuka_lokal` (pembuka tanpa proxy).
+
+    Pemeriksaan pertama sengaja menjadi KONTROL: ia membuktikan setelan proxy di
+    tes ini memang bermusuhan, supaya pemeriksaan kedua tidak lulus begitu saja
+    tanpa membuktikan apa pun.
+    """
+    print("\n[23] Loopback tidak lewat proxy")
+    import http.server
+    import threading
+    import urllib.request
+
+    import server
+
+    class _Penangan(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 (nama wajib dari pustaka)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *args):
+            pass
+
+    peladen = http.server.HTTPServer(("127.0.0.1", 0), _Penangan)
+    alamat = f"http://127.0.0.1:{peladen.server_address[1]}/"
+    threading.Thread(target=peladen.serve_forever, daemon=True).start()
+
+    kunci = ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
+             "no_proxy", "NO_PROXY")
+    asli = {k: os.environ.get(k) for k in kunci}
+    try:
+        # Proxy diarahkan ke port mati, dan `no_proxy` dibersihkan supaya tidak
+        # ada jalan pintas yang membuat tes ini lulus tanpa alasan.
+        for k in kunci:
+            os.environ.pop(k, None)
+        os.environ["http_proxy"] = "http://127.0.0.1:9"
+        os.environ["HTTP_PROXY"] = "http://127.0.0.1:9"
+
+        # PENTING: `urllib.request.urlopen` memakai pembuka bawaan modul yang
+        # dibangun SEKALI pada pemanggilan pertama, sehingga mengubah lingkungan
+        # setelahnya tidak berpengaruh apa-apa. Kontrolnya karena itu harus
+        # membangun pembuka yang membaca proxy dari lingkungan saat ini.
+        pembuka_berproxy = urllib.request.build_opener(urllib.request.ProxyHandler())
+        try:
+            pembuka_berproxy.open(alamat, timeout=5)
+            polos_berhasil = True
+        except Exception:
+            polos_berhasil = False
+        _cek(
+            "KONTROL: pembuka yang menghormati proxy memang gagal",
+            polos_berhasil is False,
+            "(proxy tidak berpengaruh di mesin ini)" if polos_berhasil else "",
+        )
+
+        from core import llm_engine as _mesin_llm
+
+        try:
+            with _mesin_llm._pembuka_lokal.open(alamat, timeout=5) as respon:
+                status = respon.status
+        except Exception as galat:
+            status = None
+            print(f"     (pembuka lokal gagal: {galat})")
+        _cek("pembuka lokal tetap menembus loopback walau proxy disetel", status == 200)
+
+        # Panggilan sungguhan ke llama-server: inilah yang dulu selalu gagal.
+        if server.llm.apakah_siap:
+            _cek(
+                "_cek_server tetap benar saat proxy disetel",
+                server.llm._cek_server() is True,
+            )
+            _cek(
+                "pemanasan awalan tetap berhasil saat proxy disetel",
+                server.llm.hangatkan_awalan(
+                    server.pesan_sistem_kampus("PEMANASAN", "pemanasan")) is True,
+            )
+        else:
+            print("     (LLM tidak siap; dua pemeriksaan loopback dilewati)")
+    finally:
+        for k, nilai in asli.items():
+            if nilai is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = nilai
+        peladen.shutdown()
+
+
 def uji_frontend() -> None:
     """
     Jalankan tes frontend (`node:test`) dari uji asap Python.
@@ -1427,6 +1524,7 @@ def main() -> int:
     # Pemanasan awalan hanya berguna bila prompt pemanasan benar-benar berbagi
     # awalan dengan prompt asli, jadi invarian itu ikut diuji di sini.
     uji_pemanasan_llm()
+    uji_loopback_tanpa_proxy()
     uji_frontend()
     if os.environ.get("SELA_UJI_SERVER") == "1":
         uji_routing()

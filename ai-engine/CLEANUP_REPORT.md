@@ -1723,5 +1723,69 @@ Uji asap **173 lulus / 0 gagal** (naik dari 171; dua pemeriksaan baru di bagian 
 goldens **20/20**. Tidak ada kode produksi yang berubah pada bagian ini — hanya
 `test_server.py` (dua pemeriksaan + docstring), README, dan berkas ini.
 
+## 32. Loopback pernah bisa diputus oleh proxy (dan kenapa tidak terlihat)
+
+### 32.1 Masalahnya
+Seluruh komunikasi ke `llama-server` lewat `http://127.0.0.1:8088` dan memakai
+`urllib.request.urlopen` biasa. `urllib` **menghormati** `http_proxy`/`https_proxy`, dan
+`proxy_bypass("127.0.0.1")` mengembalikan **False** di Windows — jadi tidak ada pengecualian
+otomatis untuk loopback. Bila mesin pengguna menyetel proxy (umum di jaringan kantor),
+permintaan ke server lokal ikut dikirim ke proxy itu.
+
+Rantai akibatnya berbahaya karena semuanya senyap:
+
+1. `_cek_server()` menelan **semua** pengecualian dan hanya mengembalikan `False`.
+2. `_muat_llama_server()` lalu menunggu `_cek_server()` selama 90 detik dan berakhir dengan
+   `llama-server tidak merespons dalam batas waktu`.
+3. `apakah_siap` tetap `False` → SELA kehilangan kemampuan menjawabnya, tanpa satu pun pesan
+   yang menyebut proxy sebagai sebabnya.
+
+`electron/pengelola_proses.js` meneruskan `...process.env` ke proses Python, jadi proxy milik
+pengguna memang sampai ke backend.
+
+### 32.2 Kenapa selama ini tidak terlihat
+Dua sebab, dan keduanya kebetulan:
+
+- Proxy di mesin ini berjalan **lokal** (127.0.0.1:33781) sehingga ia masih bisa menjangkau
+  127.0.0.1 milik klien. Diukur langsung: `urlopen` biasa ke server lokal tetap **200**. Bug
+  ini baru muncul bila proxy **tidak** bisa menjangkau loopback klien — yaitu proxy kantor
+  yang jauh, skenario yang justru paling umum di mesin pengguna.
+- Skrip pengukuran di sesi ini selalu membersihkan `http_proxy` dan menyetel `no_proxy` lebih
+  dulu (§28.1), sehingga lingkungan yang justru bermasalah tidak pernah ikut teruji.
+
+### 32.3 Perbaikan
+`core/llm_engine.py` membuat satu pembuka tanpa proxy dan memakainya untuk **ketiga** panggilan
+loopback (pemeriksaan kesehatan, pemanasan awalan, dan permintaan jawaban):
+
+```python
+_pembuka_lokal = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+```
+
+Perbaikan ini tidak bergantung lingkungan sama sekali, jadi tetap benar walaupun `server.py`
+dijalankan manual tanpa `no_proxy`. Yang **tidak** diubah: unduhan model (`persiapan_model.py`)
+dan pencarian web (`tools/web_search_tool.py`) — keduanya memang tujuan luar dan justru harus
+tetap menghormati proxy.
+
+### 32.4 Jebakan `urllib` yang ditemukan saat menulis tesnya
+`urllib.request.urlopen` memakai **pembuka bawaan tingkat modul yang dibangun SEKALI** pada
+pemanggilan pertama. Mengubah `http_proxy` di `os.environ` setelahnya tidak berpengaruh apa
+pun. Kontrol pertama di tes ini karena itu sempat GAGAL — kontrolnya ikut memakai pembuka
+bawaan yang sudah terlanjur dibangun dengan proxy lama. Kontrol yang benar harus membangun
+pembukanya sendiri (`build_opener(ProxyHandler())`) supaya benar-benar membaca lingkungan saat
+itu. Ini juga menjelaskan kenapa gejalanya bisa membingungkan: perilaku proxy "menempel" pada
+proses setelah panggilan HTTP pertama.
+
+### 32.5 Tes [23] — dengan kontrol yang membuktikan keadaannya bermusuhan
+Pemeriksaan pertama sengaja berupa **kontrol**: pembuka yang menghormati proxy harus GAGAL
+menembus server lokal yang baru dinyalakan tes itu sendiri. Tanpa kontrol ini, pemeriksaan
+kedua bisa lulus tanpa membuktikan apa pun. Baru setelah itu: pembuka lokal wajib berhasil,
+lalu `_cek_server()` dan `hangatkan_awalan()` wajib tetap bekerja saat `http_proxy` diarahkan
+ke port mati dan `no_proxy` dibersihkan. Lingkungan asli selalu dikembalikan di blok `finally`.
+
+### 32.6 Verifikasi
+Uji asap **177 lulus / 0 gagal** (naik dari 173; empat pemeriksaan baru di bagian [23]),
+goldens **20/20**. Satu-satunya kode produksi yang berubah: `core/llm_engine.py`
+(satu pembuka + tiga pemakaian).
+
 
 

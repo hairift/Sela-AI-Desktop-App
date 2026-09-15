@@ -62,6 +62,17 @@ _MAKS_TOKEN_DEFAULT = 512
 _SUHU_DEFAULT = 0.6
 _PORT_SERVER = int(os.environ.get("SELA_LLM_PORT", "8088"))
 
+# Pembuka HTTP khusus loopback. Bila mesin pengguna menyetel `http_proxy` /
+# `https_proxy` (umum di jaringan kantor), `urllib` akan mengirim permintaan ke
+# `127.0.0.1` lewat proxy itu -- `proxy_bypass("127.0.0.1")` memang mengembalikan
+# False di Windows, jadi proxy tidak dilewati secara otomatis. Akibatnya
+# pemeriksaan kesehatan llama-server SELALU gagal (proxy membalas 502), mesin
+# menganggap LLM tidak pernah siap, dan SELA kehilangan kemampuan menjawabnya --
+# tanpa satu pun galat yang menjelaskan sebabnya, karena `_cek_server()` menelan
+# semua pengecualian. Loopback tidak boleh lewat proxy, jadi seluruh panggilan ke
+# llama-server memakai pembuka tanpa proxy ini.
+_pembuka_lokal = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 class LlmEngine:
     """Pembungkus tunggal mesin LLM SELA (singleton)."""
@@ -247,7 +258,7 @@ class LlmEngine:
     def _cek_server(self) -> bool:
         try:
             req = urllib.request.Request(f"{self._url_server}/health", headers={"User-Agent": "SELA"})
-            with urllib.request.urlopen(req, timeout=1.5) as resp:
+            with _pembuka_lokal.open(req, timeout=1.5) as resp:
                 return resp.status == 200
         except Exception:
             return False
@@ -379,7 +390,7 @@ class LlmEngine:
                     data=data,
                     headers={"Content-Type": "application/json"},
                 )
-                with urllib.request.urlopen(req, timeout=120) as respon:
+                with _pembuka_lokal.open(req, timeout=120) as respon:
                     respon.read()
             return True
         except Exception:
@@ -427,7 +438,7 @@ class LlmEngine:
                     data=data,
                     headers={"Content-Type": "application/json"},
                 )
-                with urllib.request.urlopen(req, timeout=300) as respon:
+                with _pembuka_lokal.open(req, timeout=300) as respon:
                     for baris in respon:
                         baris_str = baris.decode("utf-8", errors="ignore").strip()
                         if not baris_str.startswith("data: "):
